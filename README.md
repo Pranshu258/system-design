@@ -1,6 +1,6 @@
 # Production System Design Collection
 
-Detailed, production-scale system design documents structured for technical interviews.
+Detailed, production-scale system design documents.
 
 ## Collaboration and storage
 
