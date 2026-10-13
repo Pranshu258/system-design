@@ -46,6 +46,14 @@ Approximate upload request rate:
 = approximately 20,000-50,000 uploads/second at peak
 ```
 
+Approximate byte volume with 5 MB average files:
+
+```text
+Uploads:   20M x 20 x 5 MB = 2 PB/day = ~23 GB/s average
+Downloads: 20M x 100 x 5 MB = 10 PB/day = ~116 GB/s average
+Peak upload ingress: 20K-50K uploads/s x 5 MB = ~100-250 GB/s
+```
+
 Storing every version indefinitely would be prohibitively expensive. The system therefore needs retention policies, deduplication, compression where useful, and lifecycle-based movement to colder storage.
 
 ## 3. High-level architecture
@@ -291,7 +299,7 @@ Mutation APIs should accept idempotency keys because clients will retry after ne
 - Chunks can be downloaded in parallel.
 - Large files do not need to pass through application servers.
 
-A fixed 4-8 MB chunk size is straightforward. Content-defined chunking provides better delta detection when bytes are inserted near the beginning of a file, but costs more CPU and implementation complexity.
+A fixed 4 MB chunk size is straightforward and aligns with Dropbox's published block design; 4-8 MB is still a reasonable interview range. Content-defined chunking provides better delta detection when bytes are inserted near the beginning of a file, but costs more CPU and implementation complexity.
 
 A strong interview answer can begin with fixed-size chunks, then introduce content-defined chunking if bandwidth optimization becomes a priority.
 
@@ -332,6 +340,8 @@ Each client maintains:
 8. Devices apply changes in sequence order and persist the new cursor.
 
 Notifications are only hints. They can be duplicated, delayed, or lost. The cursor-based change log is the source of truth.
+
+For very large newly-created files, the system can reduce device-to-device latency by advertising a pre-commit, prefetchable block manifest to other authorized devices. The downloader fetches blocks while the uploader is still sending later chunks, then falls back to the committed change log if the speculative state expires.
 
 ### Reconnection
 
@@ -442,6 +452,8 @@ Store chunks in replicated object storage. The object key can derive from the co
 chunks/{hash-prefix}/{sha256}
 ```
 
+At exabyte scale, avoid treating every 4 MB chunk as an independent physical placement unit. Group immutable chunks into larger extents or buckets for replication, erasure coding, compaction, and disk-rebuild workflows.
+
 ### Deduplication
 
 Two possible scopes:
@@ -452,6 +464,10 @@ Two possible scopes:
 For a production design, tenant-scoped deduplication is often the safer default.
 
 Never trust a client-provided hash alone. The server or object-storage layer must verify the bytes against the declared hash.
+
+### Compression
+
+Lossless compression can reduce both storage cost and sync bandwidth, but it must be deterministic and verified. Compress only formats and sizes where CPU cost, latency, and memory bounds are acceptable; after compression, decode and compare bytes before committing the compressed representation. For already-compressed or encrypted data, skip compression quickly.
 
 ### Garbage collection
 
@@ -465,7 +481,7 @@ Deleting a version should not synchronously delete its chunks.
 
 This prevents races with in-progress commits, restores, replication, and delayed events.
 
-Reference counts alone can drift after failures. Periodic mark-and-sweep reconciliation should verify them.
+Reference counts alone can drift after failures. Periodic mark-and-sweep reconciliation should verify them. In immutable extent-based stores, garbage collection only identifies dead chunks; a separate compaction process must copy live chunks into new extents before old extents release physical space.
 
 ## 13. Caching and CDN
 
@@ -502,7 +518,7 @@ A practical design:
 - Replicate file chunks across regions according to durability and residency policies.
 - Serve downloads from nearby replicas and CDN edges.
 
-Active-active metadata writes across distant regions introduce difficult ordering and conflict problems. A per-namespace home region provides a simpler consistency model while still allowing globally distributed reads.
+Active-active metadata writes across distant regions introduce difficult ordering and conflict problems. A per-namespace home region provides a simpler consistency model while still allowing globally distributed reads. File-content storage can be active-active sooner than metadata because immutable chunk reads and asynchronous replication have fewer ordering constraints than namespace mutations.
 
 During home-region failure:
 
@@ -570,6 +586,8 @@ Time from successful commit on device A
 to visible metadata on device B
 ```
 
+Sync correctness also needs randomized and model-based tests that explore offline edits, concurrent moves, deletes, partial transfers, retry races, and platform-specific filesystem behavior. Track invariant violations such as orphaned nodes, duplicate active child names, and cursor gaps.
+
 ## 18. Major trade-offs
 
 ### Whole-file storage versus chunking
@@ -601,7 +619,50 @@ to visible metadata on device B
 - Polling provides reliability.
 - Use push as a hint and cursor-based polling as the authoritative mechanism.
 
-## 19. Recommended interview presentation
+
+## 19. Lessons from production systems
+
+### Magic Pocket: immutable blocks plus higher-level metadata
+
+Dropbox's Magic Pocket stores file content as immutable encrypted blocks up to 4 MB, while mutable file history lives in a separate FileJournal-style metadata layer. This directly supports the design here: keep object storage simple and immutable, and put versioning, conflict detection, sharing, and cursor ordering in strongly consistent metadata.
+
+### Magic Pocket compaction: deletes are not physical reclamation
+
+Dropbox's 2026 Magic Pocket write-up emphasizes that immutable blobs remain inside closed volumes after delete; garbage collection marks dead blobs, but compaction must rewrite live blobs into new volumes before old capacity is reusable. This changes the storage design from "decrement refcount and delete" to an asynchronous GC plus compaction pipeline with safeguards against write amplification.
+
+### Nucleus: stable data models matter more than clever sync logic
+
+Dropbox rewrote its desktop sync engine as Nucleus because the classic engine's data model made scale, sharing, and correctness hard; one cited issue was representing moves as delete/add pairs and lacking stable identifiers preserved across moves. The `node_id` and version-based design here is therefore not just convenience: it prevents path-based ambiguity and makes offline reconciliation testable.
+
+### Testing sync: design away invalid states
+
+Dropbox's Nucleus testing strategy made the protocol stricter so clients could not even transiently accept impossible states such as a file without its parent directory. This maps to concrete invariants in this design: commits must preserve parent existence, unique names, acyclic folder graphs, monotonic cursors, and recoverable conflict copies, then randomized tests should generate offline/concurrent edit sequences to break those invariants.
+
+### Streaming Sync: pipeline large-file propagation
+
+Dropbox's Streaming Sync reduced multi-client sync latency by letting authorized downloaders prefetch blocks from not-yet-committed uploads, approaching a 2x best-case improvement and showing about 25% improvement in one published two-machine test. For this design, expose speculative blocklists only as hints with expiration and fallback to the durable committed change log.
+
+### Broccoli: compress before syncing when it pays
+
+Dropbox's Broccoli work used a modified Brotli encoder in the block sync path and reported more than 30% reductions in median latency and data on the wire. Add compression as a negotiated client/server capability with quick bypass for incompressible data, strict CPU/memory limits, and byte-for-byte verification before storing compressed chunks.
+
+### Lepton: specialized lossless compression can save petabytes
+
+Dropbox's Lepton recompressed JPEGs losslessly, reporting 22% savings on existing JPEG images, 16 billion images encoded, and multiple petabytes saved. The lesson is to apply format-specific, reversible transformations only where determinism and safety are proven; generic compression alone leaves large savings untapped at exabyte scale.
+
+### Edgestore: metadata wants a strongly consistent abstraction
+
+Dropbox built Edgestore as a strongly consistent, read-optimized, horizontally scalable metadata store over MySQL, serving millions of queries per second with five-nines availability. This supports the document's separation between content blobs and metadata, and argues for a metadata API that hides sharding, caching, and replication details from feature teams.
+
+### Panda: shard splitting is not a long-term scaling plan
+
+Dropbox introduced Panda, a petabyte-scale transactional key-value layer between Edgestore/filesystem systems and sharded MySQL, to support ACID transactions, rebalancing, incremental capacity expansion, and distributed transactions. In this design, very large namespaces and metadata hot spots should be handled by movable key ranges and transaction support, not only by doubling shards or manually splitting databases.
+
+### Disaster readiness: content and metadata fail over differently
+
+Dropbox's disaster-readiness work notes that Magic Pocket block storage was active-active/multi-homed earlier, while metadata required a phased active-passive path toward active-active because ordering and state transitions are harder. The design should set separate RTO/RPO targets for chunks and metadata, drill failover regularly, and fence old primaries before accepting metadata writes in a promoted region.
+
+## 20. Recommended interview presentation
 
 A clear 45-minute sequence is:
 
@@ -618,3 +679,18 @@ A clear 45-minute sequence is:
 The central design insight is:
 
 > Store file bytes as immutable chunks, keep namespace and version metadata strongly consistent, and synchronize devices through an ordered, cursor-based change log. Push notifications improve latency, but clients always reconcile against the durable log.
+
+## Further reading: curated engineering blogs
+
+| Source | Article | Why it matters |
+|---|---|---|
+| Dropbox | [Inside the Magic Pocket](https://dropbox.tech/infrastructure/inside-the-magic-pocket) | Explains Dropbox's immutable 4 MB block storage, FileJournal separation, replication, and erasure coding. |
+| Dropbox | [Improving storage efficiency in Magic Pocket, our immutable blob store](https://dropbox.tech/infrastructure/improving-storage-efficiency-in-magic-pocket-our-immutable-blob-store) | Shows why immutable stores need GC plus compaction to reclaim deleted blob space at exabyte scale. |
+| Dropbox | [Rewriting the heart of our sync engine](https://dropbox.tech/infrastructure/rewriting-the-heart-of-our-sync-engine) | Describes Nucleus and why stable data models are essential for large-scale file sync correctness. |
+| Dropbox | [Testing sync at Dropbox](https://dropbox.tech/infrastructure/-testing-our-new-sync-engine) | Details model/randomized testing and protocol invariants for a sync engine with offline clients. |
+| Dropbox | [Streaming File Synchronization](https://dropbox.tech/infrastructure/streaming-file-synchronization) | Demonstrates prefetching uncommitted blocklists to pipeline large-file sync and cut latency. |
+| Dropbox | [Broccoli: Syncing faster by syncing less](https://dropbox.tech/infrastructure/-broccoli--syncing-faster-by-syncing-less) | Shows block-sync compression reducing median latency and network bytes by more than 30%. |
+| Dropbox | [Lepton image compression: saving 22% losslessly from images at 15MB/s](https://dropbox.tech/infrastructure/lepton-image-compression-saving-22-losslessly-from-images-at-15mbs) | Shows specialized deterministic JPEG recompression saving multiple petabytes without changing file bytes. |
+| Dropbox | [(Re)Introducing Edgestore](https://dropbox.tech/infrastructure/reintroducing-edgestore) | Presents Dropbox's strongly consistent metadata abstraction over sharded MySQL with caching and geo-replication. |
+| Dropbox | [Future-proofing our metadata stack with Panda, a scalable key-value store](https://dropbox.tech/infrastructure/panda-metadata-stack-petabyte-scale-transactional-key-value-store) | Explains rebalancing, ACID transactions, and incremental capacity expansion for petabyte-scale metadata. |
+| Dropbox | [That time we unplugged a data center to test our disaster readiness](https://dropbox.tech/infrastructure/disaster-readiness-test-failover-blackhole-sjc) | Separates active-active content storage from harder metadata failover and grounds RTO/RPO planning. |

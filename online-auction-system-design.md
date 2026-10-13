@@ -179,12 +179,15 @@ Let the current leader's maximum be `L`, the challenger's maximum be `C`, and th
 
 1. Validate auction is `ACTIVE` and authoritative time is before `effective_end_at`.
 2. Validate bidder, currency, minimum amount, limits, sanctions, and seller/bidder separation.
-3. If `C <= L`, current leader remains; visible price becomes `min(L, C + I)`.
-4. If `C > L`, challenger leads; visible price becomes `min(C, L + I)`.
-5. If maximums tie, the earlier accepted bid wins.
-6. Persist the bid, updated state, sequence, and outbox event atomically.
+3. If there is no current leader, require `C >= start_price`; challenger leads and visible price is the start price.
+4. Otherwise require `C >= current_visible_price + I` for the next public bid.
+5. If `C <= L`, current leader remains; visible price becomes `min(L, C + I)`.
+6. If `C > L`, challenger leads; visible price becomes `min(C, L + I)`.
+7. If maximums tie, the earlier accepted bid wins.
+8. Persist the bid, updated state, sequence, and outbox event atomically.
 
 For the first bid, visible price is the start price. Increment schedules may vary by current price and must be versioned per auction. Use integer minor units or decimal fixed precision, never floating point.
+Public bid increments are product policy, not an implementation detail: eBay-style automatic bidding advances by bracketed increments and can show a smaller final step when a hidden maximum is only slightly above the previous bid.
 
 Example:
 
@@ -238,6 +241,7 @@ Realtime gateways:
 - Coalesce high-frequency updates for very hot auctions.
 - Apply backpressure and disconnect persistently slow clients.
 - Tell reconnecting clients to fetch the authoritative snapshot from their last version.
+- Put admission control before expensive realtime work for major events, and pool downstream Redis/search/Kafka connections so adding gateway pods does not linearly exhaust datastore connections.
 
 Push is a latency optimization, not the source of truth. Events may be lost or duplicated. The client applies only higher versions and periodically reconciles through `GET /auctions/{id}`.
 
@@ -246,6 +250,8 @@ Use CDN caching for static listing content and images. Keep price/state TTLs ver
 ## 10. Discovery and seller workflows
 
 Listings are indexed asynchronously by title, description, category, attributes, price range, seller, and end time. The listing database remains authoritative.
+
+Search quality depends on structured attributes as much as full-text terms. Capture item specifics and demand signals during listing creation so sellers fill searchable facets before publish. For high-cardinality secondary lookups, maintain global secondary indexes/read models instead of scatter-gathering every listing shard.
 
 Before an auction starts, sellers may edit allowed fields. After the first bid, price, reserve, duration, and material description fields should be immutable or require a controlled cancellation because bidders relied on them.
 
@@ -284,7 +290,7 @@ A single auction cannot be safely multi-writer without consensus because its bid
 | Realtime event is missed | Client reloads snapshot by version |
 | Close timer is lost | Past-due reconciliation scanner closes auction |
 | Duplicate close commands | Conditional state transition and unique result |
-| Bid engine dies mid-command | Uncommitted command replays; transaction is atomic |
+| Bid engine dies mid-command | Uncommitted commands replay; committed-but-unacked commands may also replay and must hit idempotency/sequence guards |
 | Read projection lags | Bid endpoint still uses authoritative state |
 | Payment fails after close | Settlement saga; result remains immutable |
 | Hot auction overloads partition | Isolate partition, admission controls, preserve bid ordering |
@@ -308,7 +314,7 @@ Active-active bidding across regions creates ambiguous close ordering and should
 - Strong authentication and step-up verification for high-value bids.
 - Payment-method verification and bidder limits before bid acceptance.
 - Prevent sellers, related accounts, or employees from shill bidding.
-- Detect bid shielding, collusion, bots, account takeover, and card testing.
+- Detect bid shielding, collusion, bots, account takeover, and card testing using account links, device fingerprinting, network features, historical bidding/cancellation patterns, and manual review.
 - Apply rate limits by account, device, IP, auction, and risk score.
 - Sign administrative actions and keep immutable audit logs.
 - Mask bidder identities publicly while retaining evidence for disputes.
@@ -369,7 +375,45 @@ no bid is accepted at or after effective_end_at
 - Per-bid push feels immediate.
 - Coalesced price/version updates keep hot auctions operable.
 
-## 18. Recommended interview presentation
+## 18. Lessons from production systems
+
+### eBay: proxy bidding is a maximum-bid contract
+
+eBay's automatic bidding model asks buyers for the maximum they are willing to pay, then raises the public bid only by the needed increment until that limit. This directly supports the design's separation between encrypted maximums and public visible prices. It also means the API contract should return the bid decision and public price, never the hidden maximum, and should remind clients that a winning bid is a contractual commitment.
+
+### eBay: expose bidding through scoped, explicit APIs
+
+eBay's public Offer API exposes placing and retracting proxy bids plus "auctions where the buyer is bidding" as separate operations. Map that to scoped idempotency keys, policy-controlled retractions, and user-bid summary projections. Retraction should not be a generic delete of bid history; it is a privileged state transition that preserves audit evidence.
+
+### eBay NuData: avoid scatter-gather secondary queries
+
+eBay's NuData GSI work describes customer, item, order, and payment data at petabyte scale across data centers, and explains why local secondary indexes still force queries to visit all shards when lookup keys differ from the primary shard key. For auctions, listing browse and seller-management queries should use dedicated global secondary indexes or projections keyed by category, seller, end time, and price rather than querying every `auction_id` shard.
+
+### eBay seller demand data: search starts before publish
+
+eBay's Buyer Demand Data architecture turns buyer keywords, filter clicks, and browsing paths into item-specific guidance during listing creation, reporting a 5% conversion lift and 15% increase in item-specific completion. Auction design should similarly treat facets and category attributes as first-class listing data, because better structured input improves search recall, ranking, and filter quality without touching bid correctness.
+
+### Whatnot: protect live events with admission control
+
+Whatnot prepared for a 2026 event by validating 1.46 million concurrent users and about 970,000 users in one stream, then used a Go Client Admission Service through Envoy/Istio to enforce global session caps and deterministic identity-based load shedding. Hot auctions need the same edge policy: protect already-admitted watchers and active bidders, reject excess joins cleanly, and never let realtime fan-out collapse core bidding.
+
+### Whatnot: connection pooling is a scaling boundary
+
+Whatnot found that scaling backend pods linearly hit Redis, OpenSearch, and Kafka connection ceilings, then inserted Envoy proxy layers for Redis/OpenSearch and a Kafka proxy per Kubernetes node; this enabled over 50,000 backend pods. Realtime auction gateways should similarly pool and shard downstream connections so watcher growth scales gateway CPU and bandwidth, not datastore connection count.
+
+### Whatnot: shill-bidding defense is graph and behavior analysis
+
+Whatnot describes shill bidding detection using device fingerprinting, account relationship mapping, bidding/cancellation patterns, anomaly detection, automation, and investigators, with shill activity down nearly 80% over six months. Auction platforms need a trust pipeline alongside bid acceptance: risk score before high-value bids, hold/review suspicious settlements, and keep enough immutable evidence to explain enforcement.
+
+### AWS: coordinate long-lived WebSocket ownership with leases
+
+AWS's WebSocket worker pattern uses DynamoDB conditional writes as time-bounded leases, heartbeats, SQS notifications, and GSI-backed reconciliation for orphaned connections. Realtime auction gateways can use the same pattern for topic ownership and reconnect draining: exactly one worker owns a hot topic shard at a time, expired leases are reclaimed, and `last_seq` lets clients resume safely.
+
+### AWS AppSync: managed realtime still needs a source of truth
+
+AWS AppSync's realtime reference architecture emphasizes managed WebSocket connection handling and one-to-many or many-to-many subscriptions, but application data still comes from backend sources. For auctions, managed subscriptions can reduce gateway burden, yet bid acceptance and close semantics must remain in the authoritative bid engine; subscriptions only deliver versioned hints to refetch or update read models.
+
+## 19. Recommended interview presentation
 
 A clear 45-minute sequence is:
 
@@ -385,3 +429,16 @@ A clear 45-minute sequence is:
 The central design insight is:
 
 > Give each auction one strongly consistent, totally ordered bid authority; derive scalable browse and realtime views from its versioned events, and make closing an idempotent state transition rather than trusting a timer.
+
+## Further reading: curated engineering blogs
+
+| Source | Article | Why it matters |
+|---|---|---|
+| eBay | [Automatic bidding](https://www.ebay.com/help/buying/bidding/automatic-bidding?id=4014) | Canonical proxy-bidding behavior: hidden maximums, public increments, immediate outbid semantics, and contractual commitment. |
+| eBay Developers | [Offer API](https://www.developer.ebay.com/develop/api/buy/offer_api) | Shows proxy bid placement/retraction and buyer bid summaries as explicit marketplace API capabilities. |
+| eBay | [eBay's Global Secondary Indexes](https://innovation.ebayinc.com/stories/ebays-global-secondary-indexes/) | Petabyte-scale distributed indexing pattern that avoids scatter-gather reads across listing shards. |
+| eBay | [How eBay's Distributed Architecture Surfaces More Item Listings for Buyers](https://innovation.ebayinc.com/stories/how-ebays-distributed-architecture-surfaces-more-item-listings-for-buyers/) | Connects buyer demand signals, listing attributes, and asynchronous data products to search quality. |
+| Whatnot | [Scaling Whatnot: Behind the Largest Live Shopping Stream in US History](https://medium.com/whatnot-engineering/scaling-whatnot-behind-the-largest-live-shopping-stream-in-us-history-040a458f538c) | Practical live-auction adjacent lessons on admission control, load testing, connection pooling, and hot-event readiness. |
+| Whatnot | [Taking On Shill Bidding](https://blog.teamwhatnot.com/unitedstates/taking-on-shill-bidding) | Trust-and-safety signals for detecting seller-related bids, collusion, and manipulation. |
+| AWS | [Building resilient real-time streaming workers with Amazon DynamoDB leases](https://aws.amazon.com/blogs/architecture/building-resilient-real-time-streaming-workers-with-amazon-dynamodb-leases/) | Lease, heartbeat, and reconciliation pattern for exactly-one ownership of stateful WebSocket work. |
+| AWS | [AWS AppSync real-time reference architecture](https://aws.amazon.com/blogs/mobile/aws-appsync-real-time-reference-architecture/) | Managed WebSocket subscription fan-out pattern for delivering realtime auction read-model updates. |

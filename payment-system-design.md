@@ -31,8 +31,8 @@ Out of scope: implementing card-network rails, consumer wallet UI, foreign-excha
 - 100 million payment attempts/day.
 - Average: about 1,160 attempts/second; peak: 10,000/second.
 - 70% authorize-and-capture, 20% separate capture, 10% failed/abandoned.
-- 20 ledger entries per successful lifecycle on average.
-- About 2 billion ledger postings/day including reserves, fees, refunds, and payouts.
+- 20 ledger postings per successful lifecycle on average.
+- About 2 billion ledger postings/day including reserves, fees, refunds, and payouts. At 250-500 bytes/posting before indexes, seven-year hot+cold retention is roughly 1.3-2.6 PB of raw postings before compression and replicas.
 - 10 million webhook deliveries/day, with retry bursts during merchant outages.
 - Seven-year financial retention, requiring tiered immutable storage and partitioned reporting.
 
@@ -215,7 +215,7 @@ GET  /v1/balance_transactions?cursor=...
 POST /v1/webhook_endpoints
 ```
 
-Scope every idempotency key to merchant, endpoint, and normalized request body. Reusing a key with different parameters returns a conflict.
+Scope every idempotency key to merchant, API endpoint, and normalized request body. Persist the first executed result and replay it on retries; reusing a key with different parameters returns a conflict.
 
 ## 6. Payment state machine
 
@@ -241,16 +241,16 @@ Transitions use compare-and-swap on `version` and validate allowed source states
 ## 7. Idempotent authorization and capture flow
 
 1. Authenticate merchant and validate amount, currency, payment token, and request key.
-2. Atomically create or retrieve the `PaymentIntent` by idempotency scope.
+2. Atomically create or retrieve the `PaymentIntent` and idempotency recovery state by scope.
 3. Run risk rules and, when required, return a 3-D Secure challenge.
 4. Create a stable `PaymentAttempt` and processor operation ID before network I/O.
 5. Send the operation through the chosen processor adapter.
 6. If approved, conditionally advance payment state.
-7. Post the corresponding balanced ledger transaction.
+7. Post the corresponding balanced ledger transaction using a unique business reference.
 8. Insert an outbox event in the same local transaction where architecture permits.
 9. Return authoritative state; webhooks notify asynchronous changes.
 
-If the processor times out, status becomes `PROCESSING` or `UNKNOWN`, not `FAILED`. Retry/query using the same processor operation ID. Creating a new operation risks a duplicate charge.
+If the processor times out, status becomes `PROCESSING` or `UNKNOWN`, not `FAILED`. Retry/query using the same processor operation ID and resume from the stored recovery point. Creating a new operation risks a duplicate charge.
 
 For processors without native idempotency, serialize operations per payment attempt and reconcile before retrying. A timeout is an uncertainty to resolve, not evidence of failure.
 
@@ -271,11 +271,20 @@ Debit  PlatformBankCash:USD          $100
 Credit ProcessorReceivable:USD       $100
 ```
 
-When paying the merchant:
+When funds become available to the merchant:
+
+```text
+Debit  MerchantPending:USD            $97
+Credit MerchantAvailable:USD          $97
+```
+
+When creating and executing the merchant payout:
 
 ```text
 Debit  MerchantAvailable:USD          $97
 Credit MerchantPayoutsPayable:USD     $97
+Debit  MerchantPayoutsPayable:USD     $97
+Credit PlatformBankCash:USD           $97
 ```
 
 The exact chart of accounts depends on legal entity and fund flow, but every movement has balanced postings. Keep pending, available, reserve, fee, refund, dispute, processor receivable, bank cash, and payout payable accounts distinct.
@@ -379,6 +388,7 @@ Exactly-once end-to-end delivery is not realistic. Achieve exactly-once financia
 - Partition payment intents and attempts by `merchant_id` plus hashed payment ID, balancing tenant locality against hot merchants.
 - Keep all mutable state for one payment on one database shard.
 - Partition ledger postings by legal entity, currency, and account range; preserve atomic transactions within a balancing boundary.
+- Avoid single global clearing accounts becoming hot keys; split by processor, merchant cohort, time bucket, or account range while retaining roll-up controls.
 - Maintain merchant balance/read projections separately from immutable postings.
 - Partition event streams by payment ID for per-object ordering.
 - Store reports and raw processor files in write-once object storage.
@@ -401,8 +411,9 @@ Moving ledger accounts between shards is complex. Choose partition boundaries fr
 | Settlement file is duplicated | File checksum/sequence and row-level idempotency |
 | Database shard fails | Synchronous replica promotion with fencing |
 | Processor is degraded | Circuit breaker; safe pre-attempt routing only |
+| Downstream dependency is slow | Short timeouts, bounded queues, backpressure, and explicit `PROCESSING` states |
 
-Use durable workflow state for operations spanning external calls. Dead-letter queues require alerts and operator tooling; they are not a terminal resolution for money.
+Use durable workflow state for operations spanning external calls. Dead-letter queues require alerts and operator tooling; they are not a terminal resolution for money. Run load tests that include global traffic distribution, retry storms, processor latency, and merchant webhook outages.
 
 ## 16. Multi-region design
 
@@ -493,7 +504,45 @@ Trace with internal IDs, never raw card data. Synthetic payments in processor te
 - Strong idempotency and ledger ordering become much harder.
 - Home-region ownership is the safer default.
 
-## 20. Recommended interview presentation
+## 20. Lessons from production systems
+
+### Stripe: idempotency is an API contract, not a best-effort cache
+
+Stripe's idempotency guidance treats network failure as ambiguous: a request may fail before execution, during execution, or after the side effect succeeded but before the client saw the response. This design should therefore persist idempotency state durably, replay the original result for the same merchant/endpoint/body, and combine client retries with exponential backoff and jitter.
+
+### Airbnb: resume distributed payment workflows from recovery points
+
+Airbnb built a generic idempotency framework because payment requests in SOA cross multiple services and side-effecting calls. Map that to this design by storing a recovery point for each payment operation, so a retry continues after completed local or external steps instead of re-running a processor call, ledger write, or payout transfer.
+
+### Stripe Ledger: model money movement as fund-flow state machines
+
+Stripe's Ledger represents producer systems as logical fund flows across accounts, then monitors clearing, timeliness, and completeness. Beyond balancing each transaction, this design should continuously query clearing accounts for nonzero aged balances, track missing/late events by reference ID, and make discrepancy ownership visible to the team that owns the producer.
+
+### Square Books: make the ledger a shared database primitive
+
+Square replaced product-specific settlement tables with Books, an immutable double-entry accounting database built to support multiple products and complex payout relationships. This reinforces keeping payment workflow tables separate from a reusable ledger service with journal entries, account-level ordering, reversals, and product-neutral settlement semantics.
+
+### Modern Treasury: hot accounts are a first-class ledger scaling problem
+
+Modern Treasury notes that common accounts in double-entry systems can become write bottlenecks, especially when synchronous authorizations must prevent overdrafts. Partition processor receivables, cash, reserve, and platform accounts by currency, processor, cohort, or time window, and use cached/snapshot balances only when backed by serializable writes and replayable immutable entries.
+
+### Uber Gulfstream: batch hot financial updates without weakening consistency
+
+Uber's Gulfstream uses double-entry principles and immutable account changelogs, but hot business accounts exceeded sequential update limits. Their high-throughput account processing shows why this design needs per-account queue depth metrics, batchable adjustment workflows, and carefully defined account partitions rather than assuming one row can absorb every merchant, fleet, or payout burst.
+
+### Shopify: resilience starts with timeouts, queues, and load tests
+
+Shopify's payments guidance emphasizes low timeouts, queueing theory, and realistic load testing well before peak events. For this design, processor adapters, database queries, webhook delivery, and reconciliation jobs need explicit timeouts, bounded retries, jitter, backpressure, and synthetic tests that model Black-Friday-scale retry amplification.
+
+### Stripe online migrations: evolve financial schemas with dual writes and verification
+
+Stripe's online migration pattern uses dual writes, backfills, read switches, and cleanup while services continue running. Apply the same discipline to payment and ledger schema changes: never rewrite historical postings in place, run migrations behind feature flags, compare old/new projections during backfill, and block cutover until reconciliation metrics match.
+
+### Airbnb payment orchestration: decouple product flows from money movement
+
+Airbnb's payment-orchestration migration separated reusable money-movement workflows from product-specific reservation logic. This design should keep order or subscription concepts outside the ledger and processor core, expressing them as business references and policy inputs so new products do not fork the correctness-critical payment path.
+
+## 21. Recommended interview presentation
 
 A clear 45-minute sequence is:
 
@@ -509,3 +558,17 @@ A clear 45-minute sequence is:
 The central design insight is:
 
 > Treat external payment status as asynchronous and sometimes uncertain, but make internal monetary effects deterministic through scoped idempotency, guarded state machines, an immutable balanced ledger, and continuous reconciliation against processors and banks.
+
+## Further reading: curated engineering blogs
+
+| Source | Article | Why it matters |
+|---|---|---|
+| Stripe | [Designing robust and predictable APIs with idempotency](https://stripe.com/blog/idempotency) | Explains ambiguous network failures, idempotency keys, replayed results, and backoff for safe payment retries. |
+| Airbnb | [Avoiding double payments in a distributed payments system](https://medium.com/airbnb-engineering/avoiding-double-payments-in-a-distributed-payments-system-2981f6b070bb) | Shows a recovery-point idempotency framework for exactly-once effects across payment microservices. |
+| Stripe | [Ledger: Stripe's system for tracking and validating money movement](https://stripe.com/blog/ledger-stripe-system-for-tracking-and-validating-money-movement) | Describes immutable fund-flow modeling, clearing/timeliness/completeness checks, and data-quality tooling at payment scale. |
+| Square | [Books, an immutable double-entry accounting database service](https://developer.squareup.com/blog/books-an-immutable-double-entry-accounting-database-service/) | Details why Square built a shared double-entry ledger database for settlements, payouts, consistency, and auditability. |
+| Modern Treasury | [Behind the Scenes: How We Built Ledgers for High Throughput](https://www.moderntreasury.com/journal/behind-the-scenes-how-we-built-ledgers-for-high-throughput) | Covers hot-account bottlenecks, balance caching, and making double-entry ledger writes fast enough for critical paths. |
+| Uber | [Building High Throughput Payment Account Processing](https://www.uber.com/us/en/blog/high-throughput-processing/) | Explains how Uber handles bursty hot financial accounts while preserving strict consistency in Gulfstream. |
+| Shopify | [10 Tips for Building Resilient Payment Systems](https://shopify.engineering/building-resilient-payment-systems) | Practical payment resilience advice on low timeouts, queues, retries, observability, and realistic load testing. |
+| Stripe | [Online migrations at scale](https://stripe.com/blog/online-migrations) | Gives a dual-write/backfill/read-switch pattern for evolving payment schemas without downtime or data divergence. |
+| Airbnb | [Rebuilding Payment Orchestration at Airbnb](https://medium.com/airbnb-engineering/rebuilding-payment-orchestration-at-airbnb-341d194a781b) | Shows how Airbnb decoupled reusable payment orchestration from product-specific booking flows during SOA migration. |

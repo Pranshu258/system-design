@@ -35,8 +35,8 @@
 - 100 million new posts/day: approximately 1,200/second average and 10,000/second peak.
 - Average feed page: 20 items.
 - Average user follows 300 sources; a celebrity may have 100 million followers.
-- Candidate retrieval may inspect 500-2,000 items to rank 20.
-- Post metadata averages 2 KB; media is stored separately in object storage.
+- Candidate retrieval may inspect 500-2,000 items to rank 20. At 12.5 billion page reads/day, that is 6.25-25 trillion candidate inspections/day, or roughly 72-289 million inspections/second average before caching and pre-ranking.
+- Post metadata averages 2 KB; media is stored separately in object storage. New post metadata is about 200 GB/day before indexes, replicas, inbox references, and logs.
 
 Naively joining every user's follow graph against recent posts at read time is too expensive. Naively writing every celebrity post into every follower inbox is also too expensive. The core design is therefore hybrid fan-out.
 
@@ -260,7 +260,7 @@ For celebrities and other high-fan-out sources:
 - Fetch their recent posts during candidate generation.
 - Merge them with the materialized inbox at read time.
 
-Select the mode using follower count, active-follower ratio, posting rate, and current system load. A hybrid avoids both write explosions and expensive full graph joins. Changing modes must tolerate overlap; deduplicate by `post_id`.
+Select the mode using follower count, active-follower ratio, posting rate, and current system load. A hybrid avoids both write explosions and expensive full graph joins. LinkedIn FollowFeed found full fan-out-on-write could inflate data size by 62x and make ranking-model A/B tests expensive, so only materialize cheap candidate references, not final rank order, and keep relevance scoring online. Changing modes must tolerate overlap; deduplicate by `post_id`.
 
 ## 8. Feed read and ranking flow
 
@@ -269,18 +269,20 @@ Select the mode using follower count, active-follower ratio, posting rate, and c
 3. Remove exact duplicates and previously served items for this feed session.
 4. Perform an early privacy, block, deletion, and moderation filter.
 5. Hydrate online features in batches.
-6. Apply a lightweight pre-ranker to reduce candidates.
+6. Apply a lightweight pre-ranker to reduce candidates, similar to production cascades that avoid running heavy models on every possible item.
 7. Apply the main ranking model.
-8. Re-rank for diversity, freshness, creator frequency caps, integrity, and ad constraints.
+8. Re-rank for diversity, freshness, creator frequency caps, integrity, and ad constraints. Instagram explicitly normalizes across media types and applies author/media diversity rules after scoring; keep those as serving-time constraints, not only training objectives.
 9. Recheck authoritative eligibility immediately before response.
 10. Return posts, explanations, signed tracking tokens, and the next cursor.
 11. Log impressions asynchronously.
 
-The request has a strict time budget. Candidate sources and models receive deadlines; late optional sources are omitted rather than delaying the page. Core followed-content retrieval has a larger share of the budget than experimental recommendations.
+The request has a strict time budget. Candidate sources and models receive deadlines; late optional sources are omitted rather than delaying the page. Core followed-content retrieval has a larger share of the budget than experimental recommendations. Twitter/X-style pipelines also separate candidate sourcing, feature hydration, heavy ranking, visibility filtering, and mixing so each stage can shed work independently.
 
 ## 9. Ranking model and feature design
 
-The ranker estimates multiple outcomes rather than a single click:
+The ranker estimates multiple outcomes rather than a single click. Meta describes News Feed ranking as optimizing multiple predictions, weighted toward long-term value and survey-backed quality, rather than raw engagement alone.
+
+The ranker estimates:
 
 - Probability of meaningful engagement.
 - Expected dwell time.
@@ -290,13 +292,13 @@ The ranker estimates multiple outcomes rather than a single click:
 
 Feature classes include:
 
-- Viewer-author interactions and graph proximity.
+- Viewer-author interactions, graph proximity, community embeddings, and relationship-strength models.
 - Post age, type, language, and topic.
 - Recent aggregate engagement with age normalization.
 - User preferences, device, network, and session context.
 - Negative feedback and policy risk.
 
-Offline pipelines train on impression-labeled data and publish versioned models. The online feature store serves freshness-sensitive values; static embeddings may be cached. Training/serving feature definitions must be shared to avoid skew. Never train only on clicks without accounting for position bias and prior model exposure.
+Offline pipelines train on impression-labeled data and publish versioned models. The online feature store serves freshness-sensitive values; static embeddings may be cached. Graph/community embeddings such as X/Twitter SimClusters, TwHIN, and RealGraph-style relationship features are useful for out-of-network recommendations and social proof. Training/serving feature definitions must be shared to avoid skew. Never train only on clicks without accounting for position bias and prior model exposure.
 
 ## 10. Pagination, deduplication, and freshness
 
@@ -312,7 +314,7 @@ expiry
 signature
 ```
 
-Freezing an entire feed gives stable pagination but quickly becomes stale. Recomputing every page is fresh but causes duplicates and reorderings. A practical compromise keeps a short-lived candidate snapshot, excludes already served IDs, and allows limited fresh-post injection.
+Freezing an entire feed gives stable pagination but quickly becomes stale. Recomputing every page is fresh but causes duplicates and reorderings. A practical compromise keeps a short-lived candidate snapshot, separates unseen candidate pools from already presented items, excludes already served IDs, and allows limited fresh-post injection. Pinterest Smart Feed used this unseen-versus-seen separation to defer lower-value items rather than discard all unshown content.
 
 Bloom filters are compact but can falsely suppress an item. A server-side exact set is more precise but costs state. Bound session length and accept that feed pagination is best-effort, not a financial ledger.
 
@@ -323,7 +325,7 @@ Strong consistency is needed for:
 - Creating and deleting canonical posts.
 - Audience and ownership changes.
 - Blocks and account disablement.
-- Exactly one active reaction per user/post/type policy.
+- Exactly one active reaction per user/post when reactions are mutually exclusive, or idempotent per-type reactions if the product allows multiple simultaneous reaction types.
 
 Eventually consistent projections include inboxes, counts, search, ranking features, and notifications.
 
@@ -350,18 +352,18 @@ Eligibility depends on:
 - Geographic, age, and legal restrictions.
 - Moderation state.
 
-Apply cheap filters during candidate generation and authoritative checks at response time. Never assume that presence in an inbox proves current authorization.
+Apply cheap filters during candidate generation and authoritative checks at response time. Never assume that presence in an inbox proves current authorization. Systems like Meta TAO model social data as objects and associations and are optimized for high-volume single-hop graph reads; a feed design should keep graph lookups cheap, cached, and versioned rather than doing deep graph traversals in the hot path.
 
 ## 13. Partitioning, caching, and storage
 
 - Partition canonical posts by `post_id`; index author timelines by `(author_id, created_at)`.
 - Partition inboxes by `user_id` and time bucket to bound partitions.
 - Partition graph adjacency by source user and shard celebrity reverse edges.
-- Partition event logs by `author_id` for publication order, salting celebrity fan-out work into batches.
+- Partition the immutable publication log by `author_id` when per-author ordering is required, then emit separate salted fan-out task records for celebrity distribution so one author does not pin all worker parallelism to one hot partition.
 - Store media in immutable object storage and deliver through a CDN.
 - Cache hydrated posts, graph summaries, model features, and first feed pages.
 
-First-page feed caches have high value but invalidate frequently. Cache a candidate or ranked-ID list for a short TTL, then rehydrate and refilter. Do not cache fully authorized responses across users.
+First-page feed caches have high value but invalidate frequently. Cache a candidate or ranked-ID list for a short TTL, then rehydrate and refilter. Do not cache fully authorized responses across users. For core storage, Twitter Manhattan shows why social feeds often need multi-tenant low-latency key-value stores with quotas, rate limits, and per-workload storage engines rather than one generic database.
 
 Inbox retention is finite; old items can be reconstructed from author timelines when users scroll deeply. This caps storage and keeps hot partitions small.
 
@@ -436,7 +438,7 @@ Track:
 - Privacy-filter denials and deletion/block propagation latency.
 - Impression-log loss and counter lag.
 
-Use guarded experiments with stable assignment, holdouts, sample-ratio-mismatch detection, and predefined safety metrics. Optimize long-term user value, not only short-term clicks. Every response logs model, feature, and experiment versions without logging sensitive raw content unnecessarily.
+Use guarded experiments with stable assignment, holdouts, sample-ratio-mismatch detection, and predefined safety metrics. Optimize long-term user value, not only short-term clicks. Pinterest used PID controllers over impression streams to keep content-type distribution targets stable as ranking models changed; similar post-ranking controls keep freshness, media mix, and creator exposure from drifting. Every response logs model, feature, and experiment versions without logging sensitive raw content unnecessarily. LinkedIn streams feature tracking asynchronously from index nodes and brokers to avoid adding synchronous latency while preserving training/serving consistency.
 
 ## 19. Major trade-offs
 
@@ -464,7 +466,49 @@ Large models improve relevance but add latency and dependencies. A lightweight m
 
 Exact server-side served sets cost memory. Bloom filters are compact but occasionally hide unseen items. The UX normally tolerates approximate suppression.
 
-## 20. Recommended interview presentation
+## 20. Lessons from production systems
+
+### Meta News Feed: multi-pass ranking and value-aligned objectives
+
+Meta describes News Feed ranking as a multi-stage process: gather eligible inventory, predict multiple outcomes, combine those predictions into a value score, and apply rules such as content-type diversity. This supports the design's pre-ranker, main ranker, and re-ranker split. The important production lesson is not to optimize only for clicks; include hides, reports, meaningful interactions, freshness, and survey- or quality-backed labels.
+
+### Meta TAO: social graph reads are a first-class storage problem
+
+TAO was built because Facebook's graph workload is read-heavy, highly customized, hard to partition, and sensitive to celebrity hot spots. It models objects and associations with cache-aware APIs and primary/secondary regional behavior. For this design, graph and privacy checks should be single-hop, cached, versioned, and backed by an authoritative store; feed inboxes must remain derived indexes.
+
+### X/Twitter timelines: relevance sits on top of chronological inventory
+
+Twitter's ranked timeline started from reverse-chronological followed content, then scored candidates with deep models and placed the best items above the time-ordered remainder or in modules such as “In case you missed it.” This maps to preserving a chronological fallback while letting relevance ranking promote selected content. The fallback is not a separate product afterthought; it is the reliability baseline.
+
+### X/Twitter recommendation algorithm: explicit pipeline boundaries
+
+The open X recommendation repository breaks the system into shared data streams, user-signal services, graph/embedding features, candidate sources, model serving, product mixing, and visibility filters. That reinforces separating candidate generation, feature hydration, heavy ranking, integrity filtering, and mixing in this design so experiments or failures in one stage do not corrupt the whole feed.
+
+### Twitter Manhattan: low-latency social storage needs workload isolation
+
+Manhattan was built for millions of low-latency queries per second, multi-region scale, multi-tenancy, quotas, rate limiting, and predictable operation. A production feed should budget storage classes separately: canonical post store, author timelines, inbox references, counters, features, and event logs have different consistency, latency, and access patterns. Do not force all of them through one storage engine.
+
+### LinkedIn FollowFeed: fan-out-on-read can beat pre-materialized feeds
+
+LinkedIn replaced a generic search system with FollowFeed, a timeline index over entities, and reported a fivefold reduction in mobile feed p99 latency, 20x larger index, and 50% lower capex. It chose fan-out-on-read because full fan-out-on-write was measured at 62x larger data size and made relevance A/B tests hard. This design should materialize candidate references selectively, but compute relevance online.
+
+### LinkedIn Feed ranking: two-pass ranking and local features
+
+LinkedIn's feed uses multiple first-pass rankers, including FollowFeed for network content, and a second-pass ranker to merge inventories. FollowFeed stores activity features near indexed records, passes viewer features in the request, and asynchronously streams tracking events for training/serving consistency. This maps directly to batched feature hydration, local feature caches, and asynchronous impression logging.
+
+### Pinterest Smart Feed: defer, mix, and remember unseen content
+
+Pinterest moved from newest-first to Smart Feed, mixing sources at different rates, dropping or deferring lower-value Pins, and separating available unseen content from already presented content. That supports this design's short-lived candidate snapshot and served-item set: pagination should manage unseen inventory explicitly rather than repeatedly re-querying and hoping deduplication fixes the UX.
+
+### Pinterest controllable distribution: post-ranking control loops
+
+Pinterest used PID controllers over frontend impression streams to tune normalization constants for content-type targets, replacing brittle periodic insertion rules. This maps to the re-ranker: diversity, freshness, creator exposure, and media mix need observable control loops and guardrails because model score distributions drift after ranking-model updates.
+
+### Instagram Feed ranking: normalize and diversify after scoring
+
+Instagram's Feed ranking system card describes sourcing unseen followed content, filtering, predicting actions, combining scores, normalizing across post types, applying integrity demotions, and enforcing author/media diversity rules such as limiting consecutive posts from the same account. This validates the final serving-time policy filter and diversity re-ranker in this design.
+
+## 21. Recommended interview presentation
 
 1. Clarify graph semantics, chronological mode, post privacy, recommendations, and ads.
 2. Estimate feed reads, posts, average follow count, and celebrity fan-out.
@@ -477,3 +521,18 @@ Exact server-side served sets cost memory. Bloom filters are compact but occasio
 9. Close with integrity, experimentation, and the chronological fallback.
 
 A strong answer treats ranking as only one layer. Durable posts, scalable candidate generation, final authorization checks, stable-enough pagination, and graceful fallback are what make the feed production-ready.
+
+## Further reading: curated engineering blogs
+
+| Source | Article | Why it matters |
+|---|---|---|
+| Meta | [How machine learning powers Facebook’s News Feed ranking algorithm](https://engineering.fb.com/2021/01/26/ml-applications/news-feed-ranking/) | Shows multi-pass News Feed ranking, multi-objective predictions, and diversity rules at billions-user scale. |
+| Meta | [TAO: The power of the graph](https://engineering.fb.com/2013/06/25/core-infra/tao-the-power-of-the-graph/) | Explains social graph storage, object/association APIs, celebrity hot spots, and cache-aware graph reads. |
+| X/Twitter | [Using Deep Learning at Scale in Twitter’s Timelines](https://blog.x.com/engineering/en_us/topics/insights/2017/using-deep-learning-at-scale-in-twitters-timelines) | Shows ranked timeline layering over chronological followed inventory and relevance scoring under tight latency. |
+| X/Twitter | [X’s Recommendation Algorithm](https://github.com/twitter/the-algorithm/blob/main/README.md) | Documents candidate sources, real-time user signals, graph embeddings, model serving, product mixing, and visibility filters. |
+| X/Twitter | [Manhattan, our real-time, multi-tenant distributed database for Twitter scale](https://blog.x.com/engineering/en_us/a/2014/manhattan-our-real-time-multi-tenant-distributed-database-for-twitter-scale) | Covers low-latency multi-tenant storage, quotas, rate limits, replication, and workload-specific storage for social data. |
+| LinkedIn | [FollowFeed: LinkedIn’s Feed Made Faster and Smarter](https://www.linkedin.com/blog/engineering/feed/followfeed-linkedin-s-feed-made-faster-and-smarter) | Explains timeline indexes, fan-out-on-read trade-offs, online relevance, RocksDB storage, and p99/feed-cost wins. |
+| LinkedIn | [Community-focused Feed optimization](https://www.linkedin.com/blog/engineering/feed/community-focused-feed-optimization) | Details two-pass feed ranking, local feature storage, Quasar model inference, data-pack deployment, and async feature tracking. |
+| Pinterest | [Building a smarter home feed](https://medium.com/pinterest-engineering/building-a-smarter-home-feed-ad1918fdfbe3) | Introduces Smart Feed source mixing, best-first ordering, unseen/presented separation, and deferring lower-value items. |
+| Pinterest | [Using PID controllers to diversify content types on home feed](https://medium.com/pinterest-engineering/using-pid-controllers-to-diversify-content-types-on-home-feed-1c7195c89218) | Shows production control loops for media mix, freshness, creator goals, and AB-test-safe post-ranking constraints. |
+| Meta/Instagram | [Instagram Feed Ranking System Card](https://ai.meta.com/tools/system-cards/instagram-feed-ranking/) | Summarizes feed sourcing, action prediction, score normalization, integrity demotions, and author/media diversity rules. |

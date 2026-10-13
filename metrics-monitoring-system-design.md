@@ -36,11 +36,11 @@ Assume:
 - 100,000 dashboard queries/second and 10 million alert rules evaluated each minute.
 
 ```text
-67M samples/s x 86,400 x 2 compressed bytes
-= about 11.6 TB/day for sample payloads
+66.7M samples/s x 86,400 x 2 compressed bytes
+= about 11.5 TB/day, or 10.5 TiB/day, for sample payloads
 ```
 
-Indexes, replication, write-ahead logs, and object metadata add several times that amount. Cardinality, not only bytes, drives memory: an in-memory 200-byte head per active series would require roughly 200 GB before replicas and caches.
+Indexes, replication, write-ahead logs, and object metadata add several times that amount. Cardinality, not only bytes, drives memory: an in-memory 200-byte head per active series would require roughly 200 GB before replicas and caches, and production systems often budget more for label indexes and churn.
 
 ## 3. High-level architecture
 
@@ -152,7 +152,7 @@ Range queries return a matrix of timestamp/value pairs plus warnings for partial
 3. A consistent hash routes each series to an ingest partition.
 4. The gateway appends the batch to a quorum-replicated log before acknowledging it.
 5. An ingest worker deduplicates request IDs within a bounded window and appends samples to its write-ahead log and in-memory head.
-6. Periodically, the worker compacts immutable two-hour blocks, uploads them to object storage, and publishes block metadata.
+6. Periodically, the worker cuts immutable two-hour blocks, uploads them to object storage, and publishes block metadata; larger compactions run asynchronously.
 7. Catalog updates make newly observed series discoverable.
 
 At-least-once agents are preferable to losing metrics. Identical timestamp/value pairs are collapsed; conflicting values at one timestamp use a documented winner, normally the latest accepted sample, and increment a conflict metric.
@@ -166,7 +166,7 @@ Each worker adds target health metrics, applies timeouts, and uses jitter so all
 - Gateways return `429` with retry guidance.
 - Agents use exponential backoff, jitter, a bounded disk spool, and oldest-first replay.
 - Per-tenant fair queues prevent one customer from consuming all capacity.
-- Low-priority recording rules may be delayed before ingestion is dropped.
+- Low-priority derived-metric writes, rollups, and recording-rule evaluations may be delayed before raw ingestion is dropped.
 
 Never silently report success for discarded samples. Surface dropped-series and spool-age telemetry locally and centrally.
 
@@ -178,6 +178,7 @@ Optimizations:
 
 - Cache immutable block indexes and normalized query results.
 - Push label filters and partial `sum`, `min`, and `max` to leaves.
+- Fan out through a query tree for multi-region or very large tenants so aggregation happens near storage instead of at one root reducer.
 - Align dashboard time ranges and steps to improve cache reuse.
 - Use recording rules for expensive, recurring expressions.
 - Select a coarser downsampled resolution when the requested pixel density permits it.
@@ -213,7 +214,7 @@ Concurrent rule edits use an `etag` or revision. Alert leases require fencing to
 
 Partition first by tenant, then hash by series fingerprint. Large tenants receive dedicated virtual shards; small tenants share shards. Time partitioning creates immutable blocks, enabling cheap object storage and parallel range scans.
 
-The inverted catalog maps `(tenant, label_name, label_value)` to compressed postings of series IDs. High-cardinality values make this index expensive, so enforce per-metric series limits and expose cardinality reports.
+The inverted catalog maps `(tenant, label_name, label_value)` to compressed postings of series IDs. Keep this index independently scalable from point storage, because high-cardinality values can dominate memory and query planning even when raw sample bytes are manageable. Enforce per-metric series limits and expose cardinality reports.
 
 Within a block, group samples by series and encode:
 
@@ -242,7 +243,7 @@ Maintain head replicas in separate failure domains. Regularly restore blocks and
 
 ## 13. Retention and lifecycle
 
-Keep raw samples for short diagnostic windows, then compact to 1-minute and 5-minute rollups containing count, sum, min, max, and histogram sketches. Averages alone are insufficient because they cannot be safely re-aggregated.
+Keep raw samples for short diagnostic windows, then compact to 1-minute and 5-minute rollups containing count, sum, min, max, reset-aware counter increase, first/last samples, and histogram sketches. Averages alone are insufficient because they cannot be safely re-aggregated, and counters need reset-aware rollups for correct rates.
 
 Deletion records tenant/time predicates as tombstones. Queries honor tombstones immediately; asynchronous rewrite removes bytes. Legal deletion needs completion tracking across raw blocks, rollups, caches, and backups.
 
@@ -283,7 +284,7 @@ Synthetic canary series should continuously test write, query, rule evaluation, 
 
 ## 17. Bottlenecks and evolution
 
-The first bottleneck is usually label cardinality, followed by catalog memory and fan-out queries. Add admission control before merely adding storage. Dedicated heavy-tenant shards, query scheduling, recording rules, and downsampling are safer scaling steps.
+The first bottleneck is usually label cardinality, followed by catalog memory, recovery time, and fan-out queries. Add admission control before merely adding storage. Dedicated heavy-tenant shards, query scheduling, recording rules, and downsampling are safer scaling steps.
 
 Do not promise arbitrary SQL over all samples. Keep the query language optimized for time-series selection and vector aggregation, and export bounded data for offline analytics.
 
@@ -309,7 +310,41 @@ Dashboards may accept marked partial results. Alerts should reserve capacity and
 
 Raw data supports arbitrary debugging but is expensive. Rollups reduce cost but permanently limit resolution and available functions.
 
-## 19. Recommended interview presentation
+## 19. Lessons from production systems
+
+### Meta Beringei / Facebook Gorilla: hot data deserves a memory-optimized path
+
+Meta built Beringei from the Gorilla paper because HBase-backed monitoring had multi-second to timeout-class reads for dashboard-scale queries. The key insight is a dedicated hot path: keep roughly the most recent day in memory, persist for restart, and use streaming timestamp delta-of-delta plus float XOR compression to cut memory by at least 90%. This design should keep the mutable head small, replicated, and heavily optimized rather than treating all retention tiers the same.
+
+### Prometheus TSDB: immutable two-hour blocks plus WAL are the baseline
+
+Prometheus stores incoming samples in a mutable head protected by a WAL, then writes two-hour immutable blocks with chunks, an index, metadata, and tombstones. That maps directly to this design's head-plus-block architecture: acknowledge only after durable logging, make recent data fast, and make historical blocks immutable so compaction, caching, snapshots, and object storage are simple. The important caveat is that single-node Prometheus is not clustered or replicated, so this design must add sharding, replication, and remote storage semantics explicitly.
+
+### Uber M3: retention and rollup policies are first-class, not an afterthought
+
+Uber's M3 replaced a Graphite/Carbon/Whisper stack that was hard to reshard and lost data on disk failures. M3 reports more than 6.6 billion time series, 500 million metrics per second aggregated, and 20 million persisted metrics per second globally, with quorum writes to three replicas in a region. Its Coordinator applies downsampling, retention, and rollup rules from policy, which supports this design's per-tenant and per-metric retention policies instead of one global raw-retention knob.
+
+### Netflix Atlas: dimensionality and query trees are product requirements
+
+Netflix Atlas was built after a 2 million-series internal system failed to keep up and users encoded dimensions into metric names with ad hoc regex conventions. Atlas made dimensional tags and a common query API core requirements, with isolated regional deployments and a global query layer that composes results hierarchically. That reinforces early label normalization, a real series catalog, and tree-shaped query fan-out for global dashboards.
+
+### Grafana Mimir: active-series scale is the hard part
+
+Grafana's Mimir load test reached 1 billion active series in one cluster using about 1,500 replicas, 7,000 CPU cores, and 30 TiB RAM; with default redundancy, 1 billion logical active series became 3 billion ingested series before compaction deduped them. This validates the document's emphasis that active cardinality, not historical sample count, drives memory, replication traffic, and operational cost. It also argues for tenant limits, shuffle sharding, and redundancy-aware capacity math.
+
+### Datadog metrics engine: split point storage from tag indexing
+
+Datadog describes its real-time metrics storage as separate RTDB nodes for `<timeseries_id, timestamp, value>` data and an index database for `<timeseries_id, tags>`, with routers and query services joining the two. Their newer Rust engine achieved a reported 60x ingestion improvement and 5x faster peak queries by redesigning the storage engine around high-cardinality and bursty workloads. This supports separating the series catalog from sample storage and scaling/throttling them independently.
+
+### Pinterest Goku: bootstrap and recovery time can dominate availability
+
+Pinterest's Goku separates short-term in-memory storage, long-term SSD/HDD storage, a compactor, and smart query routing. In one older recovery path, 150-200 hosts per cluster each held about 80 GB in memory, while shared EFS throughput around 1024 MB/s caused multi-host recovery to approach or exceed two hours. This design should treat recovery bandwidth, replay length, and bootstrap fan-out as capacity targets, not just steady-state ingest/query rates.
+
+### Cloudflare Prometheus: cardinality needs lifecycle ownership
+
+Cloudflare reported 916 Prometheus instances and about 4.9 billion time series, with the largest instances around 30 million series. Their operational lesson is that metric lifecycle, ownership, and cardinality control are as important as backend tuning. This design should provide per-metric owners, cardinality dashboards, pre-ingest label controls, and safe defaults so a single label such as user ID or request path cannot destabilize the platform.
+
+## 20. Recommended interview presentation
 
 A clear 45-minute sequence is:
 
@@ -325,3 +360,16 @@ A clear 45-minute sequence is:
 The central design insight is:
 
 > Treat each labeled series as an ordered append stream, acknowledge through a durable log, store recent data in a fast mutable head and history in immutable compressed blocks, and protect alert evaluation from noisy ingestion and queries.
+
+## Further reading: curated engineering blogs
+
+| Source | Article | Why it matters |
+|---|---|---|
+| Meta | [Beringei: A high-performance time series storage engine](https://engineering.fb.com/2017/02/03/core-infra/beringei-a-high-performance-time-series-storage-engine/) | Explains the Gorilla-style in-memory hot store, delta-of-delta timestamps, XOR float compression, and why recent metrics need millisecond reads. |
+| Prometheus | [Storage](https://prometheus.io/docs/prometheus/latest/storage/) | Canonical reference for WAL-protected head chunks, two-hour immutable blocks, tombstones, compaction, and the 1-2 bytes/sample rule of thumb. |
+| Uber | [M3: Uber’s Open Source, Large-scale Metrics Platform for Prometheus](https://www.uber.com/gb/en/blog/m3/) | Shows multi-tenant Prometheus-compatible metrics at billions of series, quorum writes, global queries, and policy-driven rollups/retention. |
+| Netflix | [Atlas Overview](https://netflix.github.io/atlas-docs/overview/) | Covers dimensional metrics, regional isolation, global query composition, and why metric-name encoding does not scale. |
+| Grafana Labs | [How we scaled our new Prometheus TSDB Grafana Mimir to 1 billion active series](https://grafana.com/blog/how-we-scaled-our-new-prometheus-tsdb-grafana-mimir-to-1-billion-active-series/) | Quantifies active-series scaling, redundancy overhead, load testing, and resource needs for billion-series clusters. |
+| Datadog | [Evolving our real-time timeseries storage again: Built in Rust for performance at scale](https://www.datadoghq.com/blog/engineering/rust-timeseries-engine/) | Describes separating real-time point storage from tag indexing and redesigning the hot engine for high-cardinality, bursty workloads. |
+| Pinterest | [Improving Efficiency Of Goku Time Series Database at Pinterest (Part — 1)](https://medium.com/pinterest-engineering/improving-efficiency-of-goku-time-series-database-at-pinterest-part-1-7659b94796f4) | Highlights short-term/long-term storage separation, compaction, smart routing, and recovery-time bottlenecks. |
+| Cloudflare | [How Cloudflare runs Prometheus at scale](https://blog.cloudflare.com/how-cloudflare-runs-prometheus-at-scale/) | Gives operational lessons from hundreds of Prometheus instances, billions of series, and practical cardinality governance. |

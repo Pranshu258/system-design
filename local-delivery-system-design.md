@@ -28,12 +28,12 @@ Out of scope: marketplace restaurants, scheduled parcel shipping, and warehouse 
 
 - 20 million registered users; 3 million daily active users.
 - 1,000 MFCs across several countries.
-- 2 million orders/day; 100,000 orders at peak hour.
-- Peak checkout rate: about 30-50 orders/second globally, with strong local spikes.
-- 25 items/order; 50 million order lines/day.
+- 2 million orders/day, averaging about 23 orders/second.
+- 100,000 orders in the peak hour, or about 28 orders/second globally; use 30-50 orders/second for headroom, with strong local spikes.
+- 25 items/order; 50 million order lines/day, averaging about 579 lines/second and about 694 lines/second in the 100,000-order peak hour.
 - 50,000 active couriers at peak, emitting location every 5 seconds: 10,000 updates/second.
-- 5,000 SKUs per MFC; about 5 million location-SKU inventory rows.
-- Browse traffic is roughly 100 times order-write traffic.
+- 5,000 SKUs per MFC; about 5 million MFC-SKU inventory rows.
+- Browse traffic is roughly 100 times order-write traffic, or about 3,000-5,000 reads/second at peak before CDN and app cache hits.
 
 The global throughput is manageable, but locality creates hot partitions: a single MFC can receive hundreds of simultaneous checkouts during a promotion or weather event.
 
@@ -163,7 +163,7 @@ sellable >= 0
 GET /v1/catalog?latitude=37.78&longitude=-122.41
 ```
 
-The response includes an `mfc_id`, catalog version, estimated availability, prices, and delivery estimate. Browse availability is advisory; checkout performs authoritative reservation.
+The response includes an `mfc_id`, catalog version, estimated availability, prices, and delivery estimate. Browse availability is advisory; checkout performs authoritative reservation. For grocery and quick commerce, search and browse should resolve against the customer's candidate MFCs, then revalidate authoritative price and stock before checkout because hub inventory can change between keystrokes and payment.
 
 ### Create an order
 
@@ -223,7 +223,7 @@ ETA = order_queue_delay
     + route_travel_time
 ```
 
-Use percentile estimates rather than averages and recalibrate continuously. The displayed ETA should include capacity and uncertainty; optimistic straight-line distance alone causes missed promises.
+Use percentile or probabilistic estimates rather than averages and recalibrate continuously. The displayed ETA should include capacity and uncertainty; optimistic straight-line distance alone causes missed promises. Keep an ML fallback path with clipped inputs/outputs or conservative heuristics so upstream feature-unit bugs do not produce unsafe promises.
 
 ## 7. Checkout and order saga
 
@@ -264,7 +264,7 @@ Lock rows in sorted `sku_id` order to reduce deadlocks. If any line fails, roll 
 
 Browse reads use an eventually consistent cache. Checkout uses the primary inventory store. Reservation records have expirations; a sweeper releases abandoned holds, but it must transition reservation state conditionally so it cannot release a consumed hold.
 
-Physical stock can still differ because of shrinkage, damage, or mis-picks. Cycle counts and picker reports produce adjustments. Safety stock and conservative low-stock thresholds trade sales for fewer substitutions.
+Physical stock can still differ because of shrinkage, damage, or mis-picks. Cycle counts and picker reports produce adjustments. Safety stock and conservative low-stock thresholds trade sales for fewer substitutions. For browse/search ranking, feed inventory confidence into retrieval or ranking, but keep a final real-time inventory check in the order path; stale projections should hide or down-rank risky items, not become the source of truth.
 
 ## 9. Picking, substitution, and handoff
 
@@ -273,7 +273,7 @@ Fulfillment queues are partitioned by MFC. Within a center, prioritize by promis
 1. A picker claims a task with a lease.
 2. The app gives a route optimized for aisle/bin locations.
 3. Each scan validates barcode and quantity.
-4. Missing items trigger the customer's substitution policy.
+4. Missing items trigger the customer's substitution policy and a ranked replacement list based on historical substitutions, product attributes, and current MFC availability.
 5. Material price changes may request customer approval with a deadline.
 6. Packing records bags, temperature zones, restricted items, and final total.
 7. A handoff scan transfers custody to the assigned courier.
@@ -290,7 +290,7 @@ Dispatch continuously matches ready-soon orders to couriers using:
 - Batch compatibility and detour cost.
 - Courier capacity, breaks, and fairness.
 
-Start with greedy constrained matching every few seconds; introduce optimization windows or min-cost matching when batching value justifies complexity.
+Start with greedy constrained matching every few seconds; introduce optimization windows, MIP/min-cost matching, or vehicle-routing heuristics when batching value justifies complexity. Keep the optimization window bounded by the promise and use a greedy fallback if the solver times out.
 
 Courier locations enter a high-write, TTL-based geo store, not the order database. Keep the latest point for dispatch and a sampled, retention-limited trail for support. Customers receive throttled updates over WebSocket/SSE; raw courier coordinates should stop after delivery.
 
@@ -318,7 +318,7 @@ Payment provider timeouts are ambiguous. Query by the stable payment operation I
 - Partition inventory and fulfillment by `mfc_id`; this preserves local transactions and isolates hot centers.
 - Partition orders primarily by `order_id`, with secondary customer and MFC indexes.
 - Partition the event stream by `order_id` for ordered lifecycle events; use separate MFC topics for warehouse scheduling.
-- Store catalog product data centrally but materialize MFC-specific assortment, price, and availability views.
+- Store catalog product data centrally but materialize MFC-specific assortment, price, and availability views. Split ingestion, publishing, and search indexing so sparse retailer or MFC feeds can be enriched, validated, versioned, and rolled back before customer exposure.
 - Store location points in a geospatial/time-series system with TTL.
 - Store receipts and proof images in object storage with signed access.
 
@@ -420,7 +420,49 @@ Operational dashboards must be scoped per MFC; global averages hide local failur
 - Safety stock reduces substitutions and overselling.
 - Aggressive sellable counts improve conversion but worsen customer experience.
 
-## 18. Recommended interview presentation
+## 18. Lessons from production systems
+
+### DoorDash: dispatch is ML plus optimization, not nearest courier
+
+DoorDash's dispatch writing frames matching as a real-time optimization problem over predicted ready times, travel times, Dasher states, quality, and efficiency. Their move from bipartite matching/Hungarian-style assignment to MIP-style formulations unlocked multi-delivery routes and larger regional solve windows. In this design, Dispatch should treat greedy nearest-courier matching as a fallback, not the target architecture, and should log solver alternatives for safe rollout.
+
+### DoorDash: route optimization needs bounded heuristics and fallbacks
+
+DoorDash's routing post describes last-mile routing as NP-hard and uses ruin-and-recreate with termination criteria such as time limits or iteration caps; it also keeps a trivial greedy route as a fallback and benchmark. For instant commerce, batching/pickup routing must run inside seconds, so every optimizer needs a latency budget, a partial-solution strategy, and an operational fallback that preserves delivery correctness even if economics degrade.
+
+### DoorDash: ETA should be probabilistic and multi-stage
+
+DoorDash's NextGen ETA system separates an accuracy-first probabilistic base layer from a decision layer and uses multi-task modeling across homepage, store, checkout, food, grocery, pickup, and delivery ETA use cases. This maps directly to the ETA formula here: queue delay, pick time, assignment delay, pickup wait, and travel time should be modeled as distributions and then transformed into customer promises by a business decision layer.
+
+### DoorDash: inventory availability is a confidence problem
+
+DoorDash's grocery inventory work combines merchant feeds, operator updates, Dasher reports, photos, historical order data, and source-confidence ranking, then precomputes projections that feed search ranking. It reports nearly 90% exact-item fulfillment after cleaning and prediction, but still relies on substitutions for the rest. This design should therefore expose availability confidence in browse/search while preserving authoritative reservation at checkout.
+
+### Instacart: availability and substitutions belong in the shopping flow
+
+Instacart predicts over 500 million listings every 60 minutes across nearly 25,000 stores using retailer data, store location, purchase history, shopper input, and time-of-day/day-of-week features. It pairs that item availability model with replacement recommendations because customers shopping for themselves commonly replace items and many customers leave replacement choice to the shopper. For MFC commerce, this means the app should request substitution preferences before checkout, not after a picker reports an outage.
+
+### Instacart: cart pricing is contextual and must be confirmed at order creation
+
+Instacart describes search over 500 million item listings across 20,000 locations and basket pricing with more than 10 million active deals or discounts. It confirms totals and creates payment authorization at order creation after applying customer, retailer, CPG, loyalty, bundle, delivery, and credit rules. This supports the design's pricing snapshots and price-version validation: browse totals are provisional; checkout must persist the exact pricing inputs used for authorization and later reconciliation.
+
+### Uber Eats: retail catalog needs enrichment, versioning, and rollback
+
+Uber's INCA system was built when Uber Eats expanded from restaurant menus to grocery, pharmacy, and retail catalogs with hundreds of thousands of SKUs per retailer. It splits ingestion, storage, publishing, and indexing; processes billions of changes daily; targets under-one-minute critical price/availability updates; merges/enriches sparse feeds; and snapshots published catalogs for instant rollback. The catalog service here should similarly version published MFC assortments and keep bad feed rollbacks separate from inventory reservation correctness.
+
+### Zepto: hyperlocal search must revalidate inventory downstream
+
+Zepto's search architecture resolves query understanding, fulfillment zone, retrieval, live ranking, ads, and filters within tight latency budgets while serving over a million search-platform requests per minute. Because inventory, personalization, session state, experiments, and store configuration make full page caching invalid, Zepto keeps retrieval/ranking live and uses Product Assortment/Product Service for authoritative inventory and price resolution. This maps to using cached candidate lists only as hints and doing final stock/price validation before cart and checkout.
+
+### Zepto: prioritize freshness signals to avoid indexing backpressure
+
+The AWS/Zepto OpenSearch write-up separates high-priority inventory/catalog/pricing updates from lower-priority enrichment updates with Kafka/MSK topics and Flink indexing jobs. It also shows a practical trade-off: a 10-second search-index refresh was acceptable because real-time inventory service validation happened after retrieval, enabling 2x indexing throughput and 30% cost savings. For this design, search-index freshness can lag slightly if checkout and product-enrichment reads hit the real-time inventory authority.
+
+### Swiggy: ML reliability is part of the product SLA
+
+Swiggy's ML reliability post calls out ETA and Instamart recommendations as business-critical and gives a concrete failure mode: an upstream service changing time units from microseconds to milliseconds could corrupt ETA predictions without clipping and observability. For local delivery, ML serving should expose error codes, shadow-mode validation, input/output clipping, fallback heuristics, and data-drift monitoring as first-class reliability features.
+
+## 19. Recommended interview presentation
 
 A clear 45-minute sequence is:
 
@@ -436,3 +478,19 @@ A clear 45-minute sequence is:
 The central design insight is:
 
 > Keep inventory authority and fulfillment local to a specific MFC, coordinate checkout as an idempotent saga, and make every physical or financial transition auditable because real-world stock, payments, and courier state will inevitably diverge and require reconciliation.
+
+## Further reading: curated engineering blogs
+
+| Source | Article | Why it matters |
+|---|---|---|
+| DoorDash | [Next-Generation Optimization for Dasher Dispatch at DoorDash](https://careersatdoordash.com/blog/next-generation-optimization-for-dasher-dispatch-at-doordash/) | Shows why dispatch evolves from simple matching to MIP-style optimization with predictions, constraints, rollout safety, and multi-delivery routes. |
+| DoorDash | [Scaling a routing algorithm using multithreading and ruin-and-recreate](https://careersatdoordash.com/blog/scaling-a-routing-algorithm-using-multithreading-and-ruin-and-recreate/) | Explains bounded route optimization, same-day constraints, concurrency, and greedy fallbacks for last-mile routing. |
+| DoorDash | [Improving ETAs with multi-task models, deep learning, and probabilistic forecasts](https://careersatdoordash.com/blog/improving-etas-with-multi-task-models-deep-learning-and-probabilistic-forecasts/) | Details probabilistic, multi-stage ETA modeling and why uncertainty must feed the customer promise. |
+| DoorDash | [Building a Source of Truth for an Inventory with Disparate Data Sources](https://careersatdoordash.com/blog/building-a-source-of-truth-for-a-digital-inventory-with-disparate-data-sources/) | Covers inventory-confidence signals, precomputed availability projections, search down-ranking, and substitutions. |
+| Instacart | [The story behind an Instacart order, part 3: predicting the shop](https://tech.instacart.com/the-story-behind-an-instacart-order-part-3-predicting-the-shop-d1a3bb9f5d98) | Shows item availability and replacement models for grocery fulfillment with stale partner inventory. |
+| Instacart | [The story behind an Instacart order, part 2: browsing and buying](https://tech.instacart.com/the-story-behind-an-instacart-order-part-2-browsing-and-ordering-6b6a6066a706) | Explains searchable grocery catalog scale, contextual pricing, deal application, checkout persistence, and authorization. |
+| Uber Eats | [From Restaurants to Retail: Scaling Uber Eats for Everything](https://www.uber.com/us/en/blog/scaling-uber-eats-for-everything/) | Describes INCA catalog/inventory ingestion, enrichment, publishing, indexing, versioning, and rollback at retail scale. |
+| Zepto | [Building Search for a 10-Minute World](https://blog.zepto.com/building-search-for-a-10-minute-world-43b1992f5dca) | Explains hyperlocal quick-commerce search where query intent, fulfillment zone, inventory, price, and ranking are resolved live. |
+| Zepto / AWS | [How Zepto powers sub-second search using OpenSearch Service OR2 instances](https://aws.amazon.com/blogs/big-data/how-zepto-powers-sub-second-search-using-opensearch-service-or2-instances/) | Shows event-driven hub-level indexing, P0/P1 freshness pipelines, and the trade-off between search refresh latency and real-time inventory validation. |
+| Swiggy | [Building Rock-Solid ML Systems](https://medium.com/swiggy-bytes/building-rock-solid-ml-systems-d1d5ab544f0e) | Covers ML operational excellence for ETA and quick-delivery systems, including clipping, shadow mode, error codes, and fallbacks. |
+

@@ -151,7 +151,7 @@ Order
 - hold_id
 - amount
 - currency
-- status: PENDING_PAYMENT | PAID | FAILED | REFUNDED | CANCELLED
+- status: PENDING_PAYMENT | PAYMENT_AUTHORIZED | PAID | FAILED | REFUNDED | CANCELLED
 - payment_attempt_id
 - idempotency_key
 
@@ -303,12 +303,11 @@ Payment cannot share an ACID transaction with the inventory database. Use an exp
 1. Validate the active hold, ownership, price, limits, and expiration.
 2. Create `PENDING_PAYMENT` order idempotently.
 3. Authorize or charge through the payment provider using the order ID as its idempotency key.
-4. On payment success, transactionally mark seats `SOLD`, mark the hold `CONVERTED`, and mark the order `PAID`.
-5. Create ticket records and an outbox event.
-6. Capture payment, if authorization and capture are separate.
-7. Deliver ticket notifications asynchronously.
+4. On authorization success, transactionally mark seats `SOLD`, mark the hold `CONVERTED`, mark the order `PAYMENT_AUTHORIZED`, create ticket records, and write an outbox event.
+5. Capture payment, if authorization and capture are separate, then mark the order `PAID`; if the provider charged immediately, record the successful charge and mark `PAID` in the finalization transaction.
+6. Deliver ticket notifications asynchronously.
 
-If payment succeeds but finalization initially fails, retain the hold and retry finalization. Do not sell those seats to someone else. If finalization is permanently impossible, void or refund the payment and release inventory with an audited compensation.
+If payment succeeds or is authorized but finalization initially fails, retain the hold and retry finalization. Do not sell those seats to someone else. If finalization is permanently impossible, void or refund the payment and release inventory with an audited compensation.
 
 If payment fails, mark the order failed. The user may retry while the hold remains valid.
 
@@ -328,7 +327,7 @@ This prevents a delayed worker from releasing a seat belonging to a newer hold. 
 Fairness controls:
 
 - Virtual waiting room with randomized ordering before onsale.
-- Signed admission tokens and controlled per-event issue rate.
+- Signed admission tokens and controlled per-event issue rate; a queue token permits shopping, not a specific seat, and protected APIs still validate the token on every request.
 - Per-account, card, device, address, and phone purchase limits.
 - CAPTCHA or step-up checks based on risk, not on every request.
 - Short holds and limits on concurrent holds.
@@ -379,6 +378,7 @@ Catalog data is partitioned geographically or by event ID. Orders partition by b
 - CDN-cache event pages, venue assets, and static seat geometry.
 - Search indexes event metadata and is updated asynchronously.
 - Cache section-level available counts with a very short TTL.
+- Use CDN shield POPs and route/service rate limits so cache misses do not stampede fragile origin services.
 - Stream seat-state deltas to active clients rather than refetching full maps.
 - For large venues, load geometry and availability by viewport/section.
 
@@ -388,7 +388,7 @@ Pricing responses include signed quote IDs, fee details, and expiration. Dynamic
 
 ## 13. Tickets, transfer, resale, and admission
 
-Issue an opaque ticket ID with a rotating signed barcode. Do not encode reusable bearer credentials in screenshots.
+Issue an opaque ticket ID with a rotating, device-bound signed barcode. Do not encode reusable bearer credentials in screenshots or static wallet images.
 
 Transfer flow:
 
@@ -403,7 +403,7 @@ At admission, online scanners submit the current rotating credential. The admiss
 
 ## 14. Reliability and failure handling
 
-Use transactional outboxes for order, inventory, and ticket events. Consumers are idempotent. Periodic reconcilers compare:
+Use transactional outboxes for order, inventory, and ticket events; high-throughput implementations can emit domain events in the same database transaction and relay them from the write-ahead log to Kafka. Consumers are idempotent. Periodic reconcilers compare:
 
 - Paid orders against sold inventory.
 - Sold seats against active tickets.
@@ -478,7 +478,7 @@ one current owner per active ticket
 no expired active hold accepted at checkout
 ```
 
-Run synthetic onsales and payment-provider fault injection before major releases.
+Run protocol-level load tests, real-browser onsale simulations, and payment-provider fault injection before major releases.
 
 ## 18. Major trade-offs
 
@@ -509,7 +509,49 @@ Run synthetic onsales and payment-provider fault injection before major releases
 - Online validation prevents duplicates globally.
 - Offline validation keeps gates moving but accepts bounded duplicate risk.
 
-## 19. Recommended interview presentation
+## 19. Lessons from production systems
+
+### Ticketmaster: Verified Fan is demand shaping, not capacity magic
+
+Ticketmaster's Eras Tour postmortem-style business note says TaylorSwiftTix had more than 3.5 million preregistrations, about 1.5 million access codes, and 2 million waitlisted fans; the onsale still saw 3.5 billion total system requests, about 4x the previous peak. Map that to this design by treating registration and access codes as only the first filter: the edge must still absorb non-code traffic, queue tokens must be validated before every protected commerce API, and sale pacing must slow when checkout error rates rise.
+
+### Ticketmaster: Smart Queue needs account binding and live communication
+
+Ticketmaster describes Smart Queue as account sign-in before the sale, assignment of queue position at start, and admission at a rate that minimizes checkout errors, with in-queue inventory, price, and added-date messaging. For this design, the waiting room should not be a blind FIFO pipe: it should bind tokens to account/session, publish realistic availability and price-band updates, and let operations lower the admission rate without changing inventory correctness.
+
+### Ticketmaster: SafeTix shifts tickets from bearer images to managed credentials
+
+SafeTix describes tickets that refresh automatically, stay authenticated in the Ticketmaster ecosystem, block screenshots/recordings, bind to a fan device, and support secure transfer/resale. The analogous ticket service should rotate credentials, revoke old credential versions on transfer or refund, keep chain-of-custody events, and make offline admission explicitly risk-bounded rather than accepting static barcodes.
+
+### SeatGeek/AWS: a ticketing waiting room is a protected-zone token system
+
+AWS's SeatGeek architecture uses a gatekeeper at the edge, waiting-room and queueing modes, predefined throughput into the protected ticket-selection zone, DynamoDB tables for protected zones/counters/user connections/queue mappings, and metrics such as queue length and wait time. This supports modeling queue admission separately from inventory holds: issue access tokens at a controlled rate, cap users in the protected zone, and track business metrics so operators can tune the sale while it runs.
+
+### SeatGeek: test the browser behavior, not just the purchase endpoint
+
+SeatGeek built browser-based load testing with AWS Batch and Playwright to simulate 50,000+ users because protocol tests missed WebSocket, heartbeat, reload, and edge-token behaviors in high-demand queues. This design should keep cheap API load tests, but the release gate for major onsales needs full browser simulations that exercise waiting room refreshes, queue-token exchange, seat-map loading, checkout, and failure messaging.
+
+### SeatGeek: transactional outbox avoids dual-write drift
+
+SeatGeek's data-platform team adopted a transactional outbox pattern, then optimized it by emitting domain events directly into Postgres WAL with `pg_logical_emit_message()`, relaying with Debezium/Kafka Connect, and enforcing schemas. For ticketing, inventory/order/ticket state transitions and their events must be atomic; a direct publish to Kafka after commit is insufficient because a crash creates missing notifications, stale availability, or broken reconciliation inputs.
+
+### SeatGeek: cache shielding and rate limits prevent failure cascades
+
+SeatGeek's resilience write-up describes Fastly shield POPs, short TTL and stale-while-revalidate caching, Kong token-bucket/per-consumer limits, and circuit-breaking for fragile services. The important lesson is that failed origin responses often cannot be cached, so overload can reduce cache hit rate and amplify itself. Event pages, maps, and cacheable availability summaries need edge shielding plus route-specific throttles before origin saturation.
+
+### Cloudflare: global waiting rooms trade exact global state for bounded overshoot
+
+Cloudflare's Waiting Room uses encrypted cookies with bucket IDs, accepted timestamps, and last check-in time; it divides active-user and new-user-per-minute slots across data centers using recent historical traffic ratios to avoid constant global coordination. This maps well to browse admission, where slight over-admission is acceptable, but not to seat holds; holds still go to the event's strongly consistent home shard.
+
+### Cloudflare: queueing policy is a product decision
+
+Cloudflare supports FIFO and random queueing. FIFO gives intuitive wait estimates, while random queueing can be fairer for hype launches where pre-start arrival time should not dominate; switching can preserve the underlying bucketed queue state. Ticketing systems should make that policy explicit per onsale: randomized assignment before sale start, FIFO after start, and clear communication so users do not gain advantage by refreshing or arriving hours early.
+
+### AWS Virtual Waiting Room: protect APIs with signed, time-limited tokens
+
+AWS's reference solution combines API Gateway, Lambda, SQS batching for burst intake, DynamoDB token state, Secrets Manager keys, and a Lambda authorizer or OIDC adapter to validate signed time-limited tokens before protected APIs. In this design, the queue service must be in the enforcement path, not just the web page: direct calls to hold or checkout endpoints without a valid admission token should be rejected before they reach inventory.
+
+## 20. Recommended interview presentation
 
 A clear 45-minute sequence is:
 
@@ -526,3 +568,19 @@ A clear 45-minute sequence is:
 The central design insight is:
 
 > Treat every seat as scarce strongly consistent inventory: atomically hold it for a bounded time, never lock it across payment, and convert the hold through an idempotent saga. Scale volatile onsales with waiting rooms and cached browsing, not by weakening the sale invariant.
+
+
+## Further reading: curated engineering blogs
+
+| Source | Article | Why it matters |
+|---|---|---|
+| Ticketmaster | [Taylor Swift \| The Eras Tour Onsale Explained](https://business.ticketmaster.com/press-release/taylor-swift-the-eras-tour-onsale-explained/) | Real incident numbers for Verified Fan demand shaping, bot/non-code traffic, queue slowdowns, and sale outcomes. |
+| Ticketmaster | [Smart Queue: Streamline Sales and Maximize Sell-Through](https://business.ticketmaster.com/smart-queue/) | Shows the production queue contract: account sign-in, assigned positions, controlled admission, and live in-queue messaging. |
+| Ticketmaster | [SafeTix: Secure Ticketing Built for Fans](https://business.ticketmaster.com/safetix-encrypted-digital-ticketing/) | Demonstrates why issued tickets should be rotating, account/device-bound credentials rather than reusable screenshots. |
+| AWS / SeatGeek | [Build a Virtual Waiting Room with Amazon DynamoDB and AWS Lambda at SeatGeek](https://aws.amazon.com/blogs/architecture/build-a-virtual-waiting-room-with-amazon-dynamodb-and-aws-lambda-at-seatgeek/) | Concrete ticketing waiting-room design with edge gatekeeper, protected-zone tokens, DynamoDB queue state, and operational metrics. |
+| SeatGeek | [Browser-Based Load Testing Without Breaking the Bank](https://chairnerd.seatgeek.com/browser-based-load-testing/) | Explains why high-demand onsales need real browser simulations for queues, WebSockets, heartbeats, and token exchange. |
+| SeatGeek | [The Transactional Outbox Pattern: Transforming Real-Time Data Distribution at SeatGeek](https://chairnerd.seatgeek.com/transactional-outbox-pattern/) | Production outbox/WAL/Debezium/Kafka approach for avoiding dual-write gaps in inventory, order, and ticket event streams. |
+| SeatGeek | [Shielding the Core: Scaling Resilience with a Multi-Layered Approach](https://chairnerd.seatgeek.com/shielding-the-core/) | Shows how CDN shielding, rate limits, circuit breakers, and load tests stop cache-miss spikes from overwhelming origin services. |
+| Cloudflare | [Building Waiting Room on Workers and Durable Objects](https://blog.cloudflare.com/building-waiting-room-on-workers-and-durable-objects/) | Details global slot allocation, encrypted queue cookies, bucketed users, and bounded edge coordination for waiting rooms. |
+| Cloudflare | [Waiting Room: Random Queueing and Custom Web/Mobile Apps](https://blog.cloudflare.com/waiting-room-random-queueing-and-custom-web-mobile-apps/) | Compares FIFO and random queueing and explains when hype launches need randomized fairness instead of arrival-order dominance. |
+| AWS | [Introducing AWS Virtual Waiting Room](https://aws.amazon.com/blogs/compute/introducing-aws-virtual-waiting-room/) | Reference implementation for signed time-limited admission tokens, authorizers, burst buffering, and protected API integration. |

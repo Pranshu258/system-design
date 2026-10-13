@@ -48,7 +48,13 @@ Peak collaboration traffic:
 = 20M edit operations/second
 ```
 
-Most operations are tiny, but connection fan-out and per-document ordering dominate. Presence events are more frequent and less durable than edits, so they need a separate path.
+At 500 TB/day and 20M operations/second, the average persisted operation budget is about 290 bytes before replication:
+
+```text
+500 TB/day / (20M ops/sec x 86,400 sec/day) ~= 290 bytes/op
+```
+
+With 3x log replication this is about 1.5 PB/day, or 17 GB/sec of sustained replicated write bandwidth. Average fan-out is roughly four remote recipients per operation, so peer delivery is about 80M frames/second before presence. Most operations are tiny, but connection fan-out and per-document ordering dominate. Presence events are more frequent and less durable than edits, so they need a separate path.
 
 ## 3. High-level architecture
 
@@ -175,6 +181,8 @@ Document content is an ordered tree, not an HTML blob. Stable node and character
 
 Operations and snapshots are immutable. Metadata points to the latest committed revision. An `operation_id` plus `(client_id, client_sequence)` provides retry deduplication.
 
+For rich documents, keep structural parent pointers separate from render-order child arrays. The parent pointer is the authority for permissions and ancestry checks; ordered child arrays are the editable render tree. This avoids ambiguous ACL inheritance when content is moved, linked, or temporarily referenced from multiple places.
+
 ## 5. Core APIs and protocols
 
 ### Open a document
@@ -255,6 +263,8 @@ All mutations use idempotency keys. WebSocket frames carry session tokens scoped
 
 Acknowledgement happens only after durable replication. Rendering does not wait for acknowledgement, which preserves typing responsiveness.
 
+To keep server state bounded, clients should coalesce local keystrokes and maintain a small in-flight window, often one outstanding batch per document session. While waiting for acknowledgement, new local edits stay optimistic in the client queue and are sent as the next batch.
+
 ## 7. Operational transformation and alternatives
 
 For a centralized service, operational transformation (OT) is a practical choice:
@@ -276,7 +286,7 @@ Canonical result after transformation: "big cats"
 
 The transform library must be deterministic, versioned, and exhaustively property-tested for convergence.
 
-A CRDT simplifies peer-to-peer and offline merging because operations commute, but per-character identifiers, tombstones, and metadata can increase document size. A server-authoritative OT design fits centralized Docs; a sequence CRDT is attractive if long offline editing or decentralized replicas dominate.
+A CRDT simplifies peer-to-peer and offline merging because operations commute, but per-character identifiers, tombstones, version vectors, Lamport timestamps, and garbage collection can increase document size and implementation cost. A server-authoritative OT design fits centralized Docs; a sequence CRDT is attractive if long offline editing or decentralized replicas dominate. For non-text ordered lists such as layers or block children, fractional indexing can be simpler than OT because moving an item updates one ordering value, but it can interleave concurrent inserts and is a poor fit for prose.
 
 ## 8. Offline editing and reconnection
 
@@ -295,7 +305,7 @@ On reconnection:
 4. If the retained log no longer covers the base revision, fetch a current snapshot and run a three-way semantic rebase.
 5. If an operation cannot be represented safely, preserve it in a recoverable offline copy and tell the user.
 
-Never discard offline edits silently. Long offline intervals may produce visible formatting conflicts even when text converges.
+Never discard offline edits silently. Only advertise a document or subtree as available offline after all records required to render and edit it are durably cached. Track why each item is offline, such as explicit pinning, recent access, or inheritance from an offline parent, so removing one reason does not accidentally evict needed data. Long offline intervals may produce visible formatting conflicts even when text converges.
 
 ## 9. Comments, suggestions, and anchors
 
@@ -323,11 +333,11 @@ Guarantees:
 
 The collaboration leader is a per-document serialization point. It is not a durability boundary: the replicated operation log is. A fencing epoch prevents an old leader from committing after a new leader is elected.
 
-ACL changes increment an ACL version. Collaboration servers subscribe to invalidations and revalidate on sensitive actions. Revoked editors are disconnected promptly; already committed edits remain in history.
+ACL changes increment an ACL version and publish a revocation fence before returning success. Collaboration servers subscribe to invalidations, include the ACL version in session state, and must refresh a stale version before appending any new edit. Revoked editors are disconnected promptly; already committed edits remain in history.
 
 ## 11. Partitioning, snapshots, and storage
 
-Partition operation logs by hash of `document_id`; all operations for a document remain ordered in one partition. Metadata is sharded by `document_id`, with secondary owner and recents indexes.
+Partition operation logs by hash of `document_id`; all operations for a document remain ordered in one partition. Metadata is sharded by `document_id` or by a workspace/domain container when many documents share permissions and navigation state. Keep the document, ACL rows, comments, and other transactionally related records co-located where possible; cross-shard writes require an outbox or saga and must not be needed for the edit acknowledgement path.
 
 Snapshots:
 
@@ -346,7 +356,9 @@ Hot partitions are mitigated by isolating extremely active documents onto dedica
 
 Committing an edit and emitting downstream events must not diverge. The operation log itself can be the source for history, search, notifications, analytics, and audit consumers. Metadata mutations use a transactional outbox.
 
-Consumers track `(document_id, revision)` and are idempotent. Search indexes snapshots asynchronously rather than every keystroke. Revision history groups operations into human-sized versions based on idle windows, actor changes, and explicit named versions.
+Consumers track `(document_id, revision)` and are idempotent. Search indexes snapshots asynchronously rather than every keystroke, and query-time filtering checks current ACL state rather than trusting a stale indexed permission copy. Revision history groups operations into human-sized versions based on idle windows, actor changes, and explicit named versions.
+
+Delta sync for reconnecting clients is a permission-aware log query: fetch revisions after the client's checkpoint, filter by current access and subscriptions, and stream in order. For very large tenants, serve most of the historical range from a secondary metadata index, overlap with an authoritative head slice from the primary log, and deduplicate by revision so index lag cannot hide committed edits.
 
 Slow consumers do not block editing. Lag alarms and replayable retention allow recovery.
 
@@ -363,6 +375,8 @@ The collaboration server broadcasts once per committed operation to all sessions
 - Disconnect and resynchronize clients that cannot keep up instead of retaining unbounded buffers.
 
 CDNs serve immutable snapshots, images, and export artifacts. They do not cache mutable edit streams.
+
+If collaboration workers keep active document state in memory, pair checkpoints with a durable journal. Each journal entry has a per-document sequence range, and each worker write is conditional on the current document ownership epoch. Recovery loads the latest checkpoint, replays newer journal entries, and rejects split-brain writers whose epoch is stale.
 
 ## 14. Multi-region design
 
@@ -463,7 +477,49 @@ Use synthetic multi-client documents to continuously verify convergence, reconne
 - Per-operation indexing is fresher.
 - Snapshot-based indexing is cheaper and avoids indexing transient intermediate states.
 
-## 19. Recommended interview presentation
+## 19. Lessons from production systems
+
+### Google Docs: revision logs and OT
+
+Google described Docs as a revision log of changes, not direct mutation of a character buffer. Edits such as `InsertText`, `DeleteText`, and `ApplyStyle` are appended, and each editor transforms incoming changes relative to its local state. This supports the design's immutable operation log and reinforces that style ranges, deletes, and structural edits need explicit transform rules, not generic JSON patches.
+
+### Apache Wave: optimistic UI with bounded server state
+
+The Wave OT whitepaper used local optimistic execution so typing never waits for the network, but required a client to wait for server acknowledgement before sending more operations. While waiting, the client batches local operations. That maps directly to this design's optimistic client queue and explains why limiting in-flight batches reduces per-client server state without sacrificing local responsiveness.
+
+### Figma: centralized, CRDT-inspired documents
+
+Figma rejected general OT for its design-document tree and used a centralized, CRDT-inspired model with object IDs, properties, last-writer-wins registers, and server authority. The lesson is to choose conflict semantics per data type: rich text may need OT or a sequence CRDT, while object properties, comments, and layout attributes can often use deterministic last-writer-wins or intent-preserving merges.
+
+### Figma: journals, ownership locks, and validation
+
+Figma moved from checkpoint-only persistence every 30-60 seconds to a write-ahead journal, reporting that 95% of edits were saved within 600 ms. It also made journal writes conditional on a document lock UUID and validated journal replay against checkpoints on about 400K consecutive cases before rollout. This strengthens the design's durable acknowledgement path: active in-memory leaders need fencing, journal replay, and dark validation.
+
+### Figma: fractional indexing for ordered non-text sequences
+
+For layer ordering, Figma stores arbitrary-precision fractional positions between 0 and 1, so insert or move usually changes one value. This is useful for block children, outline nodes, or comment ordering, but not for prose because concurrent inserts may interleave. The editor should therefore use text OT or CRDTs for character sequences and reserve fractional indexing for non-text ordered collections.
+
+### Notion: blocks, parent pointers, and transaction boundaries
+
+Notion models text, images, pages, database rows, and lists as blocks with UUIDs, properties, type, ordered content pointers, and a separate parent pointer used for permissions. That maps to the document tree here: use stable node IDs for anchors and moves, but keep ACL ancestry independent from render ordering so permissions stay unambiguous during collaboration.
+
+### Notion: shard by locality, not just row count
+
+Notion sharded Postgres by workspace ID because related blocks, comments, collections, and spaces are normally queried and updated together. It created 480 logical shards over 32 physical databases to preserve future rebalancing options. For Docs, hash by document for the operation log, but shard metadata by workspace or document container when that is the transactional and permission locality boundary.
+
+### Notion: complete offline subtrees
+
+Notion's offline mode evolved a SQLite cache into a persistent store that tracks which pages are fully available offline and why. It keeps a forest of offline page trees, so a page is removed only when its last offline reason disappears, and reconnect fetches only pages whose server timestamp changed. This design should similarly avoid partial offline documents and track offline coverage explicitly.
+
+### Microsoft Fluid SharedTree: sequenced tree intents
+
+Fluid SharedTree sequences edits through a relay, then merges by applying valid intentions in sequence order. It treats moves as true moves rather than copy-plus-delete, treats removal as movement to a detached state, and uses last-writer-wins only for incompatible intentions. The implication is that structured document operations should encode intent, such as move node X, not low-level diffs.
+
+### Linear: permission-aware delta sync
+
+Linear's local-first sync uses ordered immutable sync actions that clients replay after a checkpoint. At large scale, reconnect became a permission-aware set intersection over more than 20 TB of sync actions, so Linear moved historical filtering to inverted indexes, kept payloads in Postgres, overlapped with an authoritative recent Postgres slice, and deduplicated. Docs needs the same separation between committing the log and serving catch-up queries.
+
+## 20. Recommended interview presentation
 
 A clear 45-minute sequence is:
 
@@ -475,8 +531,24 @@ A clear 45-minute sequence is:
 6. Cover snapshots, history, comments, and suggestion anchors.
 7. Discuss hot documents, fan-out, and partitioning.
 8. Explain home-region failover, fencing, permissions, and security.
-9. Finish with OT-versus-CRDT and latency-versus-consistency trade-offs.
+9. Tie the design to production lessons: OT revision logs, durable journals, offline coverage, sharding locality, and permission-aware delta sync.
+10. Finish with OT-versus-CRDT and latency-versus-consistency trade-offs.
 
 The central design insight is:
 
 > Render edits optimistically at the client, but establish one durable canonical operation order per document. Transform concurrent operations against that order, separate ephemeral presence from durable content, and recover every session from snapshots plus an idempotent operation log.
+
+## Further reading: curated engineering blogs
+
+| Source | Article | Why it matters |
+|---|---|---|
+| Google Drive Blog | [What’s different about the new Google Docs: Conflict resolution](https://drive.googleblog.com/2010/09/whats-different-about-new-google-docs_22.html) | Explains Google Docs' revision log and OT transform model for insert, delete, and style changes. |
+| Apache Wave | [Google Wave Operational Transformation](https://svn.apache.org/repos/asf/incubator/wave/whitepapers/operational-transform/operational-transform.html) | Details optimistic UI, server acknowledgement, batching, and structured-document OT. |
+| Figma | [How Figma’s multiplayer technology works](https://www.figma.com/blog/how-figmas-multiplayer-technology-works/) | Shows when a centralized CRDT-inspired model is simpler than OT for object trees. |
+| Figma | [Making multiplayer more reliable](https://www.figma.com/blog/making-multiplayer-more-reliable/) | Describes the write-ahead journal, ownership lock, checkpoints, and replay validation behind reliable multiplayer. |
+| Figma | [Realtime editing of ordered sequences](https://www.figma.com/blog/realtime-editing-of-ordered-sequences/) | Introduces fractional indexing for collaborative ordered lists where text-style OT is unnecessary. |
+| Notion | [The data model behind Notion’s flexibility](https://www.notion.com/blog/data-model-behind-notion) | Explains block IDs, content arrays, parent pointers, and transactional operations for flexible documents. |
+| Notion | [Herding elephants: Lessons learned from sharding Postgres at Notion](https://www.notion.com/blog/sharding-postgres-at-notion) | Covers workspace-local sharding, transitive sharding of related rows, and 480 logical shards over 32 databases. |
+| Notion | [How we made Notion available offline](https://www.notion.com/en-gb/blog/how-we-made-notion-available-offline) | Shows complete offline subtrees, reason tracking, push refresh, and conflict-resolution migration. |
+| Microsoft | [Fluid Framework: How SharedTree merges changes](https://devblogs.microsoft.com/microsoft365dev/fluid-framework-how-sharedtree-merges-changes/) | Defines sequenced merge semantics for collaborative trees, true moves, removals, and last-writer-wins conflicts. |
+| Linear | [Rebuilding Linear’s delta sync read path](https://linear.app/now/rebuilding-delta-sync-read-path) | Demonstrates scalable permission-aware delta sync using immutable actions, inverted indexes, authoritative overlap, and late enrichment. |
