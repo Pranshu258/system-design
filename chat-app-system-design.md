@@ -36,7 +36,7 @@ State assumptions explicitly and refine them with the interviewer:
 - 25 billion messages/day, approximately 290,000/second average and 1 million/second peak.
 - Average text envelope: 1 KB after metadata and encryption; 25 TB/day before replication.
 - 10% of messages include media, averaging 500 KB after client compression: roughly 1.25 PB/day of new media.
-- Average one-to-one fan-out: 1 recipient with 2 active devices.
+- Average one-to-one delivery fan-out: 1 recipient with 2 active devices, plus synchronization to the sender's other devices.
 - Typical group: 10 members; maximum group: 10,000 members.
 - Message history retention is product- and jurisdiction-dependent.
 
@@ -157,11 +157,12 @@ InboxEntry
 - last_activity_at
 - unread_count_hint
 
-DeliveryState
-- message_id
-- recipient_user_id
-- delivered_at
-- read_at
+ReceiptState
+- user_id
+- conversation_id
+- delivered_through_sequence
+- read_through_sequence
+- updated_at
 
 MediaObject
 - media_id
@@ -240,7 +241,7 @@ PATCH  /v1/conversations/{id}/members/{user_id}
 {"type":"ACK_READ","conversation_id":"c1","through_sequence":90}
 ```
 
-Receipts acknowledge a contiguous high-water mark where possible; this compresses state compared with one row per message.
+Receipts acknowledge a contiguous high-water mark where possible; persist per-user/per-conversation receipt state rather than one row per message except for small-group detail or audits.
 
 ## 6. Message send and delivery flow
 
@@ -268,9 +269,9 @@ The server returns:
 - Membership or metadata changes.
 - Message tombstones and edits.
 - Device/key changes relevant to encryption.
-- A new cursor committed only after the client applies the page.
+- A new cursor that the client advances locally only after it applies the page.
 
-If a cursor has expired, the client fetches an inbox snapshot and then message ranges for changed conversations. A new device may require explicit approval and key transfer before it can decrypt old history.
+If a cursor has expired, the client fetches an inbox snapshot and then message ranges for changed conversations. A new device may require explicit approval and key transfer before it can decrypt old history. In an E2EE multi-device model, the sender encrypts separately to every recipient device and to the sender's companion devices; the server stores device identity mappings and opaque encrypted application state, not plaintext.
 
 Sending from two devices is safe because message identity and sequencing are server-assigned. Read state normally converges by taking the maximum acknowledged sequence across a user's devices.
 
@@ -296,7 +297,7 @@ Guarantee ordering **within one conversation**, not globally.
 
 - Route a conversation to one logical sequencer at a time.
 - Persist an epoch with the leader lease and fence stale leaders.
-- Allocate sequence ranges to reduce database contention, accepting gaps when a lease holder fails.
+- Allocate sequence ranges only if skipped ranges are recorded as no-op tombstones; otherwise clients using gap detection will wait forever for sequence numbers that can never arrive.
 - Do not equate sequence order with client wall-clock timestamps.
 
 Concurrent edits and deletes use compare-and-swap against the current message revision. A delete is a tombstone so all devices converge. Receipts, typing, presence, unread counts, and search indexes can be eventually consistent.
@@ -318,11 +319,11 @@ For E2EE, the server still authorizes membership and sequences ciphertext, but c
 Use a wide-column or distributed SQL store keyed by:
 
 ```text
-partition key: hash(conversation_id) or conversation_id bucket
+partition key: (conversation_id, sequence_bucket)
 sort key: sequence_number
 ```
 
-Large conversations can be bucketed by sequence range or time while a directory maps ranges to partitions. Avoid time alone as the partition key because one viral group can create a hot shard.
+Large conversations should be bucketed by sequence range or time inside the conversation key, while a directory maps ranges to partitions. Avoid a bare hash or time-only partition key: a bare hash mixes unrelated conversations and time-only keys let one viral group create a hot shard.
 
 ### Inbox storage
 
@@ -330,7 +331,7 @@ Partition by `user_id`; sort by `last_activity_at`. Inbox entries are projection
 
 ### Media
 
-Clients request signed upload URLs, upload encrypted bytes directly to object storage, then attach the committed `media_id` to a message. The media service verifies size and checksum. Non-E2EE media can be malware-scanned and transcoded; E2EE media scanning is limited to client-side controls and metadata abuse detection.
+Clients request signed upload URLs, upload encrypted bytes directly to object storage, then attach the committed `media_id` to a message. The media service verifies size and checksum before the message can reference the object. Non-E2EE media can be malware-scanned and transcoded; E2EE media scanning is limited to client-side controls and metadata abuse detection.
 
 Retention jobs compact expired messages into tombstones, honor legal holds, and delete media only after reference and grace-period checks.
 
@@ -360,11 +361,11 @@ Presence is ephemeral:
 - Cross-region aggregation is eventually consistent.
 - Privacy rules are applied before emitting status.
 
-Typing events are lossy, rate-limited, expire within seconds, and never enter durable message storage. Delivery and read receipts are coalesced high-water marks and flushed asynchronously. For groups, exposing per-member read state is expensive; cap it to smaller groups or return aggregate counts.
+Typing events are lossy, rate-limited, expire within seconds, and never enter durable message storage. Delivery and read receipts are coalesced high-water marks and flushed asynchronously. For groups, exposing per-member read state is expensive; cap it to smaller groups or return aggregate counts. Subscribe clients only to visible/relevant presence and typing topics to avoid flooding every device with every state change.
 
 ## 13. Caching and search
 
-Cache membership, conversation metadata, device routing, and recent messages, but treat authoritative membership as strongly consistent for sends and key changes. Version cache entries so revocation invalidates stale authorization.
+Cache membership, conversation metadata, device routing, and recent messages, but treat authoritative membership as strongly consistent for sends and key changes. Version cache entries so revocation invalidates stale authorization, and coalesce concurrent hot-row reads through a per-conversation data service rather than letting every reconnect hit storage independently.
 
 For plaintext/server-encrypted chat, index asynchronously by `(user_id, conversation_id)` and enforce authorization at query time. With E2EE, server-side full-text search is unavailable; devices maintain local encrypted indexes. This is a fundamental product trade-off, not an implementation detail.
 
@@ -460,7 +461,45 @@ Per-message receipt rows are precise but costly. High-water marks dramatically r
 
 WebSockets provide low latency and efficient bidirectional delivery. Cursor-based polling remains necessary for recovery and environments that block persistent connections.
 
-## 19. Recommended interview presentation
+## 19. Lessons from production systems
+
+### Discord: bounded message partitions and hot-read coalescing
+
+Discord's message-store evolution shows why the message table should be keyed by conversation plus bucket, not by an unbounded conversation partition. Their Cassandra design moved from `(channel_id, message_id)` to `((channel_id, bucket), message_id)` to keep partitions around operationally safe sizes, and their later ScyllaDB path added Rust data services with request coalescing and consistent-hash routing so `@everyone` reconnect/read storms do not hammer a hot partition. This maps directly to the bucketed message store and hot-row coalescing above.
+
+### Discord: real-time fan-out must preserve ordering while distributing CPU
+
+Discord's Elixir architecture originally had one guild process fan out events to all connected sessions; large servers made a single process spend seconds sending. Manifold grouped recipient processes by remote node and worker partition so fan-out CPU and network traffic were distributed while preserving the linear event order clients depend on. The chat gateway/fan-out layer should similarly shard send work by gateway/node without letting parallel workers reorder one conversation's event stream.
+
+### Discord: million-user groups need offloaded scans and careful heap design
+
+Discord's Maxjourney work on a million-plus-online server highlights a separate issue from ordinary fan-out: membership scans, handoff, and `@everyone` eligibility checks can stall the hot conversation actor. They moved large member state into ETS and used workers so expensive reads and process handoff did not block the guild process. For 10,000-member or broadcast groups, keep the sequencer small, offload membership scans to versioned snapshots, and measure runtime/GC effects of large in-memory structures.
+
+### Slack: channel servers and gateway servers separate routing from sockets
+
+Slack's real-time messaging stack uses Channel Servers mapped by consistent hashing to channels and Gateway Servers that hold WebSocket subscriptions near users. A sent message goes through the app backend to the channel's server, then to subscribed gateways worldwide, which push to connected clients. This validates the split here between connection gateways, a connection directory, and per-conversation routing rather than putting durable message logic inside socket hosts.
+
+### Slack Flannel: edge caches reduce reconnect storms and client bootstrap size
+
+Slack built Flannel as an application-level edge cache that serves slim startup state, lazily loads users/channels, and keeps team affinity via consistent hashing. It handled 4 million simultaneous connections and 600K client queries per second, while reducing bootstrap payload by 7x for a 1.5K-user team and 44x for a 32K-user team. This design should avoid sending full membership/contact snapshots to every chat client and should cache metadata near reconnecting users.
+
+### Messenger Iris: mobile sync is snapshot plus ordered deltas
+
+Meta's Messenger team replaced pull-heavy JSON synchronization with an initial snapshot plus pushed deltas over MQTT, encoded with Thrift. Iris is a per-user totally ordered queue with separate pointers for app delivery and long-term storage, so slow disk writes or offline phones do not block real-time delivery. The sync API above should be treated as the source of truth: sockets and push wake clients, but clients reconcile by applying ordered deltas from durable cursors.
+
+### WhatsApp: multi-device E2EE changes fan-out semantics
+
+WhatsApp's multi-device architecture gives each device its own identity key. A sender obtains the recipient's device list and encrypts the message separately for each recipient device; group chats continue to use Sender Key encryption, and companion-device history transfer is encrypted end to end. If E2EE is in scope, server fan-out cannot be just one plaintext payload per user: device-list freshness, key verification, remote logout, and sender-to-own-device sync become part of the send path.
+
+### LinkedIn: separate core messaging from product-specific business logic
+
+LinkedIn's messaging redesign moved from tangled mailbox logic toward a single centralized copy of each conversation message and service-owned persistence boundaries. They explicitly prioritized correctness over architecture elegance and latency, then split services so each owned its database and contract. This supports keeping this design's chat command, group/membership, message store, inbox projection, and search responsibilities separate, with asynchronous projections instead of cross-service database writes.
+
+### LinkedIn Messenger SDK: clients need a reactive local store
+
+LinkedIn's cross-platform Messenger SDK uses a local or in-memory store, a mailbox API, a real-time manager, and GraphQL/REST fetches so UI components react to data regardless of whether it arrived by query or stream. For this design, every device should maintain a local ordered store and reconcile socket events, sync pages, edits, deletes, and receipt updates through one state machine rather than special-casing each transport.
+
+## 20. Recommended interview presentation
 
 1. Clarify whether E2EE, group-size limits, multi-device history, and voice/video are in scope.
 2. Estimate message rate, concurrent sockets, fan-out amplification, and media volume.
@@ -473,3 +512,19 @@ WebSockets provide low latency and efficient bidirectional delivery. Cursor-base
 9. Close with E2EE and multi-region trade-offs plus concrete SLOs.
 
 A strong answer focuses first on durable, ordered, idempotent messaging. Presence, typing indicators, search, calls, and sophisticated moderation should be layered on only after the core delivery contract is precise.
+
+
+## Further reading: curated engineering blogs
+
+| Source | Article | Why it matters |
+|---|---|---|
+| Discord | [How Discord Stores Billions of Messages](https://discord.com/blog/how-discord-stores-billions-of-messages) | Cassandra/Scylla-style message bucketing by channel and time to bound partitions and support range reads. |
+| Discord | [How Discord Stores Trillions of Messages](https://discord.com/blog/how-discord-stores-trillions-of-messages) | Hot-partition mitigation with Rust data services, request coalescing, and consistent-hash routing. |
+| Discord | [How Discord Scaled Elixir to 5,000,000 Concurrent Users](https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users) | Ordered, distributed real-time fan-out and the CPU/network cost of large pub/sub groups. |
+| Discord | [Maxjourney: Pushing Discord's Limits with a Million+ Online Users in a Single Server](https://discord.com/blog/maxjourney-pushing-discords-limits-with-a-million-plus-online-users-in-a-single-server) | Large-group responsiveness, membership scans, process handoff, and runtime memory/GC lessons. |
+| Slack | [Real-time Messaging](https://slack.engineering/real-time-messaging/) | Channel servers, gateway servers, consistent hashing, transient events, and global WebSocket fan-out. |
+| Slack | [Flannel: An Application-Level Edge Cache to Make Slack Scale](https://slack.engineering/flannel-an-application-level-edge-cache-to-make-slack-scale-/) | Edge metadata caching, lazy loading, reconnect-storm protection, and client pub/sub reduction. |
+| Meta Messenger | [Building Mobile-First Infrastructure for Messenger](https://engineering.fb.com/2014/10/09/production-engineering/building-mobile-first-infrastructure-for-messenger/) | Iris snapshot-plus-delta sync, per-user ordered queues, MQTT push, and mobile bandwidth reduction. |
+| WhatsApp | [How WhatsApp Enables Multi-Device Capability](https://engineering.fb.com/2021/07/14/security/whatsapp-multi-device/) | Device identity keys, client fan-out encryption, encrypted history transfer, and secure app-state sync. |
+| LinkedIn | [Designing Our New Messaging System](https://www.linkedin.com/blog/engineering/messaging-notifications/designing-our-new-messaging-system) | Centralized message copies, service ownership boundaries, and correctness-first migration principles. |
+| LinkedIn | [Unifying Messaging Experiences Across LinkedIn](https://www.linkedin.com/blog/engineering/messaging-notifications/unifying-messaging-experiences-across-linkedin) | Reactive client data layer combining local store, realtime stream, and query APIs across platforms. |

@@ -2,6 +2,8 @@
 
 Detailed, production-scale system design documents.
 
+Each design includes a **Lessons from production systems** section distilled from official engineering blogs and papers, plus a curated reading list. See [Curated Engineering Blogs](./engineering-blogs.md) for the full index.
+
 ## Collaboration and storage
 
 - [Dropbox-like File Storage and Sync](./dropbox-system-design.md)

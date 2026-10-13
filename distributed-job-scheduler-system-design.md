@@ -7,7 +7,7 @@
 1. Submit immediate, delayed, recurring, and dependency-based jobs.
 2. Dispatch work to heterogeneous worker pools using resource and placement constraints.
 3. Support retries, timeouts, cancellation, priorities, rate limits, and deadlines.
-4. Prevent two healthy workers from owning the same attempt intentionally.
+4. Prevent two healthy workers from concurrently owning the same attempt.
 5. Expose status, progress, logs, history, and searchable metadata.
 6. Support cron schedules with explicit time zones and daylight-saving behavior.
 7. Handle workflows/DAGs and fan-out/fan-in dependencies.
@@ -17,7 +17,7 @@
 
 - Schedule tens of millions of jobs per day with second-level dispatch latency.
 - Remain available across machine and availability-zone failures.
-- Never lose an accepted job.
+- Never lose an accepted job within the home-region quorum; cross-region disaster recovery has an explicit RPO unless writes are synchronously replicated across regions.
 - Provide at-least-once execution; clearly define idempotency expectations.
 - Isolate tenants and prevent starvation.
 - Scale the control plane independently from worker execution.
@@ -64,7 +64,7 @@ flowchart LR
     API --> IDX[(History Search Index)]
 ```
 
-The durable job store is authoritative. Ready queues accelerate dispatch but are reconstructable. Schedulers decide placement; workers execute untrusted or isolated workloads.
+The durable job store is authoritative. Ready queues accelerate dispatch but are reconstructable hints; if a queue/log is chosen as the initial write buffer, the client acknowledgment must match its replication durability. Schedulers decide placement; workers execute untrusted or isolated workloads.
 
 ## 4. Data model and state machine
 
@@ -194,11 +194,11 @@ Cron definitions store the original expression, IANA time zone, and explicit day
 - Repeated local time: run once or twice.
 - Misfire: catch up, coalesce to one run, or skip.
 
-Clock skew is bounded with synchronized clocks, but database compare-and-swap—not local time alone—prevents double creation.
+For non-idempotent cron jobs, prefer fail-closed behavior: skipping or operator-controlled catch-up is usually safer than accidentally double-launching. Clock skew is bounded with synchronized clocks, but database compare-and-swap—not local time alone—prevents double creation.
 
 ## 8. Dispatch and placement
 
-Ready queues are partitioned by pool and priority band. Scheduler instances consume partitions under leases and maintain a soft cache of worker capacity.
+Ready queues are partitioned by pool and priority band. Scheduler instances consume partitions under leases and maintain a soft cache of worker capacity. For workflow-heavy workloads, sticky ownership of a workflow shard can keep related state transitions local, but ownership must be rebuildable from the database after failure.
 
 Placement filters by:
 
@@ -210,7 +210,7 @@ Placement filters by:
 
 Then it scores eligible workers by remaining capacity, locality, fragmentation, and recent failure rate. The scheduler creates an `Attempt` and transitions `READY -> DISPATCHED` before offering it. If the worker does not accept promptly, the offer expires and the run is requeued.
 
-Use deficit round robin or weighted fair queuing across tenants, with reserved capacity for critical classes. Aging prevents low-priority starvation.
+Use deficit round robin or weighted fair queuing across tenants, with reserved capacity for critical classes and per-namespace quotas so one tenant or job type cannot monopolize shared queues. Aging prevents low-priority starvation.
 
 ## 9. Execution, leases, retries, and cancellation
 
@@ -228,7 +228,7 @@ Worker code receives `run_id`, `attempt_id`, and a stable business idempotency k
 
 ## 10. Workflow and dependency handling
 
-A DAG submission validates acyclicity and creates dependency edges. Each child stores `remaining_dependencies`. When a parent reaches a terminal state, an idempotent dependency consumer records that edge as satisfied and atomically decrements the counter. The child becomes `READY` exactly when the count reaches zero and its conditions hold.
+A DAG submission validates acyclicity and creates dependency edges. Each child stores `remaining_dependencies`. When a parent reaches a terminal state, an idempotent dependency consumer records that edge as processed and atomically decrements the counter if the edge condition is satisfied. If a required `SUCCESS` edge cannot be satisfied because the parent failed or was canceled, the child is marked `SKIPPED`/`BLOCKED` (or failed according to workflow policy) rather than waiting forever. The child becomes `READY` exactly when all required edges are processed and their conditions hold.
 
 For massive fan-out, do not transact across all children. Emit partitioned parent-completion events and use batched conditional updates. A workflow aggregator computes summary state from durable child transitions. Compensation is application-defined; the scheduler must not pretend arbitrary steps can be rolled back.
 
@@ -249,7 +249,7 @@ Fencing is essential. A lease timestamp alone fails if a paused scheduler resume
 
 Shard job/run rows by `tenant_id` plus hashed `job_id` to distribute large tenants. Keep a run and its attempts/events together. Separate indexes serve `(state, next_action_time, shard)` scans without globally querying all jobs.
 
-Ready queues partition by execution pool and priority, with virtual partitions for rebalancing. Timer buckets partition by fire time and hash. Payloads, results, and logs use immutable object keys and checksums.
+Ready queues partition by execution pool and priority, with virtual partitions for rebalancing. Timer buckets partition by fire time and hash. Very large tenants get namespace-level capacity reservations and many virtual shards; small tenants can share shards without losing quota isolation. Payloads, results, and logs use immutable object keys and checksums.
 
 Move terminal event histories to columnar object-storage files after the hot period. Keep compact status rows online and index selected fields in a search engine. Search is never authoritative for scheduling.
 
@@ -273,12 +273,12 @@ Run continuous invariants: no `RUNNING` attempt with an expired unhandled lease,
 
 ## 14. Multi-region design
 
-Assign each tenant or job to a home region for state transitions and timer ownership. Stateless APIs route writes home; workers may run elsewhere if latency and data policy permit. Metadata replicates synchronously across availability zones and asynchronously to a disaster-recovery region.
+Assign each tenant or job to a home region for state transitions and timer ownership. Stateless APIs route writes home; workers may run elsewhere if latency and data policy permit. Metadata replicates synchronously across availability zones and asynchronously to a disaster-recovery region by default; choose synchronous cross-region writes only for tenants that require zero regional data loss and can accept the added latency/availability trade-off.
 
 During regional failure:
 
 1. Stop or fence old-region lease issuance.
-2. Verify replication position against the accepted recovery-point objective.
+2. Verify replication position against the accepted recovery-point objective and disclose/reconcile any acknowledged home-region writes beyond that point.
 3. Promote the secondary and increment regional epochs.
 4. Reconstruct ready queues and timer windows from authoritative rows.
 5. Treat old workers as stale until they re-register.
@@ -313,7 +313,7 @@ The primary SLI is deadline attainment or schedule-to-start latency, not merely 
 
 ## 17. Capacity protection and operations
 
-Admission control rejects or delays workloads beyond tenant quotas. Per-handler circuit breakers can pause jobs when a dependency is failing, avoiding a retry storm. Operators need safe controls to pause a definition, drain a pool, reduce concurrency, quarantine a version, replay dead letters, and inspect every state transition.
+Admission control rejects or delays workloads beyond tenant quotas. Per-handler circuit breakers can pause jobs when a dependency is failing, avoiding a retry storm. Backpressure should be visible as queue age and admission delay, not hidden as unbounded database/Redis memory growth. Operators need safe controls to pause a definition, drain a pool, reduce concurrency, quarantine a version, replay dead letters, and inspect every state transition.
 
 Deploy scheduler changes gradually because placement bugs have fleet-wide blast radius. Version worker protocols and allow mixed-version operation during rollout.
 
@@ -339,7 +339,49 @@ Central schedulers optimize placement but can bottleneck. Partitioned schedulers
 
 Strict priority can starve tenants. Weighted fair queues with reserved emergency capacity provide predictable isolation.
 
-## 19. Recommended interview presentation
+## 19. Lessons from production systems
+
+### Dropbox ATF: callback contracts and no-concurrent-task ownership
+
+Dropbox's Async Task Framework was built for 10,000 tasks/second from the start, was serving about 9,000 scheduled tasks/second, and targeted 95% of tasks beginning within five seconds of their scheduled time. Its most transferable idea is the explicit user contract: at-least-once execution, idempotent callbacks, terminal-state signaling by user code, and no concurrent execution of the same task. This design should expose the same contract in the API and worker SDK instead of burying retries and fencing as implementation details.
+
+### Slack: durable buffers prevent queue-memory deadlock
+
+Slack's older Redis-backed queue failed badly when Redis filled: enqueue stopped, and even dequeue required enough memory to move jobs into an in-flight list. Slack inserted Kafka ahead of Redis through a stateless Kafkagate service, preserving application interfaces while adding a durable write buffer for bursts. This scheduler should treat bounded in-memory queues as dispatch accelerators only; accepted jobs need durable storage/logging before client acknowledgment, and queue age should trigger backpressure before memory exhaustion.
+
+### Meta FOQS: persistent priority queues with leases and active-topic discovery
+
+FOQS is a sharded-MySQL, multitenant priority queue with namespace/topic isolation, `deliver_after`, lease duration, ack/nack, delayed redelivery, and active-topic discovery. Meta also uses prefetch buffers and in-memory ready indexes to avoid scanning every shard on dequeue. This maps directly to ready-queue partitions: keep priority/delay metadata durable, let consumers lease work, and use active partition/topic discovery so workers do not poll every possible queue.
+
+### Meta Async: delay tolerance, time shifting, and batching
+
+Meta's Async platform moved beyond simple FIFO priority because large use cases and peak-hour load could starve smaller or more urgent work. It classifies work by delay tolerance and uses queues, time shifting, and batching to move tolerant work away from peaks while preserving urgent workloads. The scheduler should therefore make deadline/delay tolerance a first-class placement signal and expose coalescing/batching policies for tenants that can trade latency for efficiency.
+
+### Airbnb Dynein: separate immediate queues from durable delayed scheduling
+
+Airbnb's Dynein wraps SQS for immediate jobs and uses a separate delayed scheduler for jobs that may be months or years in the future, with an inbound SQS queue buffering scheduler ingestion spikes. This supports the database-plus-near-horizon timing-wheel split: durable future triggers remain in a scheduler store, immediate execution uses queue semantics, and an inbound buffer smooths write spikes without losing jobs.
+
+### Google distributed cron: prefer fail-closed for non-idempotent schedules
+
+Google SRE's distributed cron chapter emphasizes that some cron jobs tolerate skipped runs but not double launches, such as payroll or newsletters. Their lesson is to track launch state consistently and often prefer skipping over duplicate launch when ambiguity remains. This design should require explicit misfire and idempotency policy per cron definition, with operator-visible skipped launches rather than automatic duplicate catch-up for unsafe jobs.
+
+### Netflix Maestro: keep authoritative state single and rebuild fast caches
+
+Netflix redesigned Maestro's engine after dual state in Conductor tables plus Maestro tables and external queues created race conditions, stuck jobs, and lost executions. The new engine keeps the database as source of truth, rebuilds in-memory flow state after failure, partitions flow groups, and uses generation IDs for ownership. This reinforces the design choice that queues, heaps, and actor state are caches; the database must be sufficient to rebuild ownership and continue workflows safely.
+
+### Uber Cadence: code-driven durable workflows need versioning and operations
+
+Uber Cadence treats workflows as code in native languages, adding schedules, signals, cancellation, retries, searchable attributes, UI inspection, rate limits, hot-shard detection, failover, resets, versioning, and replay/shadow testing. For this scheduler, DAG support should not stop at dependency counters: long-lived workflows need version-safe replay, operator reset from a safe point, searchable checkpoints, and compatibility rules for in-flight runs during deployments.
+
+### Temporal: durable execution is an application model, not exactly-once side effects
+
+Temporal frames durable execution as crash-proof progress by virtualizing execution across process failures. That is useful for workflow code, but it does not eliminate the need for idempotent activities and external side-effect coordination. This scheduler should distinguish durable orchestration state from side-effect correctness: it can reliably resume a workflow decision, but handlers still need idempotency keys, transactional inbox/outbox patterns, or fenced downstream writes.
+
+### Google Borg: placement is an optimization and isolation problem
+
+Borg runs hundreds of thousands of jobs across clusters up to tens of thousands of machines, combining admission control, task packing, overcommitment, machine sharing, and process-level isolation. A job scheduler at this scale should not only dequeue work; it must model resource requests, pack tasks to reduce fragmentation, spread correlated failures, and expose simulation/analysis tools before changing fleet-wide placement policy.
+
+## 20. Recommended interview presentation
 
 A clear 45-minute sequence is:
 
@@ -355,3 +397,18 @@ A clear 45-minute sequence is:
 The central design insight is:
 
 > Keep job state authoritative in a strongly consistent store, use queues as rebuildable dispatch accelerators, and combine renewable leases with monotonically increasing fencing epochs so failures can cause retries without allowing stale owners to mutate state.
+
+## Further reading: curated engineering blogs
+
+| Source | Article | Why it matters |
+|---|---|---|
+| Dropbox | [How we designed Dropbox ATF: an async task framework](https://dropbox.tech/infrastructure/asynchronous-task-scheduling-at-dropbox) | Defines at-least-once async task contracts, no-concurrent execution, isolation, and latency targets at 9k tasks/sec. |
+| Slack | [Scaling Slack’s Job Queue](https://slack.engineering/scaling-slacks-job-queue/) | Shows how durable Kafka buffering avoided Redis memory deadlock while preserving existing job queue interfaces. |
+| Meta | [FOQS: Scaling a distributed priority queue](https://engineering.fb.com/2021/02/22/production-engineering/foqs-scaling-a-distributed-priority-queue/) | Details sharded persistent priority queues with delay, leases, ack/nack, active-topic discovery, and trillion-item/day scale. |
+| Meta | [Async: Driving efficiency and developer productivity at Facebook scale](https://engineering.fb.com/2020/08/17/production-engineering/async/) | Explains delay tolerance, time shifting, batching, and fairness for billions of asynchronous requests. |
+| Airbnb | [Dynein: Building an Open-source Distributed Delayed Job Queueing System](https://medium.com/airbnb-engineering/dynein-building-a-distributed-delayed-job-queueing-system-93ab10f05f99) | Separates immediate SQS-backed queues from durable delayed scheduling with buffering, rate limits, and backpressure. |
+| Google SRE | [Distributed Periodic Scheduling with Cron](https://sre.google/sre-book/distributed-periodic-scheduling/) | Covers distributed cron state, idempotency, skipped-vs-duplicate launch trade-offs, and consensus-backed scheduler replicas. |
+| Netflix | [100X Faster: How We Supercharged Netflix Maestro’s Workflow Engine](https://netflixtechblog.com/100x-faster-how-we-supercharged-netflix-maestros-workflow-engine-028e9637f041) | Shows how single-source-of-truth state, rebuildable in-memory actors, partitioned ownership, and generation IDs remove workflow races. |
+| Uber | [Announcing Cadence 1.0: The Powerful Workflow Platform Built for Scale and Reliability](https://www.uber.com/us/en/blog/announcing-cadence/) | Highlights code-driven workflows, signals, schedules, resets, versioning, failover, search, and operational tooling. |
+| Temporal | [The definitive guide to Durable Execution](https://temporal.io/blog/what-is-durable-execution) | Clarifies durable execution as crash-proof workflow progress while leaving external side effects to idempotency/fencing. |
+| Google Research | [Large-scale cluster management at Google with Borg](https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/) | Adds placement lessons: admission control, task packing, overcommitment, isolation, correlated-failure avoidance, and simulation. |

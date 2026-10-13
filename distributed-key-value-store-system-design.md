@@ -29,11 +29,11 @@ The baseline design is a strongly consistent, range-partitioned store. Multi-key
 Assume:
 
 - 10 PB logical data, 1 KB average value, roughly 10 trillion keys.
-- 5 million reads/second and 1 million writes/second peak.
-- Replication factor three: 30 PB before compression.
-- 100,000 storage nodes with 10-20 TB usable capacity.
+- 5 million reads/second and 1 million writes/second peak: 6 million ops/s, roughly 83/17 read/write.
+- Replication factor three: 30 PB replicated data before compression and metadata overhead.
+- Roughly 3,000-9,000 storage nodes with 10-20 TB usable capacity after headroom, compaction, index, and tombstone overheads.
 - 30-day point-in-time recovery through snapshots and logs.
-- 70/30 read/write ratio, but individual ranges can be highly skewed.
+- Individual ranges can be highly skewed even when aggregate traffic is read-heavy.
 
 ```text
 1M writes/s x 1 KB = 1 GB/s logical ingress
@@ -166,7 +166,7 @@ For multi-range transactions, add:
 3. Two-phase commit after conflict checking.
 4. A recovery protocol where participants resolve abandoned coordinators.
 
-This provides atomicity but increases latency, write amplification, and contention. Keep the initial interview design single-range unless cross-range transactions are required.
+This provides atomicity but increases latency, write amplification, and contention; long-running transactions also pin multi-tenant resources and should be tightly bounded. Keep the initial interview design single-range unless cross-range transactions are required.
 
 ## 9. Partitioning, splitting, and routing
 
@@ -180,7 +180,7 @@ Ordered range partitioning supports scans and locality. Start with coarse ranges
 
 Ranges can move replica-by-replica using joint consensus, then transfer leadership. Merge adjacent cold ranges to control metadata overhead.
 
-Sequential keys create a hot last range. Recommend hashed key prefixes, reversed timestamps, or application sharding when ordered global insertion is not required.
+Sequential keys create a hot last range. Recommend hashed key prefixes, reversed timestamps, or application sharding when ordered global insertion is not required. Splitting helps hot ranges, but a single hot key or very narrow prefix still needs request coalescing, caching, tenant throttles, or explicit application-level sharding.
 
 ## 10. LSM storage engine
 
@@ -221,7 +221,7 @@ Delivery is at least once. Consumers deduplicate by stable event identity. If re
 | Client has stale range map | Epoch error includes/refers to new descriptors |
 | Compaction crashes | Input SSTables remain; unreferenced output is discarded |
 | Tombstone removed too early | Prevent through GC safe point and repair horizon |
-| Hot range overloads | Split, relocate, isolate tenant, or redesign key |
+| Hot range overloads | Split, relocate, coalesce duplicate reads, isolate tenant, throttle, cache, or redesign key |
 | Metadata service unavailable | Cached routes and range consensus continue; reconfiguration pauses |
 
 Periodic Merkle-tree or block-checksum comparisons detect silent divergence. Repair transfers only differing blocks and never overwrites newer committed state.
@@ -290,7 +290,45 @@ Synchronous replication minimizes RPO but adds WAN latency and can reduce availa
 
 Large ranges reduce metadata and consensus groups but move slowly and hotspot. Small ranges rebalance well but add control-plane and file overhead.
 
-## 19. Recommended interview presentation
+## 19. Lessons from production systems
+
+### Amazon DynamoDB: partition splitting, adaptive capacity, and heat
+
+DynamoDB scales by adding partitions and can split partitions for size or sustained traffic, but partition-level limits still exist and partitions are split rather than merged. This reinforces the design's range split triggers and adds two operational rules: pre-warm or pre-split when launching a known high-traffic table, and do not assume automatic splitting fixes a single hot partition key. For this design, the gateway should track per-range and per-key heat separately so range split, routing, coalescing, and application sharding are chosen deliberately.
+
+### Amazon DynamoDB: managed Multi-Paxos at massive scale
+
+The DynamoDB USENIX ATC paper describes a managed NoSQL service using partitioned replication groups with Multi-Paxos, admission control, auto scaling, backups, and global tables; Amazon reported 89.2 million peak requests/second during Prime Day 2021 while maintaining single-digit millisecond performance. This maps directly to this design's independent consensus ranges and underscores that capacity automation, per-tenant guardrails, and operational workflows are as important as the core log protocol.
+
+### Amazon DynamoDB transactions: keep cross-partition transactions bounded
+
+Amazon's transactions paper adds distributed transactions using timestamp ordering while exploiting key-value semantics to keep both transactional and non-transactional operations low-latency. The important interview lesson is not to bolt on unbounded 2PC casually: transaction records, participant recovery, conflict detection, idempotency, and strict time limits are part of the feature. This is why this design keeps single-range atomicity in the baseline and treats multi-range transactions as an explicit extension.
+
+### Discord: hot partitions need upstream protection, not just a faster database
+
+Discord's message store hit Cassandra hot partitions, compaction debt, and JVM GC toil at trillions of messages. Its migration added Rust data services that consistently route by channel and coalesce duplicate reads, then moved from 177 Cassandra nodes to 72 ScyllaDB nodes; historical-message p99 improved from 40-125 ms to about 15 ms and inserts to about 5 ms. For this design, a gateway/routing layer should include request coalescing and concurrency caps for hot keys before traffic reaches range leaders.
+
+### Meta ZippyDB: a shared strongly consistent KV tier needs flexible isolation
+
+Meta built ZippyDB as a managed, strongly consistent, geographically distributed key-value store on RocksDB, Data Shuttle, shard management, and ZooKeeper. It groups resources into tiers, usually using a generic multi-tenant tier for utilization while allowing dedicated tiers for stricter isolation, and can use Paxos or async replication depending on durability/latency needs. This supports the design's tenant quotas and consistency-at-table-creation model rather than one global policy.
+
+### Uber Schemaless: immutable versions and secondary indexes simplify scale-out
+
+Uber's Schemaless stored immutable cells addressed by row key, column name, and ref key, with updates represented as newer versions and eventually consistent secondary indexes over JSON fields. Even though it used MySQL underneath rather than an LSM/consensus range, the production lesson is relevant: versioned immutable records, asynchronous derived indexes, and migration-friendly storage abstractions reduce risk when scaling core business data. This matches the MVCC/tombstone/change-stream parts of this design.
+
+### LinkedIn Venice: derived KV stores need batch-get and fanout controls
+
+LinkedIn Venice is a derived-data key-value platform used for read-heavy recommendation and ML features, serving 6.25M Single Get QPS and 45M key lookups/s for Batch Get at peak in the open-sourcing post. Venice emphasizes multi-region operation, multi-tenancy, quotas, self-healing, and invisible dataset migration across clusters. For this design, BatchGet should have key-count quotas, fanout budgets, partial-result semantics where acceptable, and operator-driven movement that is invisible to clients.
+
+### FoundationDB: keep the KV core minimal and prove it under failure
+
+FoundationDB exposes an ordered transactional key-value core and pushes richer data models into layers. Its technical overview emphasizes optimistic concurrency control, specialized cluster roles, fault tolerance, and simulation/testing as first-class engineering tools. This argues for keeping this system's core API small, making range ownership and transaction rules precise, and validating leader changes, splits, recovery, and backup restore through deterministic fault testing rather than relying on happy-path integration tests.
+
+### Netflix KV DAL: hide sharp datastore edges behind a disciplined API
+
+Netflix's Key-Value Data Abstraction Layer sits above Cassandra, DynamoDB, EVCache, RocksDB, and other stores to standardize modeling and operational patterns. Netflix calls out repeated problems with consistency reasoning, tail latency, idempotency, wide partitions, fat columns, and slow pagination. This maps to a production SDK/gateway that should reject unsafe key shapes, enforce idempotency tokens, cap value and page sizes, expose consistency explicitly, and give teams one safe path for common KV access patterns.
+
+## 20. Recommended interview presentation
 
 1. Clarify consistency, scan, transaction, durability, and regional requirements.
 2. Estimate operations, bytes, replicas, and write amplification.
@@ -304,3 +342,18 @@ Large ranges reduce metadata and consensus groups but move slowly and hotspot. S
 The central design insight is:
 
 > Partition the ordered keyspace into independently replicated consensus ranges, use epochs to make routing and ownership changes safe, and combine a replicated log with an LSM engine and MVCC so durable writes, scalable scans, repair, and snapshots have explicit correctness boundaries.
+
+
+## Further reading: curated engineering blogs
+
+| Source | Article | Why it matters |
+|---|---|---|
+| AWS | [Scaling DynamoDB: How partitions, hot keys, and split for heat impact performance](https://aws.amazon.com/blogs/database/part-3-scaling-dynamodb-how-partitions-hot-keys-and-split-for-heat-impact-performance/) | Shows partition splitting, adaptive capacity, burst behavior, and why hot keys still need design work. |
+| Amazon / USENIX | [Amazon DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL Database Service](https://www.usenix.org/conference/atc22/presentation/elhemali) | Explains partitioned Multi-Paxos replication, autoscaling, backups, global tables, and operating at tens of millions of requests per second. |
+| Amazon / USENIX | [Distributed Transactions at Scale in Amazon DynamoDB](https://www.usenix.org/system/files/atc23-idziorek.pdf) | Details how DynamoDB adds bounded distributed transactions without making normal key-value operations slow. |
+| Discord | [How Discord Stores Trillions of Messages](https://discord.com/blog/how-discord-stores-trillions-of-messages) | Demonstrates hot-partition mitigation with data services, request coalescing, consistent routing, and Cassandra-to-ScyllaDB migration results. |
+| Meta | [How we built a general purpose key value store for Facebook with ZippyDB](https://engineering.fb.com/2021/08/06/core-infra/zippydb/) | Shows a multi-tenant strongly consistent KV service with tiers, shards, RocksDB, Paxos/async replication, and flexible durability choices. |
+| Uber | [The Architecture of Schemaless, Uber Engineering’s Trip Datastore Using MySQL](https://www.uber.com/us/en/blog/schemaless-part-two-architecture/) | Covers immutable cells, sharding, versioned updates, and eventually consistent indexes in a production datastore. |
+| LinkedIn | [Open Sourcing Venice: LinkedIn’s Derived Data Platform](https://www.linkedin.com/blog/engineering/open-source/open-sourcing-venice-linkedin-s-derived-data-platform) | Provides production numbers and patterns for read-heavy derived KV data, BatchGet fanout, multi-tenancy, quotas, and multi-region operation. |
+| Apple / FoundationDB | [Technical Overview](https://apple.github.io/foundationdb/technical-overview.html) | Shows why a minimal ordered transactional KV core, layers, optimistic concurrency, and simulation-driven testing matter. |
+| Netflix | [Introducing Netflix’s Key-Value Data Abstraction Layer](https://netflixtechblog.com/introducing-netflixs-key-value-data-abstraction-layer-1ea8a0a11b30) | Explains how a KV DAL standardizes consistency, idempotency, pagination, and data modeling across multiple backing stores. |

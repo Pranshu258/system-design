@@ -33,21 +33,25 @@ Video transport, recommendation feeds, and full user identity are external syste
 - 100 million daily active viewers.
 - 10 million concurrent connections at ordinary peak; 30 million during major events.
 - 500,000 active comment threads.
-- Average 100,000 comments/second; peak 1 million/second.
-- Read fan-out can exceed 20 million delivered messages/second.
+- Average 100,000 comments/second across the fleet; peak 1 million/second.
+- Read fan-out can exceed 20 million delivered messages/second even after sampling and aggregation.
 - Average durable comment payload: 500 bytes before indexing and replicas.
-- Typical thread: 10 comments/second and 100 viewers.
+- Typical active discussion: 10 comments/second and 100 viewers; most of the 500,000 threads are colder at any instant.
 - Hot live event: 100,000 comments/second and 5 million viewers.
 - Retain comments for one year; retain moderation evidence per policy.
 
-Peak daily raw payload:
+Peak raw ingress and storage:
 
 ```text
 1M comments/second x 500 bytes
 = 500 MB/second before replication and indexes
+
+100K comments/second average x 500 bytes x 86,400 seconds/day
+= 4.32 TB/day raw
+= about 1.58 PB/year raw before replication, indexes, and evidence attachments
 ```
 
-Connection count and fan-out bandwidth exceed write-storage cost. The design must degrade hot threads deliberately rather than attempt to show every message to every viewer.
+A hot event with 100,000 comments/second and 5 million viewers would require 500 billion delivered messages/second if every viewer received every comment. Connection count and fan-out bandwidth therefore exceed write-storage cost. The design must degrade hot threads deliberately rather than attempt to show every message to every viewer.
 
 ## 3. High-level architecture
 
@@ -252,7 +256,7 @@ Each thread has one logical sequence. This gives:
 
 Wall-clock timestamps alone are insufficient because clocks skew and concurrent writes tie.
 
-Delivery is at-least-once. Gateways discard events whose sequence is already applied. If a sequence gap appears, a client or gateway calls the read API for the missing range. Push is a latency optimization; the durable comment store and sequence cursor are authoritative.
+Delivery is at-least-once. Gateways discard events whose sequence is already applied. If a sequence gap appears, a client or gateway calls the read API for the missing range. Because hot-thread sequencers may reserve ranges, the read API must distinguish "not yet persisted" from a sealed empty range so clients do not wait forever on a valid gap. Push is a latency optimization; the durable comment store and sequence cursor are authoritative.
 
 On reconnect:
 
@@ -281,6 +285,7 @@ Backpressure rules:
 - Coalesce reaction and count updates.
 - Drop ephemeral presence first.
 - Switch lagging viewers to sampled or snapshot mode.
+- For live video surfaces, cap per-viewer comment rate and rank/filter at the fan-out layer instead of asking mobile clients to discard a firehose.
 - Never block the thread's durable write path on a viewer.
 
 Communicate degraded delivery mode in protocol metadata so clients do not imply they are displaying every comment.
@@ -393,7 +398,7 @@ Assign each thread a home region for sequencing and durable writes:
 
 For global live events, cross-region write latency is traded for one deterministic order. If lower latency matters more, partition into regional substreams and display a deterministic merge, but users may observe slightly different interleavings. State that product choice explicitly.
 
-On home-region failure, elect a caught-up replica with a higher fencing epoch. Gateways buffer only a small bounded number of submissions; clients retry using idempotency keys. Read and already-replicated fan-out continue.
+On home-region failure, elect a caught-up replica with a higher fencing epoch. Replicate the idempotency-key table with the log so retries after failover return the original comment rather than creating duplicates. Gateways buffer only a small bounded number of submissions; clients retry using idempotency keys. Read and already-replicated fan-out continue.
 
 ## 15. Reliability and failure handling
 
@@ -428,7 +433,7 @@ Periodic jobs reconcile stream offsets with stored comment ranges, reaction aggr
 - Prevent enumeration through opaque IDs and uniform authorization errors.
 - Sign internal moderation decisions and verify service identity.
 
-Privacy-sensitive presence should use approximate counts unless users explicitly opt into named presence.
+Privacy-sensitive presence should use approximate counts unless users explicitly opt into named presence. Presence should be heartbeat-based with jitter tolerance: treat a user as online while heartbeats arrive within a grace window, and publish offline only after expiry to avoid flapping on lossy mobile networks.
 
 ## 17. Observability
 
@@ -484,7 +489,41 @@ Synthetic clients should post, reconnect across a forced gateway failure, detect
 - Durable user reactions enforce uniqueness.
 - Approximate or asynchronous totals scale viral reads.
 
-## 19. Recommended interview presentation
+## 19. Lessons from production systems
+
+### Meta Live Commenting: push beats low-interval polling
+
+Meta's original live commenting work found that polling every few seconds would overload backend systems at social scale. Their key inversion was to track viewer-to-content interest with local writes and read that interest globally when a comment arrived. For this design, subscriptions must be first-class state in gateways/fan-out, not an afterthought bolted onto the read API.
+
+### Meta Bladerunner: backend ranking before mobile delivery
+
+The Bladerunner paper describes Facebook stream processors that receive social-graph mutations, apply application-specific filtering, aggregation, and per-user logic, then push only selected updates to devices. Its LiveVideoComments use case is the model for this design's `RANKED` mode: rank and rate-limit in regional fan-out so phones do not spend battery and bandwidth receiving comments they will never render.
+
+### Meta Live streaming: redundancy is part of the product
+
+Meta's professional live-streaming stack added redundant transport, ingestion, processing, delivery, and playback paths, proving the design at 7.2 million concurrent viewers for a UEFA Champions League final. For comments, that maps to redundant regional fan-out consumers and bounded reconnect recovery; a live event cannot depend on a single gateway fleet, stream consumer, or moderation service instance.
+
+### LinkedIn Presence: heartbeats need grace and sticky timers
+
+LinkedIn's presence platform uses periodic heartbeats, K/V expiry, delayed triggers, and best-effort sticky routing so lossy mobile reconnects do not create online/offline flapping. The same pattern applies to viewer counts, typing indicators, and named presence here: ephemeral state should tolerate jitter and should not share the durable comment log.
+
+### Slack Flannel: edge caches reduce bootstrap and reconnect storms
+
+Slack's Flannel edge cache keeps team-affine state near clients, serves slim startup payloads, and had reached 4 million simultaneous connections and 600K client queries/second. For live comments, gateways should similarly cache thread metadata, pinned comments, author cards, and recent windows at the edge so reconnect storms do not stampede the primary read store.
+
+### Twitch Chat and Pubsub: separate ingress, policy, and fan-out
+
+Twitch describes IRC Edge accepting/delivering chat, Clue and Zuma evaluating channel rules and AutoMod settings, and Pubsub brokers fanning topic messages to edges. This supports the split in this document: write acceptance, moderation policy, and fan-out should be separate services so a hot room or a policy evaluation slowdown does not collapse every connection on the same host.
+
+### Disney+ Hotstar PubSub: broadcast clusters are not generic chat
+
+Hotstar's 50M-connection PubSub work reached 250K connections per EMQX subscriber node, found clustered latency and load-balancer limits, then used publisher/subscriber separation, small clusters, reverse bridges, and many subscriber nodes. For this design, large live events should use broadcast-optimized fan-out trees for counts, polls, and highlights, while durable comment creation remains a separately sequenced write path.
+
+### Discord message storage: shield databases from hot partitions
+
+Discord put Rust data services in front of Cassandra/ScyllaDB, using request coalescing and consistent-hash routing by channel to reduce hot-partition traffic. The comment read path should do the same for celebrity threads: coalesce identical recent-window and gap-fill requests per `(thread_id, range)` before hitting the comment store.
+
+## 20. Recommended interview presentation
 
 A clear 45-minute sequence is:
 
@@ -501,3 +540,16 @@ A clear 45-minute sequence is:
 The central design insight is:
 
 > Persist each accepted comment once in a per-thread ordered log, then treat real-time push as recoverable at-least-once fan-out. Under extreme heat, preserve durable history and moderation correctness while deliberately degrading each viewer to a bounded, transparent subset.
+
+## Further reading: curated engineering blogs
+
+| Source | Article | Why it matters |
+|---|---|---|
+| Meta | [Live Commenting: Behind the Scenes](https://engineering.fb.com/2011/02/07/core-infra/live-commenting-behind-the-scenes/) | Shows why low-latency comments need push and subscription state rather than frequent polling. |
+| Meta / SOSP | [Bladerunner: Stream processing at scale for a live view of backend data mutations at the edge](https://doi.org/10.1145/3477132.3483572) | Describes per-application stream processors that filter, aggregate, and rank live updates before device delivery. |
+| Meta | [How we scale Live streaming for millions of viewers simultaneously](https://engineering.fb.com/2020/10/22/video-engineering/live-streaming/) | Details redundancy and failover expectations for high-stakes live events with millions of concurrent viewers. |
+| LinkedIn | [Now You See Me, Now You Don’t: LinkedIn’s Real-Time Presence Platform](https://www.linkedin.com/blog/engineering/product-design/now-you-see-me-now-you-dont-linkedins-real-time-presence-platf) | Provides the heartbeat, expiry, delayed-trigger, and sticky-routing pattern for presence and viewer counts. |
+| Slack | [Flannel: An Application-Level Edge Cache to Make Slack Scale](https://slack.engineering/flannel-an-application-level-edge-cache-to-make-slack-scale-/) | Demonstrates edge caching, slim bootstraps, team affinity, and reconnect-storm reduction for real-time clients. |
+| Twitch | [Twitch State of Engineering 2023](https://blog.twitch.tv/en/2023/09/28/twitch-state-of-engineering-2023/) | Explains chat edge, policy evaluation, and Pubsub fan-out separation for hundreds of billions of chat messages/day. |
+| Disney+ Hotstar | [Building PubSub for 50M concurrent socket connections](https://blog.hotstar.com/building-pubsub-for-50m-concurrent-socket-connections-5506e3c3dabf) | Shows practical broadcast fan-out lessons: publisher/subscriber split, cluster-size limits, load balancers, and reverse bridges. |
+| Discord | [How Discord Stores Trillions of Messages](https://discord.com/blog/how-discord-stores-trillions-of-messages) | Shows request coalescing and consistent-hash routing to protect hot message partitions. |

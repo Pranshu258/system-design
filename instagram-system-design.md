@@ -36,9 +36,10 @@ Direct messaging is a separate chat subsystem and is out of scope except for sha
 - 20 billion media views/day across feed, profiles, stories, and Explore.
 - Peak feed/API read traffic: approximately 1 million requests/second.
 - Average photo source: 3 MB; average short-video source: 20 MB.
-- Daily source ingest: roughly 1-3 PB before replicas and derived renditions.
+- Daily source ingest: roughly 2-6 PB before replicas and derived renditions, depending on video mix.
 - Derived images average 3-6 sizes/formats; videos use an adaptive bitrate ladder.
 - Average user follows 300 accounts; celebrity accounts exceed 100 million followers.
+- Average write rate is about 1.2k feed posts/s plus 5.8k stories/s; 20B media views/day averages about 231k views/s before peak amplification.
 - Most bytes are served by CDN, while metadata and authorization remain application concerns.
 
 Photos, videos, feed ranking, and stories have different access and retention patterns. The design shares ingestion and media storage but uses separate indexes and serving policies.
@@ -199,7 +200,7 @@ StoryView
 - viewed_at
 ```
 
-Counters are cached projections, not the canonical engagement state. Media is immutable; edits change post metadata or create a replacement media asset rather than mutating CDN objects.
+Counters are cached projections, not the canonical engagement state. Media is immutable; edits change post metadata or create a replacement media asset rather than mutating CDN objects. User, post, story, and media IDs should be globally unique, time-sortable 64-bit or 128-bit IDs that encode or map to shard ownership so inserts do not coordinate through a single sequence.
 
 ## 5. Core APIs
 
@@ -273,7 +274,7 @@ Mutations use idempotency keys and/or entity versions. Feed cursors are signed, 
 4. An outbox event starts a durable processing workflow.
 5. Image jobs correct orientation, strip unsafe metadata, crop previews, and generate AVIF/WebP/JPEG renditions.
 6. Video jobs probe the file, transcode an HLS/DASH ladder, create posters, and validate output.
-7. Safety classifiers inspect permitted content and attach policy decisions.
+7. Safety classifiers inspect content and attach policy decisions before it can be referenced by a post.
 8. The media record becomes `READY`; the client may publish it.
 
 Processing jobs are idempotent and write versioned deterministic output keys. A minimum image rendition or low video ladder can make publishing available while premium variants finish, but the post must never reference an unvalidated source.
@@ -302,7 +303,7 @@ Candidate sources include:
 - Reshares or collaborative posts.
 - Sponsored content from a separate ads system.
 
-The serving path deduplicates, filters private/blocked/deleted/ineligible posts, hydrates media and features, pre-ranks, applies the main ranker, then re-ranks for diversity and frequency caps. It performs a final authorization check before issuing media URLs.
+The serving path deduplicates, filters private/blocked/deleted/ineligible posts, hydrates media and features, pre-ranks, applies the main ranker, then re-ranks for diversity and frequency caps. It performs a final authorization check before issuing media URLs. Recommendation sources should precompute/cache item embeddings and some candidate lists so online ranking is bounded by latency and CPU budgets.
 
 If recommendation systems fail, serve recent followed posts. If the online feature store is slow, use bounded stale features or a lightweight model. Core feed utility must not depend on every ML service.
 
@@ -332,11 +333,11 @@ Maintain an author timeline index ordered by publication time. Profile reads fet
 
 Explore uses:
 
-1. Candidate retrieval from content/user embeddings, topics, trends, and graph neighborhoods.
-2. Policy and eligibility filtering.
-3. Ranking for predicted interest and quality.
-4. Diversity across creators, media types, and topics.
-5. Exploration slots for new content.
+1. Candidate retrieval from content/user embeddings, account/media KNN, topics, trends, and graph neighborhoods.
+2. Policy and eligibility filtering before ranking, so non-recommendable inventory is removed early.
+3. Multi-stage ranking: cheap retrieval/first-pass models narrow thousands of candidates before heavier models score hundreds.
+4. Diversity across creators, seed accounts, media types, and topics.
+5. Exploration slots for new content and cold-start fallbacks from graph exploration or popular media.
 
 ### Search
 
@@ -415,11 +416,11 @@ Notifications are derived, coalesced, and rate-limited:
 - Partition stories by author and expiration bucket.
 - Partition graph lists by user; shard extreme reverse lists.
 - Partition engagement streams by target with salting for viral posts.
-- Store source and derived media in object storage; serve immutable renditions through CDN.
+- Store source and derived media in object storage; serve immutable renditions through CDN. Keep small-object metadata compact enough for memory indexes, and tier older low-request media to cheaper erasure-coded warm storage while keeping hot media replicated for throughput.
 
 Media URLs should reference versioned assets so TTLs can be long. For public content, CDN caches maximize sharing. For private content, use short-lived signed URLs/cookies and edge authorization while preserving cacheability of encrypted bytes. A leaked URL should expire quickly and be scoped to an object class.
 
-Cache profile metadata, public profile grids, feed candidate IDs, graph summaries, and popular public post metadata. Never use a stale cache entry as sole proof of private-content authorization.
+Use layered media caches: browser/app cache, edge CDN, regional origin cache, and storage backend. Cache profile metadata, public profile grids, feed candidate IDs, graph summaries, and popular public post metadata. Never use a stale cache entry as sole proof of private-content authorization.
 
 ## 15. Reliable events and lifecycle management
 
@@ -433,7 +434,7 @@ Commit canonical mutations with an outbox row. Relays publish immutable, version
 - Analytics and creator insights.
 - Deletion and retention workflows.
 
-Consumers are idempotent and compare aggregate versions so a delayed update cannot resurrect a deleted post. Dead-letter queues retain poison events with alerting and replay tooling.
+Consumers are idempotent and compare aggregate versions so a delayed update cannot resurrect a deleted post. Dead-letter queues retain poison events with alerting and replay tooling. Key-value stores that back feeds, inboxes, and graph projections need explicit p99/p999 tail-latency controls, not only average-latency dashboards.
 
 Media garbage collection is conservative:
 
@@ -501,7 +502,7 @@ Track:
 - Feed/profile/story p50/p95/p99 latency and dependency breakdown.
 - Image load time, video startup time, rebuffering, and CDN hit ratio.
 - Fan-out lag, amplification, hybrid-mode rate, and inbox rebuild progress.
-- Candidate counts, ranking fallback rate, duplicate rate, and empty feeds.
+- Candidate counts, ranking fallback rate, duplicate rate, empty feeds, model version, model criticality, and prediction-stability SLOs.
 - Story expiration correctness and unauthorized-access denials.
 - Follow-request and block propagation latency.
 - Counter/search/Explore freshness and notification delivery lag.
@@ -536,7 +537,49 @@ Full ladders improve device coverage and playback immediately but cost compute a
 
 Ranking improves relevance but introduces feature and model dependencies. A following-only chronological fallback preserves availability, predictability, and user control.
 
-## 21. Recommended interview presentation
+## 21. Lessons from production systems
+
+### Instagram sharded PostgreSQL IDs
+
+Instagram avoided a central ID service by generating IDs inside PostgreSQL shards: 41 bits of millisecond time, 13 bits of logical shard ID, and 10 bits of per-shard sequence, allowing 1024 IDs per shard per millisecond. For this design, post/media/story IDs should be time-sortable and either encode the shard or cheaply map to it, so profile grids and feed backfills can route without a lookup bottleneck.
+
+### Instagram Rocksandra for tail latency
+
+Instagram used Cassandra heavily for online key-value workloads and built Rocksandra, a RocksDB-backed storage engine, after JVM GC drove p99 read spikes. One production cluster dropped p99 reads from 60 ms to 20 ms and GC stalls from 2.5% to 0.3%. Feed inboxes, graph projections, and notification stores therefore need p99/p999 objectives, GC/compaction isolation, and request hedging/coalescing around hot keys rather than relying on average latency.
+
+### Facebook Haystack for photo storage
+
+Facebook's Haystack combined many photos into large append-only files and kept minimal offset metadata in memory, eliminating repeated filesystem metadata I/O. Instagram-like media storage should not store every rendition as an independently expensive filesystem object; it should use immutable objects, compact indexes, checksums, tombstones, and online compaction or object-store equivalents.
+
+### Facebook photo caching stack
+
+Facebook measured a layered photo-serving stack of browser cache, edge cache, origin cache, and Haystack; only 9.9% of traced photo requests reached Haystack. Media delivery here should treat CDN and origin caches as core architecture, route origin requests consistently by media ID, and tune eviction policy and cache size before scaling backend storage.
+
+### Facebook f4 warm BLOB storage
+
+Facebook's f4 moved older, lower-request BLOBs from hot replicated storage to erasure-coded warm storage, storing over 65 PB and reducing effective replication from 3.6 to 2.8 or 2.1 while preserving low-latency user reads. This maps directly to Instagram originals and old renditions: keep new or viral media on hot replicated storage, then migrate cooled immutable media to erasure-coded warm tiers behind the same media handle.
+
+### Instagram Explore ranking funnel
+
+Instagram's Explore system used IGQL, account embeddings, FAISS-backed nearest-neighbor retrieval, model distillation, and a three-stage ranking funnel that selected 150, then 50, then 25 items from 500 sampled candidates. Explore in this design should make candidate generation a first-class service with early policy filtering, ANN retrieval, cheap first-pass rankers, and heavier final rankers only after the candidate set is small.
+
+### Meta's newer Explore retrieval
+
+Meta later described Explore as retrieval, first-stage ranking, second-stage ranking, and final reranking over billions of possible items, with Two Tower models, cached item embeddings, online user embeddings, ANN lookup, off-peak precomputation, MTML scoring, and final integrity/diversity reranking. This supports the design choice to cache embeddings and precompute some recommendations while keeping final authorization and policy checks online.
+
+### Instagram Suggested Posts cold start
+
+Instagram's Suggested Posts system distinguishes connected recommendations from unconnected recommendations, uses seeds from user activity, account/media KNN, co-occurrence, and fallbacks through one-hop/two-hop graph exploration or popular media for sparse users. Home-feed recommendations here should preserve a “feels like home” merge policy: prioritize sources related to followed/home accounts, match freshness and media-type distribution, and use explicit negative feedback in ranking.
+
+### Instagram model operations at scale
+
+Instagram reported more than 1000 ML models across Feed, Stories, Reels, comments, notifications, and tagging, then added a model registry, launch automation, criticality tiers, and model-stability SLOs. A production Instagram design needs model ownership and safe rollout tooling, not just ranking algorithms: every model in the feed/story/Explore path should have a baseline, rollback plan, criticality, and health metric.
+
+### Instagram's Python/Django serving efficiency
+
+Meta still describes Instagram's frontend server as Python/Django using multiprocess serving plus asyncio per process; at that scale, Python object reference-count writes caused copy-on-write memory growth, motivating PEP 683 immortal objects. This design can use Python/Django-style stateless API workers, but should keep media bytes off the app tier, use async I/O for fan-out-friendly calls, and track per-worker memory growth during deploys.
+
+## 22. Recommended interview presentation
 
 1. Clarify whether Stories, Reels/short video, Explore, private accounts, and messaging are in scope.
 2. Estimate media ingest, rendition amplification, views, feed requests, and social-graph skew.
@@ -549,3 +592,18 @@ Ranking improves relevance but introduces feature and model dependencies. A foll
 9. Close with graceful ranking fallback, abuse controls, observability, and cost.
 
 A strong answer does not describe Instagram as only a news feed. It explicitly designs the media lifecycle, private graph, profile and discovery surfaces, ephemeral stories, CDN authorization, and integrity controls that define the product.
+
+## Further reading: curated engineering blogs
+
+| Source | Article | Why it matters |
+|---|---|---|
+| Instagram Engineering | [Sharding & IDs at Instagram](https://medium.com/instagram-engineering/sharding-ids-at-instagram-1cf5a71e5a5c) | Shows time-sortable shard-aware IDs without a central ID service. |
+| Instagram Engineering | [Open-sourcing a 10x reduction in Apache Cassandra tail latency](https://medium.com/instagram-engineering/open-sourcing-a-10x-reduction-in-apache-cassandra-tail-latency-d64f86b43589) | Explains Rocksandra and why p99/GC behavior matters for online key-value stores. |
+| Meta Engineering | [Needle in a haystack: efficient storage of billions of photos](https://engineering.fb.com/2009/04/30/core-infra/needle-in-a-haystack-efficient-storage-of-billions-of-photos/) | Details append-only photo storage with compact in-memory indexes to avoid metadata I/O. |
+| Meta Engineering | [An analysis of Facebook photo caching](https://engineering.fb.com/2014/02/27/web/an-analysis-of-facebook-photo-caching-2/) | Quantifies browser, edge, origin, and backend cache effects for photo serving. |
+| Facebook / USENIX | [f4: Facebook's Warm BLOB Storage System](https://www.usenix.org/system/files/conference/osdi14/osdi14-paper-muralidhar.pdf) | Shows how to tier cooled immutable media into erasure-coded warm storage. |
+| Meta AI | [Powered by AI: Instagram’s Explore recommender system](https://ai.meta.com/blog/powered-by-ai-instagrams-explore-recommender-system/) | Gives concrete Explore mechanisms: IGQL, embeddings, distillation, and staged ranking. |
+| Meta Engineering | [Scaling the Instagram Explore recommendations system](https://engineering.fb.com/2023/08/09/ml-applications/scaling-instagram-explore-recommendations-system/) | Updates Explore with Two Tower retrieval, ANN, precomputation, MTML ranking, and reranking. |
+| Meta Engineering | [How Instagram suggests new content](https://engineering.fb.com/2020/12/10/web/how-instagram-suggests-new-content/) | Covers suggested-post seed selection, cold start, value models, and “Feels Like Home” constraints. |
+| Meta Engineering | [Journey to 1000 models: Scaling Instagram’s recommendation system](https://engineering.fb.com/2025/05/21/production-engineering/journey-to-1000-models-scaling-instagrams-recommendation-system/) | Shows model registry, launch automation, criticality, and stability SLOs for large ML fleets. |
+| Meta Engineering | [Introducing Immortal Objects for Python](https://engineering.fb.com/2023/08/15/developer-tools/immortal-objects-for-python-instagram-meta/) | Explains Instagram's Python/Django serving model and memory-efficiency work at scale. |

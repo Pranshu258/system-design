@@ -31,8 +31,8 @@ Out of scope for the first design: semantic/vector search, searching private mes
 - 100 million new posts and 20 million edits/deletes per day.
 - 30 searches per daily active user per day.
 - Average query rate: about 35,000 QPS; peak: 150,000 QPS.
-- Peak mutation stream: 10,000 events/second.
-- Replicated inverted index: roughly 10-20 TB after postings, positions, doc values, and overhead.
+- Average mutation stream: about 1,400 events/second; peak: 10,000 events/second.
+- Replicated inverted index: roughly 10-20 TB after postings, positions, doc values, replicas, tombstones, and merge headroom.
 
 ```text
 100M DAU x 30 searches / 86,400
@@ -40,9 +40,12 @@ Out of scope for the first design: semantic/vector search, searching private mes
 
 100M new posts / 86,400
 = approximately 1,160 average creates/second
+
+(100M creates + 20M edits/deletes) / 86,400
+= approximately 1,390 average mutation events/second
 ```
 
-Index size must be measured rather than inferred only from source bytes: term dictionaries, positions, stored snippets, tombstones, replicas, and merge headroom commonly require several times the normalized corpus size.
+Index size must be measured rather than inferred only from source bytes: 2B posts at 1 KB is about 2 TB before indexing, while term dictionaries, positions, stored snippets, doc values, tombstones, 2-3 replicas, and merge headroom commonly require several times that source corpus size.
 
 ## 3. High-level architecture
 
@@ -186,7 +189,7 @@ The indexer fetches the canonical post by ID instead of trusting a possibly inco
 4. The indexer loads canonical content and current policy state.
 5. It normalizes text, detects language, extracts hashtags, and computes static quality features.
 6. It sends a version-conditional upsert or tombstone to the appropriate search shard.
-7. A refresh makes the segment searchable, normally within 1-5 seconds.
+7. A refresh makes the segment searchable, normally within 1-5 seconds. For lower latency, index the fields available at post creation first and issue later partial updates for delayed enrichments such as resolved URLs or slower policy/quality features.
 8. The consumer commits its stream offset only after the index acknowledges the write.
 
 Bulk backfills write to a new index generation, validate counts and sampled queries, then switch a read alias atomically. Live events are dual-written or replayed from a captured offset so the generation has no gap.
@@ -197,12 +200,14 @@ Bulk backfills write to a new index generation, validate counts and sampled quer
 2. Parse operators with bounded complexity; reject pathological wildcard or regex expansion.
 3. Resolve spelling correction and synonyms by locale.
 4. Route the request to all relevant corpus shards or a restricted time tier.
-5. Each shard uses BM25 to return its top `K` candidates and sort tuples.
+5. Each shard uses BM25 to return its top `K` candidates and sort tuples, with early termination where the query is explicitly newest-first.
 6. The coordinator merges shard lists.
 7. Apply cheap visibility bitsets, policy filters, and blocked-author exclusions.
 8. Re-rank the top 200-1000 candidates using freshness, quality, engagement, and optional viewer features.
 9. Hydrate the top page from the post service and recheck authoritative visibility.
 10. Remove stale/forbidden results, produce snippets, and return a signed search-after cursor.
+
+Keep retrieval features cheap in the shard and compute richer personalization only for merged candidates. Work-graph or social-affinity features belong in the re-ranker, not in the posting-list inner loop.
 
 A representative score is:
 
@@ -247,13 +252,15 @@ Partition the corpus by a stable hash of `post_id`:
 - Scatter/gather queries across all primary shards.
 - Straightforward replica placement and shard movement.
 
+If dominant queries are scoped by tenant, community, author, or conversation, route those partitions directly instead of global fan-out. Very large tenants or hot authors need split shards or dedicated cells, while private-message or follower-only search may justify a second index keyed by viewer or audience at the cost of extra storage.
+
 Time partitioning reduces fan-out for recent searches but complicates global relevance and hot recent tiers. A hybrid can use immutable time buckets inside hash shards.
 
-Each logical shard has multiple replicas. The router chooses replicas using latency, queue depth, and availability. Segment files are immutable and stored on local SSD for low latency, with snapshots in object storage. Background merges compact small segments and purge tombstones; throttle merges so they do not starve queries.
+Each logical shard has multiple replicas. The router chooses replicas using latency, queue depth, and availability. Segment files are immutable and stored on local SSD for low latency, with snapshots in object storage. Background merges compact small segments and purge tombstones; throttle merges so they do not starve queries. Use separate active and optimized segment formats only if real-time write/read contention justifies the complexity; otherwise rely on the search engine's refresh and merge machinery.
 
 ## 11. Caching and load control
 
-Cache normalized anonymous queries only when policy and locale permit. Include safe-search, language, filters, index generation, and coarse audience class in the key. Personalized result pages usually have poor cacheability.
+Cache normalized anonymous queries only when policy and locale permit. Include safe-search, language, filters, index generation, and coarse audience class in the key. Personalized result pages usually have poor cacheability. For cold partitions, consider refreshing on first search or refreshing less frequently; for hot partitions, frequent refreshes keep results fresh but must be budgeted for segment churn.
 
 Useful caches:
 
@@ -275,6 +282,7 @@ Protect the cluster with per-tenant rate limits, query cost estimation, deadline
 | Poison document | Dead-letter with alert; do not stall the partition |
 | Index corruption | Restore snapshot and replay stream |
 | Reindex misses concurrent changes | Capture offset, replay or dual-write, then alias swap |
+| New index format or ranking bug | Dark-read mirrored production traffic before serving users |
 | Hydration service is slow | Tight deadline; omit unverified candidates rather than leak |
 | Cache contains removed post | Policy/denylist check and invalidation |
 | Merge consumes I/O | Merge throttling and workload isolation |
@@ -359,7 +367,45 @@ Maintain separate SLOs for creates and removals; removal safety is more importan
 - Silent partial results damage trust and relevance.
 - Make partial behavior explicit and product-specific.
 
-## 17. Recommended interview presentation
+## 17. Lessons from production systems
+
+### Twitter/X Earlybird: design the postings layer for real-time freshness
+
+Twitter replaced a MySQL-based real-time search backend with Earlybird, a Lucene-derived inverted index designed for sub-10-second indexing while already handling over 1,000 Tweets/second and 12,000 QPS. For this design, the important lesson is that a generic search engine may not be enough when freshness is a product requirement: the postings-list representation, refresh path, GC behavior, and early query termination must be part of the design review.
+
+### X: one-second indexing requires partial freshness semantics
+
+X reduced search indexing latency from about 15 seconds to one second by removing an ingestion buffer that sorted Tweets and by indexing immediately available fields first, with delayed fields arriving later. The mapping here is to make the post visible quickly with core fields, then update resolved URLs, slower quality signals, and policy-derived fields asynchronously, while query-time policy checks prevent unsafe exposure.
+
+### Twitter Omnisearch: active and optimized index formats split write and read concerns
+
+Omnisearch kept an active postings format for concurrent reads/writes and converted older data into optimized read-only blocks. Its optimized format used local IDs, delta compression, bit packing, and block-level skipping; Twitter reported 55% memory savings and about 50% lower query latency for the optimized format versus the active one. This design should therefore separate the hot mutable tier from colder optimized segments instead of forcing one layout to serve all traffic.
+
+### Meta Unicorn: search over social data needs query rewriting and result-set scoring
+
+Meta extended Unicorn from an in-memory inverted index into Graph Search by adding vertical aggregators, query rewriting with viewer context, forward-index metadata for scoring, result-set scoring for diversity, and blending across entity verticals. For post search, this justifies the two-stage retrieval/ranking split, viewer-aware rewriting, and diversity constraints so results do not collapse to one author, language, or viral topic.
+
+### LinkedIn Galene: isolate infrastructure from relevance and make full rebuilds routine
+
+LinkedIn rebuilt its Lucene-based stack into Galene after many live-update and serving components became hard to operate. Galene moved full index building to offline jobs, used federators/brokers around verticals, and separated retrieval from pluggable scoring so relevance engineers could iterate without owning distribution mechanics. This design should keep backfills, alias swaps, query rewriting, and ranking plugins first-class rather than ad hoc operational scripts.
+
+### Discord: route at the application layer when natural search scope is narrow
+
+Discord's first message search delegated sharding and routing to the application layer, storing a guild's messages in a chosen Elasticsearch cluster/index and using Cassandra plus Redis to map guilds to shards. That avoided huge clusters and allowed lazy reindexing for rarely searched guilds. Public post search has broader fan-out, but author/community/time filters should still route narrowly where possible.
+
+### Discord: large-scale Elasticsearch works better as many small cells
+
+Discord later moved to Kubernetes-managed Elasticsearch cells because clusters above 200 nodes suffered master-node and cluster-state overhead. It batched Pub/Sub messages by destination before bulk indexing, kept shard sizes near vendor guidance, and gave very large guilds dedicated multi-shard clusters; the new system indexed trillions of messages, doubled indexing throughput, and improved median query latency from 500 ms to under 100 ms. For this design, prefer cells, destination-aware bulk indexing, and special handling for extreme tenants over one giant cluster.
+
+### Slack: personalized search is a re-ranking problem
+
+Slack improved search by running Solr retrieval first and re-ranking candidates in the application layer with work-graph features such as channel priority, author affinity, pins, stars, reactions, age, and Lucene score. It reported a 9% increase in searches with clicks and a 27% increase in clicks at position 1. The post-search design should similarly retrieve lexically, then re-rank only the top candidates with viewer-specific affinity and quality features.
+
+### Slack Enterprise Search: do not index data when permissions cannot be safely cached
+
+Slack's enterprise search uses a federated, real-time approach for external sources: it does not store external source data, queries partner APIs at request time, and relies on OAuth scopes so users see only content they can access in the source system. The lesson is to avoid indexing private or externally permissioned content unless the system can replicate permission state safely; federated retrieval is slower but removes stale-permission risk.
+
+## 18. Recommended interview presentation
 
 A clear 45-minute sequence is:
 
@@ -375,3 +421,18 @@ A clear 45-minute sequence is:
 The central design insight is:
 
 > Treat search as a rebuildable, eventually consistent projection of authoritative posts: use an inverted index for broad candidate retrieval, versioned events for correct ingestion, and authoritative policy checks before any result is returned.
+
+## Further reading: curated engineering blogs
+
+| Source | Article | Why it matters |
+|---|---|---|
+| Twitter/X | [Twitter's New Search Architecture](https://blog.x.com/engineering/en_us/a/2010/twitters-new-search-architecture) | Explains Earlybird's real-time Lucene-derived inverted index, lock-free postings, reverse traversal, and early termination. |
+| X | [Reducing search indexing latency to one second](https://blog.x.com/engineering/en_us/topics/infrastructure/2020/reducing-search-indexing-latency-to-one-second) | Shows how one-second indexing required timestamp-based doc IDs, skip-list postings, partial updates, dark reads, and careful rollout. |
+| Twitter/X | [Omnisearch index formats](https://blog.x.com/engineering/en_us/topics/infrastructure/2016/omnisearch-index-formats) | Details active versus optimized postings formats, delta compression, bit packing, and measured memory/latency wins. |
+| Meta | [Under the Hood: Building out the infrastructure for Graph Search](https://engineering.fb.com/2013/03/06/core-infra/under-the-hood-building-out-the-infrastructure-for-graph-search/) | Introduces Unicorn as the unified inverted-index infrastructure for Facebook's social graph search. |
+| Meta | [Under the Hood: Indexing and ranking in Graph Search](https://engineering.fb.com/2013/03/14/core-infra/under-the-hood-indexing-and-ranking-in-graph-search/) | Covers vertical fan-out, query rewriting, forward-index scoring, result-set scoring, blending, and A/B-tested ranking. |
+| LinkedIn | [Did you mean "Galene"?](https://engineering.linkedin.com/search/did-you-mean-galene) | Describes Galene's federators, brokers, offline rebuilds, live updates, and separation of infrastructure from relevance. |
+| Discord | [How Discord Indexes Billions of Messages](https://discord.com/blog/how-discord-indexes-billions-of-messages) | Shows application-layer routing to smaller Elasticsearch clusters, lazy indexing, shard mapping, and refresh control. |
+| Discord | [How Discord Indexes Trillions of Messages](https://discord.com/blog/how-discord-indexes-trillions-of-messages) | Explains Elasticsearch cells, destination-aware Pub/Sub bulk indexing, Kubernetes operations, and special handling for huge guilds. |
+| Slack | [Search at Slack](https://slack.engineering/search-at-slack/) | Demonstrates two-stage Solr retrieval plus personalized re-ranking with work-graph features and click-bias-aware training. |
+| Slack | [How we built enterprise search to be secure and private](https://slack.engineering/how-we-built-enterprise-search-to-be-secure-and-private/) | Shows when to use federated, permission-aware real-time retrieval instead of indexing stale external data. |

@@ -31,7 +31,7 @@
 - 2.5 billion monthly active users and 500 million daily active users.
 - 1 billion hours watched/day, about 3.6 trillion playback seconds/day.
 - Average encoded delivery bitrate: 3 Mbps.
-- Approximate average egress: `3.6T seconds x 3 Mb / 86,400`, roughly 125 Pb/s before cache effects; CDN locality is mandatory.
+- Approximate average egress: `3.6T seconds x 3 Mb / 86,400`, roughly 125 Tb/s before cache effects; CDN locality is mandatory.
 - 5 million video uploads/day, approximately 58/second average and 500/second peak.
 - Average source upload: 1 GB, or 5 PB/day before replication.
 - Transcoded renditions and thumbnails consume 2-5 times source size depending on codec ladder and retention.
@@ -278,7 +278,7 @@ virus/container validation
 
 Jobs are idempotent and write outputs to deterministic versioned keys. The orchestrator stores dependency state durably, retries transient failures with backoff, sends poison inputs to a dead-letter queue, and exposes actionable failure status to creators.
 
-The video can become playable after a minimum ladder, such as 360p and 720p, while 4K/AV1 processing continues. Publication requires both playable assets and an allowed policy state. The metadata transaction switches the active manifest pointer; partial renditions are never exposed accidentally.
+The video can become playable after a minimum ladder, such as 360p and 720p, while 4K/AV1 processing continues. For top traffic, dedicated video accelerators or higher-efficiency codecs can be scheduled selectively; for cold or low-predicted-watch uploads, avoid spending scarce compute on premium encodes until demand justifies it. Publication requires both playable assets and an allowed policy state. The metadata transaction switches the active manifest pointer; partial renditions are never exposed accidentally.
 
 ## 8. Playback flow and adaptive bitrate
 
@@ -303,9 +303,11 @@ Use a hierarchy:
 - Regional shield cache.
 - Origin rendition storage.
 
+Large video CDNs need appliance-level throughput engineering, not just generic HTTP caching; Netflix has documented single Open Connect Appliances serving 100 Gbps after OS, NIC, storage, and sendfile tuning.
+
 Assets are content-addressed or versioned and immutable, so cache TTLs can be long. Manifests are versioned; authorization tokens should be validated without destroying cache sharing, for example with signed cookies or edge token validation separate from the cache key.
 
-Proactively pre-position predicted viral videos and regional premieres. Apply request coalescing so one cache miss does not create an origin stampede. Less popular renditions can be generated just in time only if startup latency and compute economics support it; otherwise precompute the standard ladder.
+Proactively pre-position predicted viral videos and regional premieres. Apply request coalescing so one cache miss does not create an origin stampede. Less popular renditions can be generated just in time only if startup latency and compute economics support it; otherwise precompute the standard ladder. The ladder itself should be content-aware where possible: simple animation, talking-head video, and complex action scenes should not all receive the same fixed bitrate-resolution pairs.
 
 ## 10. Metadata consistency and concurrency
 
@@ -353,7 +355,7 @@ The home page is a multi-stage system:
 
 1. Candidate generators retrieve subscriptions, similar content, trending items, and personalized embeddings.
 2. Policy and availability filters remove ineligible videos.
-3. A ranking model scores candidates using user, context, freshness, and quality features.
+3. A ranking model scores candidates using user, context, freshness, and quality features. Separate candidate-generation and ranking models keep expensive scoring focused on a small candidate set rather than the whole corpus.
 4. A re-ranker adds diversity, creator caps, exploration, and business constraints.
 5. The response logs impressions with model versions for training.
 
@@ -379,7 +381,7 @@ Ordinary live latency may be 5-20 seconds; interactive streams require low-laten
 - Partition event streams by `video_id` when per-video aggregation order matters, while salting exceptionally hot IDs.
 - Store source and renditions in replicated object storage with erasure coding for cold tiers.
 - Move old sources and rarely watched renditions to colder storage; keep popular segments in CDN caches.
-- Maintain secondary indexes for channel listings, scheduled publication, and moderation queues.
+- Maintain secondary indexes for channel listings, scheduled publication, and moderation queues. At YouTube scale, metadata stores need explicit sharding/resharding automation and query-routing layers rather than a single monolithic SQL primary.
 
 A single viral video is a hot key for metadata and counters but not for immutable media if CDN caching works. Cache-miss storms, comment writes, and event partitions require explicit hot-key sharding.
 
@@ -472,7 +474,45 @@ Home-region writes reduce coordination cost. Global synchronous storage simplifi
 
 Ranking improves relevance and watch time but adds model dependency, feedback loops, and explainability concerns. A subscriptions fallback preserves core utility.
 
-## 20. Recommended interview presentation
+## 20. Lessons from production systems
+
+### YouTube Argos / VCU: make transcoding a warehouse-scale accelerator problem
+
+YouTube built Argos around custom Video Coding Unit hardware plus distributed software scheduling, reporting 20-33x compute-efficiency gains over its prior optimized CPU baseline. For this design, the transcode fleet should expose hardware capabilities to the workflow scheduler, isolate accelerator failures like any other worker failure, and reserve scarce accelerator slots for ladders/codecs that materially reduce egress or improve QoE.
+
+### YouTube recommendations: two-stage retrieval and ranking
+
+Google's YouTube recommendation paper describes a candidate-generation model followed by a separate ranking model. That maps directly to the home page: retrieve hundreds or thousands of plausible videos from subscriptions, embeddings, similarity, and freshness sources, then run heavier ranking and re-ranking only on that bounded set with logged model versions and impressions.
+
+### Vitess at YouTube: shard relational metadata deliberately
+
+Vitess originated from YouTube's need to scale MySQL on commodity hardware and reduce operational risk as the service grew. Video metadata, channel indexes, and engagement tables can still use relational semantics, but the production design needs routing, online resharding, connection pooling, and query controls so one hot query or shard move does not take down creator and playback metadata.
+
+### Netflix per-title encoding: do not use one fixed ladder for every video
+
+Netflix's per-title work analyzes each title's complexity to choose bitrate-resolution points instead of applying a universal ladder. For uploads here, the packager should generate a baseline compatibility ladder quickly, then refine popular videos with content-aware or shot-aware ladders to cut CDN egress and storage while preserving perceptual quality.
+
+### Netflix shot-based 4K encodes: optimize within a title, not only per file
+
+Netflix later optimized 4K ladders across shots, allocating bits where content is complex and avoiding saturated high-bitrate points that add storage and egress without visible quality. For long-form video, scene/shot analysis belongs in the DAG before final packaging, and validation should use perceptual metrics rather than bitrate alone.
+
+### Netflix Open Connect: design cache appliances for the media path
+
+Netflix Open Connect work shows that video CDN performance depends on appliance internals: NVMe, 100GbE NICs, FreeBSD/NGINX sendfile behavior, lock contention, and memory-vs-disk hit mix. The CDN layer in this design needs hardware profiles, kernel/network telemetry, and shield-origin protection because a popular segment cache is a high-throughput storage system, not merely a web proxy.
+
+### Meta/Facebook video encoding: prioritize advanced codecs by benefit and cost
+
+Meta describes using benefit-cost and ML models to decide which videos receive expensive advanced encodes such as VP9. This design should not blindly AV1/VP9-encode every upload immediately; queue priority should include predicted watch time, device support, creator expectations, freshness, and expected egress savings.
+
+### Instagram processing reuse: remove redundant transcode work
+
+Instagram reported a 94% reduction in compute for basic video encodings by reusing intermediate work instead of running redundant pipelines. The processing DAG should persist reusable intermediates, make dependencies explicit, and let later renditions derive from validated artifacts when quality permits rather than repeatedly decoding the same source.
+
+### Meta AV1 rollout: codec savings compete with device and compute constraints
+
+Meta's AV1 rollout notes roughly 30% better coding efficiency than VP9/HEVC in its deployment context, but also highlights encoder complexity and decoder support. Playback authorization and manifest generation should be capability-aware, and the scheduler should weigh AV1 compute cost against downstream bandwidth, storage, and device coverage.
+
+## 21. Recommended interview presentation
 
 1. Clarify on-demand versus live scope, upload limits, private video behavior, and recommendation depth.
 2. Estimate playback egress, uploads, transcode amplification, and segment request rate.
@@ -485,3 +525,17 @@ Ranking improves relevance and watch time but adds model dependency, feedback lo
 9. Close with playback SLOs, policy enforcement, and graceful degradation.
 
 A strong answer makes playback independent of nonessential systems, never serves partially processed or unauthorized assets, and treats media processing as a durable, replayable workflow rather than a synchronous request.
+
+## Further reading: curated engineering blogs
+
+| Source | Article | Why it matters |
+|---|---|---|
+| YouTube | [A new era of video infrastructure](https://blog.youtube/inside-youtube/new-era-video-infrastructure/) | Explains YouTube's VCU/Argos accelerator approach and 20-33x transcoding efficiency improvement. |
+| Google Research | [Deep Neural Networks for YouTube Recommendations](https://research.google/pubs/deep-neural-networks-for-youtube-recommendations/) | Canonical two-stage candidate generation plus ranking design for YouTube-scale recommendations. |
+| Vitess | [Vitess: The Complete Story](https://vitess.io/blog/2016-03-10-percona-live-featured-talk-with-sugu-sougoumarane-vitess-the-complete-story/) | Describes Vitess originating from YouTube's need to shard and operate MySQL at commodity-hardware scale. |
+| Netflix | [Per-Title Encode Optimization](https://netflixtechblog.com/per-title-encode-optimization-7e99442b62a2) | Shows why each video needs a content-aware bitrate ladder rather than a fixed ladder. |
+| Netflix | [Serving 100 Gbps from an Open Connect Appliance](https://netflixtechblog.com/serving-100-gbps-from-an-open-connect-appliance-cdb51dda3b99) | Demonstrates the appliance, OS, NIC, and storage tuning needed for video CDN edge throughput. |
+| Netflix | [Optimized shot-based encodes for 4K: Now streaming!](https://netflixtechblog.com/optimized-shot-based-encodes-for-4k-now-streaming-47b516b10bbb) | Extends ladder optimization to shot-level bit allocation and perceptual quality metrics. |
+| Meta | [How Facebook encodes your videos](https://engineering.fb.com/2021/04/05/video-engineering/how-facebook-encodes-your-videos/) | Uses benefit-cost and ML prioritization so expensive codecs are applied where they improve QoE most. |
+| Meta | [Reducing Instagram's basic video compute by 94 percent](https://engineering.fb.com/2022/11/04/video-engineering/instagram-video-processing-encoding-reduction/) | Demonstrates DAG/intermediate reuse to remove redundant encoding work at massive upload scale. |
+| Meta | [Bringing AV1 to Facebook and Instagram Reels](https://engineering.fb.com/2023/02/21/video-engineering/av1-codec-facebook-instagram-reels/) | Covers AV1's compression benefits and the compute/device trade-offs of production codec rollout. |

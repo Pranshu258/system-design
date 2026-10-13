@@ -46,9 +46,18 @@ Ingestion average:
 ```text
 50M fetched URLs / 86,400 seconds
 = about 580 fetches/second average
+
+5M accepted articles / 86,400 seconds
+= about 58 accepted articles/second average
+
+10B interaction events / 86,400 seconds
+= about 116,000 events/second average
+
+500M article versions * 20 KB
+= about 10 TB of article metadata before indexes, replicas, and raw fetches
 ```
 
-Fetches are bursty around publisher schedules and breaking events. Ranking and feed serving dominate online compute; extraction, clustering, and model training dominate asynchronous compute.
+Fetches are bursty around publisher schedules and breaking events, so provision scheduler, fetcher, and parser capacity for several times the 580 fetches/second average and isolate that capacity from feed serving. Ranking and feed serving dominate online compute; extraction, clustering, and model training dominate asynchronous compute.
 
 ## 3. High-level architecture
 
@@ -245,6 +254,7 @@ The source registry stores ownership, allowed fetch methods, crawl delay, creden
 Scheduler priorities combine:
 
 - Explicit feed update or publisher push.
+- RSS/Atom recent-change feeds for freshness plus XML sitemaps for full URL discovery.
 - Expected publication frequency.
 - Time since last successful fetch.
 - Change probability learned from history.
@@ -285,7 +295,7 @@ Use layers:
 
 1. **URL canonicalization:** strip known tracking parameters, normalize host and path.
 2. **Exact content hash:** collapse byte- or text-identical copies.
-3. **Near-duplicate fingerprint:** SimHash or MinHash over normalized shingles.
+3. **Near-duplicate fingerprint:** SimHash or MinHash over normalized shingles; compare fingerprints with a Hamming-distance threshold rather than equality.
 4. **Semantic similarity:** compare embeddings and named entities within a time window.
 5. **Syndication metadata:** honor canonical/source relationships supplied by publishers.
 
@@ -295,7 +305,7 @@ False merges are costly: unrelated updates about a broad topic should not become
 
 ## 9. Story clustering
 
-A story cluster groups distinct reporting about one evolving event, unlike deduplication, which groups substantially equivalent text.
+A story cluster groups distinct reporting about one evolving event, unlike deduplication, which groups substantially equivalent text. Google News's Full Coverage product frames this as real-time organization of people, places, things, timelines, local headlines, explainers, and multiple perspectives rather than a single article list.
 
 For each article:
 
@@ -322,6 +332,8 @@ Two-stage ranking:
 
 1. Retrieve hundreds or thousands of candidates cheaply.
 2. Score a smaller set with a richer model.
+
+Production systems usually keep candidate generation broad and fast: Google News combined content/profile signals with online collaborative filtering, LinkedIn used first-pass rankers feeding a second-pass ranker and re-ranker, and Yahoo! JAPAN builds the user-specific recommendation list at request time from fresh article vectors to avoid stale precomputed lists.
 
 Possible score:
 
@@ -363,7 +375,7 @@ Anonymous users receive region/language cohort feeds and a short-lived session s
 
 ## 12. Feedback and model lifecycle
 
-Impressions are essential; clicks without exposure data create biased training. Interaction events include request ID, position, candidate set, and model version.
+Impressions are essential; clicks without exposure data create biased training. Microsoft's MIND news-recommendation dataset models this explicitly with impression logs containing clicked and non-clicked items plus prior click history, after delinking production user IDs into anonymized IDs. Interaction events include request ID, position, candidate set, and model version.
 
 Pipeline:
 
@@ -409,7 +421,7 @@ Interaction events are at-least-once. Stable event IDs prevent inflated training
 - Shard search by language and time, with replicas for query load.
 - Store online user features in a low-latency key-value service.
 
-Breaking stories are hot read keys. Cache hydrated story modules and immutable images at the edge, but separate personalization from shared cards.
+Breaking stories are hot read keys. Cache hydrated story modules and immutable images at the edge, but separate personalization from shared cards. For online features, SmartNews's feature-store design shows why short-window counters should be precomputed from streams and served by point lookups, while offline copies remain available for reproducible model training.
 
 Cache layers:
 
@@ -513,7 +525,41 @@ Track:
 - A cached cohort feed is a useful fallback.
 - Rights, takedown, and safety filters must still be rechecked; never use a success-shaped unfiltered fallback.
 
-## 19. Recommended interview presentation
+## 19. Lessons from production systems
+
+### Google News: online collaborative filtering plus content signals
+
+Google's 2007 Google News personalization paper describes scalable online collaborative filtering for a fast-changing inventory. The practical lesson is to avoid relying only on long-lived user profiles: keep a real-time item-item/user-item signal path for fresh popular stories, but blend it with content, source, locale, and policy features so cold-start articles are still eligible.
+
+### Google News Full Coverage: cluster evolving stories, not just duplicates
+
+Google's Full Coverage posts describe real-time AI/ML organization of news into storylines with people, places, things, top news, local headlines, explainers, interviews, and multiple perspectives. That maps directly to this design's `StoryCluster`: clusters need source diversity, timelines, and perspective modules, while deduplication stays at the equivalent-article level.
+
+### Google Search Central: combine feeds and sitemaps for discovery
+
+Google Search Central recommends XML sitemaps for the full URL set and RSS/Atom feeds for recent updates, with canonical URLs and meaningful last-modified times. The scheduler should therefore maintain two lanes per publisher: a frequent small feed poll or push path for freshness and a slower sitemap reconciliation path for completeness and missed URLs.
+
+### Google near-duplicate detection: fingerprints are a crawl-scale primitive
+
+Google's near-duplicate web-crawling paper uses compact fingerprints such as SimHash to identify near-identical documents at scale. For news, this keeps syndicated copies and lightly edited republishes from flooding feeds, but thresholds must be conservative and reversible because false merges hide legitimate distinct reporting.
+
+### Yahoo! JAPAN News: request-time recommendation over fresh vectors
+
+Yahoo! JAPAN describes why precomputing each user's news list is a poor fit: articles arriving between list generation and the user's visit are omitted, and pure click-history methods cold-start new articles. Their architecture precomputes user vectors and article vectors, indexes each newly submitted article, then performs vector search and deduplication when the user arrives; this supports the fan-out-on-read choice here.
+
+### SmartNews: feature freshness needs a production feature store
+
+SmartNews's feature engineering post describes real-time features from Flink, offline features from Spark, Kafka distribution, ScyllaDB for online serving, and Iceberg for offline training. The key mapping is to separate online low-latency point lookups from offline reproducibility, and to avoid naive sliding-window jobs that multiply state, output, and downstream writes.
+
+### LinkedIn Feed: first-pass rankers, second-pass ranker, re-ranker
+
+LinkedIn's feed relevance architecture separates inventory-specific first-pass rankers, a second-pass ranker that merges heterogeneous candidates, and a re-ranker that adjusts the final list. For a news aggregator, use this pattern to combine followed topics, breaking news, local modules, editorial/public-interest items, and exploration without letting one inventory dominate.
+
+### Microsoft News MIND: log impressions, negatives, entities, and privacy boundaries
+
+Microsoft's MIND dataset was built from Microsoft News behavior logs and includes impressions with clicked and non-clicked items, user click history, article categories, entities, and anonymized user IDs. This reinforces that training data must include exposure and negatives, entity-rich article features, and privacy-preserving user identifiers rather than raw account data.
+
+## 20. Recommended interview presentation
 
 A clear 45-minute sequence is:
 
@@ -525,8 +571,23 @@ A clear 45-minute sequence is:
 6. Explain candidate generation, two-stage ranking, and diversity.
 7. Cover cursor feeds, feedback loops, and model deployment.
 8. Discuss partitioning, multi-region serving, takedowns, and security.
-9. Finish with freshness, personalization, and source-diversity trade-offs.
+9. Summarize production lessons from Google, Yahoo! JAPAN, SmartNews, LinkedIn, and Microsoft.
+10. Finish with freshness, personalization, and source-diversity trade-offs.
 
 The central design insight is:
 
 > Convert unreliable publisher inputs into versioned, attributable article records; collapse duplicates while clustering distinct coverage; and rank fresh shared candidates at read time with hard rights, safety, and diversity constraints that remain enforceable even when asynchronous indexes lag.
+
+## Further reading: curated engineering blogs
+
+| Source | Article | Why it matters |
+|---|---|---|
+| Google Research | [Google News Personalization: Scalable Online Collaborative Filtering](https://research.google/pubs/google-news-personalization-scalable-online-collaborative-filtering/) | Shows why online collaborative filtering must be blended with fresh content/profile features for rapidly changing news inventory. |
+| Google Blog | [New Google News: AI meets human intelligence](https://blog.google/products-and-platforms/products/news/new-google-news-ai-meets-human-intelligence/) | Explains real-time AI/ML organization of news into evolving storylines and personalized briefings. |
+| Google Blog | [Get the full news story with Full Coverage in Search](https://blog.google/products-and-platforms/products/news/get-full-news-story-full-coverage-search/) | Shows how story pages expose multiple sources, local headlines, explainers, and perspectives for complex developing events. |
+| Google Search Central | [Best practices for XML sitemaps and RSS/Atom feeds](https://developers.google.com/search/blog/2014/10/best-practices-for-xml-sitemaps-rssatom) | Clarifies why feeds are for recent updates while sitemaps are for complete URL discovery and reconciliation. |
+| Google Research | [Detecting Near-Duplicates for Web Crawling](https://static.googleusercontent.com/media/research.google.com/en/us/pubs/archive/33026.pdf) | Establishes compact fingerprinting as a crawl-scale near-duplicate detection primitive. |
+| Yahoo! JAPAN Tech Blog | [Yahoo! JAPANアプリにおけるニュース記事レコメンドの取り組み](https://techblog.yahoo.co.jp/entry/2023022730415148/) | Describes request-time vector retrieval, new-article cold start handling, and dedup/diversity for news recommendations. |
+| SmartNews Engineering | [Feature Engineering Practice in SmartNews](https://medium.com/smartnews-inc/feature-engineering-practice-in-smartnews-e14877e3edc2) | Details real-time/offline feature-store design and sliding-window pitfalls for low-latency recommendation features. |
+| LinkedIn Engineering | [Feed relevance](https://engineering.linkedin.com/teams/data/artificial-intelligence/feed) | Describes first-pass rankers, second-pass ranking, re-ranking, and implicit feedback for heterogeneous personalized feeds. |
+| Microsoft Learn | [Microsoft News Recommendation Dataset](https://learn.microsoft.com/en-us/azure/open-datasets/dataset-microsoft-news) | Documents impression logs, clicked/non-clicked negatives, entities, and anonymized users for news-recommendation training data. |

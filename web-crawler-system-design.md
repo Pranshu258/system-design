@@ -31,8 +31,9 @@ Out of scope: ranking search results, rendering every JavaScript application, an
 - Average compressed response: 500 KB; roughly 500 TB/day ingress.
 - Average page exposes 30 links before filtering.
 - 100 million origins, with a highly skewed popularity distribution.
-- 30-day average revisit interval, shortened to minutes for news and lengthened to months for static pages.
+- 30-day median long-tail revisit interval, shortened to minutes for news and lengthened to months for static pages.
 - Maximum response retained: 20 MB; maximum redirect chain: 10.
+- HTML indexing reads a bounded prefix; for example Googlebot currently fetches up to 2 MB for non-PDF URLs, while larger retained objects are for diagnostics or specialized pipelines.
 
 Bandwidth, parsing, and storage dominate cost. The global rate is less difficult than safely scheduling millions of independent origin-specific streams.
 
@@ -134,6 +135,8 @@ The scheduler pops an eligible origin, verifies robots policy and concurrency, l
 
 Priority can combine PageRank-like importance, seed distance, content type, staleness, change probability, and operator overrides. Aging prevents low-priority starvation.
 
+Robots enforcement should follow RFC 9309-style parsing: choose the most specific matching allow/disallow rule, parse at least the first 500 KiB, cap cache freshness to HTTP cache headers or 24 hours, and fail closed when a previously reachable robots file becomes temporarily unavailable. `Crawl-delay` is a non-standard extension, so treat it as crawler-specific policy rather than portable REP behavior.
+
 ## 8. Fetch and parse flow
 
 1. Worker receives a leased URL plus resolved policy.
@@ -188,6 +191,8 @@ next_interval = clamp(min_interval, max_interval,
 ```
 
 Shorten after change, lengthen after repeated stability, add jitter, and prioritize expected freshness value per fetch cost. `304 Not Modified` still consumes host capacity but saves bandwidth and parsing.
+
+Accept push freshness hints from trusted sources, such as sitemaps, feeds, IndexNow-style notifications, or CDN cache-purge signals, but verify them through the same frontier, robots, and politeness controls before fetching.
 
 ## 13. Reliability and failure handling
 
@@ -253,7 +258,45 @@ Authoritative checks preserve coverage; probabilistic filters save I/O but can m
 
 Enforce global, region, tenant, origin, and content-type budgets. Backpressure propagates from parsers and storage to fetch scheduling. Sample low-value repeated errors, compact attempt history, compress content, and tier unchanged old versions. Admission control should shed speculative discovery before high-priority refresh work.
 
-## 19. Recommended interview presentation
+## 19. Lessons from production systems
+
+### Google Search: crawl budget is both rate limit and demand
+
+Google Search Central describes crawl budget as the URLs Googlebot can and wants to crawl: rate limit rises when a site is fast and healthy, falls on timeouts or 5xxs, and demand comes from popularity and staleness. This maps directly to the origin model here: `max_concurrency` and `next_allowed_at` are not static quotas, and recrawl priority should be reduced when site health degrades instead of retrying harder.
+
+### Google Search: REP/robots correctness is a parser problem, not a string match
+
+Google's REP work that led to standardization documents edge cases crawlers historically implemented inconsistently: minimum 500 KiB parsing, 24-hour maximum cache time unless HTTP cache allows less/more appropriately, and conservative behavior when robots becomes unavailable. This design should store parsed robots versions with expiry and keep the raw file/audit trail so policy decisions can be explained and replayed.
+
+### Google Search: byte limits protect the crawler and shape indexing
+
+Googlebot is now documented as fetching up to 2 MB for non-PDF URLs and 64 MB for PDFs; bytes past the per-URL cutoff are not fetched, rendered, or indexed. The system can still retain up to 20 MB for archival or diagnostics, but the parser/index pipeline should operate on a smaller bounded prefix and track truncation so ranking or metadata extraction does not silently assume the full document was processed.
+
+### Google Research: SimHash makes near-duplicate detection feasible at web scale
+
+Google's "Detecting Near-Duplicates for Web Crawling" uses SimHash fingerprints so pages with similar features map to hashes with small Hamming distance. That justifies keeping exact SHA-256 for storage identity and a separate similarity fingerprint for mirrors, boilerplate-heavy pages, and crawl traps; do not use the near-duplicate fingerprint as the authoritative URL seen key.
+
+### Common Crawl: public web crawls are tail-heavy and artifact-oriented
+
+Common Crawl's September 2026 crawl contains 2.17 billion pages, 361.4 TiB uncompressed content, 40.4 million hosts, 33.2 million registered domains, and 587.2 million URLs not seen in prior crawls. The implication is that storage and downstream artifact formats matter as much as fetch QPS: write immutable WARC/WAT/WET-like objects, preserve request/response metadata, and expect many newly discovered URLs to be low-value tail pages.
+
+### Common Crawl: web-graph processing is a separate batch product
+
+Common Crawl's July-August-September 2026 host graph has 245.8 million host nodes and 2.7 billion edges, with 74.65% dangling nodes; the domain graph aggregates by pay-level domain using the Public Suffix List. This design should not compute graph rank inside fetch workers. Emit link records to an offline graph pipeline and feed resulting host/domain importance back into frontier priorities.
+
+### Bing: crawl efficiency is freshness per page fetched
+
+Bing describes crawl efficiency as discovering new or changed content per page crawled, and explicitly calls out the tension between freshness and webmaster load. This is a better objective than raw pages/second: dashboards should include "changed pages per 1,000 fetches", duplicate ratio, and unchanged recrawl rate, then feed those signals into the recrawl planner.
+
+### Bing IndexNow: push signals reduce waste but do not bypass validation
+
+IndexNow lets sites notify search engines when URLs are created, updated, or deleted, and Bing shares submitted URLs among participating engines. In this architecture, such notifications should enter URL ingestion with elevated freshness priority, but still pass canonicalization, policy checks, robots, leases, and per-origin budgets.
+
+### Cloudflare Crawler Hints: freshness pipelines need batching, dedupe, and backpressure
+
+Cloudflare's Crawler Hints processes cache-miss and purge-derived freshness signals through Kafka, validates records, deduplicates/buffers URLs in Redis generations, then writes batches back to Kafka for partner dispatch with per-partner retries and lag/memory metrics. The same pattern applies to seed and freshness ingestion here: separate event capture from frontier admission, dedupe before dispatch, and monitor lag before pushing more work onto fetchers.
+
+## 20. Recommended interview presentation
 
 1. Clarify crawl scope, freshness, and robots compliance.
 2. Estimate fetch rate, bandwidth, and frontier size.
@@ -267,3 +310,17 @@ Enforce global, region, tenant, origin, and content-type budgets. Backpressure p
 The central design insight is:
 
 > Partition scheduling by origin, enforce politeness before issuing every fenced lease, and treat fetching as an at-least-once operation whose metadata and downstream effects are idempotent.
+
+## Further reading: curated engineering blogs
+
+| Source | Article | Why it matters |
+|---|---|---|
+| Google Search Central | [What crawl budget means for Googlebot](https://developers.google.com/search/blog/2017/01/what-crawl-budget-means-for-googlebot) | Defines crawl budget as crawl rate limit plus crawl demand, grounding origin health and freshness prioritization. |
+| Google Search Central | [Formalizing the Robots Exclusion Protocol specification](https://developers.google.com/search/blog/2019/07/rep-id) | Explains REP edge cases: 500 KiB parsing, 24-hour robots caching, and conservative behavior on unavailable robots files. |
+| Google Search Central | [Inside Googlebot: demystifying crawling, fetching, and the bytes we process](https://developers.google.com/search/blog/2026/03/crawler-blog-post) | Documents modern Googlebot fetch limits, especially the 2 MB non-PDF per-URL cutoff that motivates parser byte caps. |
+| Google Research | [Detecting Near-Duplicates for Web Crawling](https://research.google.com/pubs/archive/33026.pdf) | Introduces SimHash-style near-duplicate detection for mirrors and templated pages at crawler scale. |
+| Common Crawl | [September 2026 Crawl Archive Now Available](https://commoncrawl.org/blog/september-2026-crawl-archive-now-available) | Gives real crawl-scale numbers for pages, hosts, domains, new URLs, and uncompressed storage volume. |
+| Common Crawl | [Host- and Domain-Level Web Graphs July, August, and September 2026](https://commoncrawl.org/blog/host--and-domain-level-web-graphs-july-august-and-september-2026) | Shows why link graph construction and ranking should be an offline pipeline feeding frontier priority. |
+| Microsoft Bing Webmaster | [Bingbot Series: Maximizing Crawl Efficiency](https://blogs.bing.com/webmaster/2018/10/bingbot-Series-Maximizing-Crawl-Efficiency/) | Frames crawl quality as fresh/new content discovered per fetch, not merely pages crawled per second. |
+| Microsoft Bing Webmaster | [IndexNow: Announcing Sharing of Submitted URLs](https://blogs.bing.com/webmaster/2022/1/IndexNow-Announcing-Sharing-of-Submitted-URLs/) | Shows how push URL-change notifications can improve freshness and reduce waste while still needing validation. |
+| Cloudflare | [From 0 to 20 billion - How We Built Crawler Hints](https://blog.cloudflare.com/from-0-to-20-billion-how-we-built-crawler-hints/) | Details a production freshness-hint pipeline with Kafka, Redis dedupe generations, batching, retries, and observability. |
