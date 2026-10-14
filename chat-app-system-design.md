@@ -34,7 +34,7 @@ Use these as illustrative assumptions, not claims about any real service. Suppos
 
 Concurrent connections are a different bottleneck. If 20% of daily active users are connected at peak and each has 1.2 active devices on average, then `500M × 0.20 × 1.2 = 120M` live connections. At 100,000 tuned WebSocket connections per gateway instance, that is `120M / 100K = 1,200` gateways before headroom. With 40% capacity reserved for deploys, regional imbalance, and failure, plan for roughly `1,200 / 0.60 = 2,000` gateway slots. This implies gateways must be horizontally replaceable and must not own durable delivery state.
 
-Fan-out multiplies accepted messages. If 85% of sends are one-to-one with one recipient averaging 1.5 online or recently active devices, 14% are small groups averaging 10 members, and 1% are large channels averaging 2,000 members, the naive delivery attempt rate per send is roughly `(0.85 × 1.5) + (0.14 × 9 × 1.5) + (0.01 × 1,999 × 0.5) ≈ 1.28 + 1.89 + 10.00 = 13.17` device pushes per accepted message. At 1.0M peak sends per second, synchronous device fan-out would be about `13.17M` push attempts per second. The design therefore acknowledges after durable append and performs fan-out asynchronously, with special treatment for large groups.
+Fan-out multiplies accepted messages. If 85% of sends are one-to-one with one recipient averaging 1.5 online or recently active devices, 14% are small groups averaging 10 members, and 1% are large channels averaging 2,000 members, the naive delivery attempt rate per send is `(0.85 × 1.5) + (0.14 × 9 × 1.5) + (0.01 × 1,999 × 0.5) = 1.275 + 1.89 + 9.995 = 13.16` device pushes per accepted message, excluding sender-companion sync. At 1.0M peak sends per second, synchronous recipient fan-out would be about `13.16M` push attempts per second. The design therefore acknowledges after durable append and performs fan-out asynchronously, with special treatment for large groups.
 
 Storage for text is large but tractable compared with media. If an encrypted message envelope averages 1 KB, accepted text-like messages add `25B × 1 KB = 25 TB` per day before replication and indexing. Three replicas make that about 75 TB per day. If 10% of messages reference media averaging 500 KB after client compression, media ingest is `25B × 0.10 × 500 KB = 1.25 PB` per day before replication. This separates message metadata storage from object storage: the ordered log keeps ciphertext and references, while media bytes go directly to object storage and CDN.
 
@@ -69,6 +69,7 @@ Idempotency-Key: {device_id}:{client_message_id}
 }
 
 GET /v1/conversations/{conversation_id}/messages?after_sequence=88150&limit=100
+  -> ordered ConversationEvent deltas, next_sequence, covered_through
 
 GET /v1/sync?cursor=opaque_user_device_cursor&limit=500
 
@@ -92,17 +93,17 @@ WS MESSAGE {"conversation_id":"c_42","sequence":88201,"message_id":"msg_781","pa
 WS ACK_DELIVERED {"conversation_id":"c_42","through_sequence":88201}
 ```
 
-The send endpoint returns `202 Accepted` because acceptance and delivery are intentionally different phases. A `201 Created` that users read as fully delivered would be misleading, while waiting for recipient delivery would turn offline devices into write-path dependencies. The `Idempotency-Key` and `client_message_id` make retries safe after a timeout, gateway disconnect, or client process restart. The key is scoped to a sender device so two devices can accidentally choose the same local identifier without colliding.
+The send endpoint uses `202 Accepted` for its asynchronous delivery operation, with the stronger application guarantee that the message is already durable. `201 Created` would also be valid for a durably created message resource; neither HTTP status implies recipient delivery. The `Idempotency-Key` and `client_message_id` make retries safe after a timeout, gateway disconnect, or client process restart. The effective key is `(conversation_id, sender_device_id, client_message_id)` so deduplication stays in the conversation's transaction boundary; it also stores a request hash and rejects conflicting reuse.
 
 Sync uses opaque cursors rather than offsets. Offsets fail when the server changes storage layout, compacts old ranges, or merges mailbox and conversation events. A cursor can encode a per-device position in a durable user delta stream, plus fallback hints for conversations whose message ranges must be fetched directly. Devices advance the cursor only after applying the page to their local store. WebSocket frames are the low-latency path, but they are never the only correctness path; a reconnecting device always reconciles with `GET /v1/sync`.
 
-Receipts are high-water marks because ordered conversations make that compact. A phone does not need to send 100 separate delivered receipts for sequences 88102 through 88201; it can say it has delivered through 88201, and the server can store the maximum per user and conversation. Gaps still exist during reconnect, so clients should only advance the high-water mark after contiguous application.
+Receipts are high-water marks because ordered conversations make that compact. A phone can acknowledge delivery through 88201 instead of one receipt per message. Clients advance only after applying all authorized events in the covered prefix; server coverage markers account for membership-filtered slots and non-message events without disclosing their bodies. Delivered/read receipts still refer to eligible message creation sequences, and server sync coverage is not evidence that the user read them.
 
 ## 4. Data model
 
-Start with the obvious `Message`: one row per chat message with a body, sender, and timestamp. That cannot represent the user-visible order because two senders can submit at the same time, clocks skew, and a retry after timeout might create a second row. The first correction is to give each message a server `message_id`, a unique `(sender_device_id, client_message_id)` pair, and a `(conversation_id, sequence)` assigned by the server. The message ID is for references; the sequence is for display, cursors, and gap detection.
+Start with the obvious `Message`: one row per chat message with a body, sender, and timestamp. That cannot represent the user-visible order because two senders can submit at the same time, clocks skew, and a retry after timeout might create a second row. The first correction is to give each message a server `message_id`, a unique `(conversation_id, sender_device_id, client_message_id)` key, and a server-assigned creation sequence. Edits, deletes, reactions, and membership changes append new `ConversationEvent` sequences; they never rely solely on updating an old message row that an `after_sequence` reader would miss. Message display order uses creation sequence; catch-up uses event sequence and applies mutations to stable message IDs.
 
-Now add `Conversation` and `ConversationMember`. Without membership rows that include `joined_sequence` and `left_sequence`, a delayed fan-out worker can accidentally deliver a message to a removed member or hide history from a member who was authorized when the message was accepted. Membership is not just a present-tense set; it is a versioned authorization boundary over an ordered log.
+Now add `Conversation` and `ConversationMember`. Membership uses retained intervals keyed by `(conversation_id, user_id, joined_sequence)`, not a single overwritten join/leave row: leaving and rejoining must not grant access to the gap. Membership commands serialize with messages in the same conversation authority. This proposal permits reads of messages created during a user's membership intervals after leaving, but never of new messages outside those intervals; stricter removal policies add a current deny fence. Delayed edits and deletes are filtered using the target message's original eligibility, so former members can still receive authorized corrections to retained history.
 
 A single message log still does not make mobile sync efficient. A user with hundreds of conversations needs to know which conversations changed without scanning all of them. Add `InboxEntry` as a projection keyed by user and sorted by last activity. It is rebuildable from message and membership events, so it need not be part of the same transaction as message acceptance. The sender acknowledgement waits for the message and outbox event, not for every inbox projection.
 
@@ -145,6 +146,10 @@ Message
 - created_at
 - edited_at
 - deleted_at
+
+ConversationEvent
+- conversation_id, sequence, event_id, event_type
+- target_message_id, message_revision, membership_version, payload
 
 Device
 - device_id
@@ -195,7 +200,7 @@ OutboxEvent
 - relay_state
 ```
 
-Messages live in a wide-column store such as Cassandra or ScyllaDB, or a distributed SQL store configured for range reads, keyed by `(conversation_id, sequence_bucket)` and sorted by `sequence`. The bucket is essential: Discord publicly described moving from unbounded channel partitions to channel-plus-time buckets, and later using ScyllaDB with a Rust data service to coalesce hot reads. Conversation metadata and membership need stronger conditional updates, so they fit better in a transactional metadata store or a small strongly consistent partition per conversation. Inbox entries are projections partitioned by `user_id`. Media bytes belong in object storage, not the message store. Presence, typing, and connection routes deliberately do not go in the transactional message store because they are ephemeral and high churn.
+The authoritative send transaction uses a transactional store that can atomically cover conversation metadata, membership, deduplication, messages/events, and outbox rows, including bucket rollover. Bucketed Cassandra or ScyllaDB history stores may be asynchronous read projections, not a second independent write in that transaction. Cassandra logged batches do not provide general cross-partition SQL isolation or transactions with an external metadata store. History is keyed by `(conversation_id, sequence_bucket)` and sorted by sequence, with an applied watermark; reads beyond it wait or use the authoritative tail. Discord's bucketed storage and Rust request-coalescing service are read/storage analogies, not evidence for this proposal's atomic send protocol. Inbox entries are projections partitioned by `user_id`; media belongs in object storage; presence, typing, and connection routes remain ephemeral.
 
 > **Key idea.** The authoritative record is the ordered conversation log plus versioned membership. Inboxes, push notifications, search, unread counts, and live socket delivery are projections that can lag and repair from the log.
 
@@ -215,7 +220,7 @@ This breaks in five concrete ways. First, a retry after the client times out can
 
 ### Fix 1: Idempotent acceptance with server sequence numbers
 
-The send path becomes a command, not just an insert. The chat service checks membership, reserves the next sequence for the conversation, and inserts a message under unique constraints on `(sender_device_id, client_message_id)`, `(conversation_id, sequence)`, and `message_id`. If the same device retries, the service returns the existing sequence. If two senders race, the sequencer serializes them inside the conversation without imposing a global order across unrelated conversations.
+The send path becomes a command, not just an insert. In one transaction the sequencer checks membership, advances the conversation sequence, and inserts a message/event under unique constraints on `(conversation_id, sender_device_id, client_message_id)` and `(conversation_id, sequence)`, with a globally unique `message_id`. If the same device retries, it returns the existing sequence. If two senders race, the sequencer serializes them inside the conversation without imposing a global order across unrelated conversations.
 
 ### Fix 2: Transactional outbox before delivery
 
@@ -227,7 +232,7 @@ WebSocket gateways maintain live sockets, heartbeats, and backpressure. A connec
 
 ### Fix 4: Cursor sync as the source of truth
 
-Online push is an optimization. Each device has a durable sync cursor and a local store. Reconnect starts with `GET /v1/sync`, then range fetches messages by `(conversation_id, after_sequence)` for conversations that changed. Meta's Messenger Iris design is evidence for this pattern: mobile sync works best as an initial snapshot plus ordered deltas, with push waking clients but not replacing a durable queue.
+Online push is an optimization. Each device has a durable sync cursor and a local store. Reconnect starts with `GET /v1/sync`, then range fetches conversation events after its sequence for conversations that changed. Meta's Messenger Iris is evidence for snapshot-plus-delta sync and durable per-user queues, not for this exact transport: the published Iris design pushes deltas over MQTT rather than requiring an HTTPS pull after every notification.
 
 ### Fix 5: Hybrid fan-out and hot-channel controls
 
@@ -244,8 +249,8 @@ flowchart LR
     API --> CMD
     CMD --> META[("Conversation metadata")]
     CMD --> SEQ["Conversation sequencer"]
-    SEQ --> MSG[("Bucketed message store")]
-    SEQ --> OUT[("Transactional outbox")]
+    SEQ --> MSG[("Transactional messages, membership, dedup and outbox")]
+    MSG --> OUT["Outbox relay"]
     OUT --> LOG[("Partitioned event log")]
     LOG --> FAN["Fan-out workers"]
     FAN --> INBOX[("User inbox projections")]
@@ -267,13 +272,13 @@ A send enters through WebSocket or HTTPS and reaches the chat command service. T
 **Question.** A client sends a message, the server commits it, the response times out, and the client retries while another sender is also posting. How do we avoid both duplicates and inconsistent ordering?
 <details><summary>Answer</summary>
 
-Treat send as an idempotent command. The server uses `(sender_device_id, client_message_id)` to return the original result on retry, assigns one monotonically increasing sequence per conversation, and commits the message and outbox event together before acknowledging.
+Treat send as an idempotent command. The server uses `(conversation_id, sender_device_id, client_message_id)` to return the original result on retry, assigns one monotonically increasing event sequence per conversation, and commits the message/event and outbox together before acknowledging.
 
 </details>
 
 The tempting implementation is `INSERT message(sender, body, timestamp)` and then sort by timestamp. That fails as soon as two clients have skewed clocks or a retry lands after the original commit but before the client receives the acknowledgement. The user sees either two copies or a different order on different devices. Chat needs a narrow but strong ordering guarantee: within one conversation, all authorized readers eventually agree that sequence 88201 happened before 88202.
 
-A conversation sequencer provides that guarantee. It can be a logical leader for the conversation, a transactional row containing `next_sequence`, or a small actor whose writes are fenced by an epoch. The service validates the sender's membership version, checks the idempotency key, allocates the next sequence, inserts the message, and inserts an outbox event in one atomic unit. If the idempotency key already exists, it returns the existing `message_id` and `sequence` instead of allocating again. If two new sends race, only one gets sequence N and the other gets N+1.
+A conversation sequencer provides that guarantee. It can be a logical leader for the conversation, a transactional row containing `next_sequence`, or a small actor whose writes are fenced by an epoch. The transaction validates the sender's membership version against concurrent removals, checks the conversation-scoped idempotency key and request hash, allocates the next event sequence, inserts the message/event, and inserts outbox work. If the key already committed, it returns the existing `message_id` and `sequence` instead of allocating again. If two new sends race, only one gets sequence N and the other gets N+1.
 
 ```mermaid
 sequenceDiagram
@@ -298,7 +303,7 @@ The acknowledgement semantics are the most important sentence in the design: acc
 
 The sequencer must be fenced. If a conversation leader has a lease and the process pauses during a garbage collection event or network partition, a replacement may take over. The old leader cannot be allowed to wake up and write sequence 88202 after the new leader already wrote 88202. Store each write with `current_epoch`, and only accept `UPDATE ... WHERE conversation_id = ? AND epoch = ? AND next_sequence = ?` or the equivalent compare-and-swap. The replacement increments the epoch during failover; stale leaders then fail their conditional writes.
 
-Sequence allocation also has a subtle gap problem. If a service reserves a block of 1,000 sequence numbers in memory and crashes after using 10, clients may wait forever for the missing 990 if gap detection assumes every number should exist. Either allocate one sequence per committed message, or record skipped ranges as explicit no-op tombstones. Many systems accept occasional tombstones because they keep range scans and client gap repair simple.
+Sequence allocation also has a subtle gap problem. If a service reserves 1,000 numbers and crashes after using 10, clients may wait forever for the remaining 990. Allocate a sequence with each committed event, or durably fence and record unused reservations as no-op ranges before advancing coverage. Edits and membership events occupy real slots even when no new message bubble appears.
 
 Storage partitioning is part of the send path because the sequencer writes the hot row. A bare `(conversation_id)` partition grows without bound and makes viral channels dangerous. Discord hit this class of issue in its message store evolution: bucketed channel partitions bounded partition size, and later ScyllaDB work put a Rust data service in front to coalesce identical hot reads. For this design, the write key is `(conversation_id, sequence_bucket)` with a directory that maps sequence ranges to buckets. The sequencer still owns order; the storage layer avoids unbounded partitions.
 
@@ -339,7 +344,7 @@ sequenceDiagram
     Dir-->>Fan: phone on gw7, tablet offline
     Fan->>GW: deliver message sequence 88201
     GW->>Phone: MESSAGE sequence 88201
-    Phone->>Store: persist locally
+    Phone->>Phone: Persist message in local database
     Phone->>GW: ACK_DELIVERED through 88201
     Fan->>Push: wake offline tablet
     Phone->>Store: GET /sync cursor d_phone
@@ -348,7 +353,7 @@ sequenceDiagram
 
 The sync cursor is per device, not merely per user. If the laptop reads through sequence 90000, that should not imply the phone has stored those messages locally. Device cursors protect local convergence. User-level `read_through_sequence` is a separate product signal that may take the maximum of reads across devices or follow a primary-device rule, depending on UX. Delivered receipts are usually device-derived and coalesced to a user high-water mark for display.
 
-A reconnecting device asks for a page of ordered deltas: conversation advances, membership changes, edits, deletes, tombstones, receipt updates, and key/device changes. The cursor advances only after the client writes those deltas to its local database. If the cursor is too old because the delta queue was compacted, the server returns a snapshot: changed conversations and their latest sequences, then the client range-fetches missing messages by conversation. This is the same general shape as Messenger Iris: snapshot plus ordered deltas, optimized for mobile bandwidth and offline gaps.
+A reconnecting device asks for ordered deltas: conversation advances, membership changes, edits, deletes, tombstones, receipt updates, and key/device changes. It commits the applied page and cursor together in its local database. An expired cursor requires a complete authorized snapshot of current conversation state at a captured sync boundary, including reconciliation of removed conversations and old edited/deleted messages—not merely messages newer than the device's last sequence. Deltas after that boundary are retained during transfer. This is the snapshot-plus-delta shape illustrated by Iris, with this design's own HTTP repair path.
 
 Multi-device end-to-end encryption changes the payload but not the delivery contract. WhatsApp's multi-device design gives each device its own identity key; senders encrypt to the recipient's device list and to the sender's companion devices. That means the send path may need a fresh device-list version and may store multiple encrypted envelopes for one logical message. A newly linked tablet may require encrypted history transfer or may start from a join point, depending on product policy. The server still sequences ciphertext and enforces membership, but it cannot derive missing plaintext or server-side search indexes.
 
@@ -377,7 +382,7 @@ Do not synchronously fan out every event to every member. Append once to the ord
 
 Small group chat rewards fan-out on write. If a message has nine recipients, writing nine inbox projections makes every recipient's home screen cheap: read the inbox partition by user, sort by last activity, show unread hints. The sender need not wait for those projections, but they usually complete quickly. The same algorithm becomes absurd for very large groups. A 10,000-member group with 1.2 devices per member turns one message into roughly 12,000 possible device deliveries, plus inbox writes, push decisions, unread updates, and receipt state. If the sender acknowledgement waits for that work, large groups ruin send latency. If workers do it naively afterward, a burst can bury the event log.
 
-The design should classify conversations by fan-out cost. Direct chats and ordinary groups use fan-out on write into `InboxEntry`. Large groups and channels use a hybrid: append the message once, update lightweight conversation activity metadata, notify a bounded subset of active subscribers, and let clients fetch from the shared log by `(conversation_id, after_sequence)`. Inboxes may store a pointer such as "channel c advanced to sequence 5000" rather than one unread row per message. Push notifications are rate-limited and batched; a muted large channel may get no push at all.
+The design should classify conversations by fan-out cost. Direct chats and ordinary groups use fan-out on write into `InboxEntry`. Large groups and channels append once, update a shared activity pointer, and notify a bounded subset of active subscribers. Sync and periodic client polling batch-read activity pointers for the user's large-channel subscriptions, even if no inbox entry or push was created; otherwise omitted subscribers could remain stale forever. Clients then range-fetch conversation events. Push notifications are rate-limited and batched; a muted large channel may get no push at all.
 
 ```mermaid
 flowchart TD
@@ -484,3 +489,5 @@ The design starts from the fact that chat is not primarily a socket problem; it 
 | WhatsApp | [How WhatsApp Enables Multi-Device Capability](https://engineering.fb.com/2021/07/14/security/whatsapp-multi-device/) | Device identity keys, client fan-out encryption, encrypted history transfer, and secure app-state sync. |
 | LinkedIn | [Designing Our New Messaging System](https://www.linkedin.com/blog/engineering/messaging-notifications/designing-our-new-messaging-system) | Centralized message copies, service ownership boundaries, and correctness-first migration principles. |
 | LinkedIn | [Unifying Messaging Experiences Across LinkedIn](https://www.linkedin.com/blog/engineering/messaging-notifications/unifying-messaging-experiences-across-linkedin) | Reactive client data layer combining local store, realtime stream, and query APIs across platforms. |
+| Apache Cassandra | [CQL data manipulation: BATCH](https://cassandra.apache.org/doc/latest/cassandra/developing/cql/dml.html#batch) | Documents batch atomicity and the single-partition isolation boundary; not a general cross-store transaction. |
+| IETF | [RFC 9110: 201 Created and 202 Accepted](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.3.2) | Separates resource creation and asynchronous processing semantics from application-level delivery receipts. |

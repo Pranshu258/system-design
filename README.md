@@ -10,7 +10,7 @@ Detailed, production-scale system design walkthroughs. Each design is built up a
 4. **High-level design**: start naive, then apply one fix per concrete failure.
 5. **Deep dives** (3–4): each opens with a probing question and closes with strong-answer criteria and a Bad / Good / Great rubric.
 6. **Variants**, **the transferable pattern**, and **review questions** with collapsible answers.
-7. **Sources and further reading**: official engineering blogs and papers whose lessons are woven into the design. See [Curated Engineering Blogs](./engineering-blogs.md) for the full index.
+7. **Sources and further reading**: official engineering blogs, papers, documentation, and standards whose lessons are woven into the design. See [Curated Engineering Blogs](./engineering-blogs.md) for the full index.
 
 ## Collaboration and storage
 

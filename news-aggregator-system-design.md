@@ -32,7 +32,7 @@ That tension forces three mechanisms. Ingestion needs adaptive discovery that co
 
 Assumptions here are illustrative, not claims about any specific company. Suppose the product has 100 million daily active users and an average user opens or refreshes a feed 20 times per day. That is `100M × 20 / 86,400 = 23,148` feed reads per second on average. A morning commute, election night, or major disaster can create a `10×` burst, so the serving design should tolerate roughly `230k` feed reads per second without depending on the crawler or model trainer.
 
-On the ingestion side, assume 10 million known publisher endpoints across feeds, section pages, sitemaps, and APIs. If the scheduler touches an average endpoint six times per day, that is `10M × 6 / 86,400 = 694` scheduled fetches per second. Fetches are not evenly distributed: large publishers publish in batches, feeds become hot during breaking news, and retries bunch after outages. Provisioning the fetch tier for `5×` the average gives about `3,500` fetches per second, but the more important consequence is not raw bandwidth. The scheduler must enforce per-domain budgets so a large global fleet does not accidentally hit one publisher with all retries at once.
+On the ingestion side, assume 10 million known publisher endpoints across feeds, section pages, sitemaps, and APIs. Touching an average endpoint six times per day gives `60M / 86,400 = 694` discovery fetches per second. If the 50 million article fetches below are additional, total load is `110M / 86,400 = 1,273/s`, or about `6,366/s` at `5×` peak, before retry headroom—not 3,500/s for the whole tier. Six polls per day means a four-hour average interval, so the 1-2 minute freshness objective applies to push-enabled or explicitly prioritized hot sources, not every endpoint. Publisher budgets still bound freshness when arrival rate exceeds permitted fetch capacity.
 
 If 50 million URLs are fetched per day and 5 million become accepted article versions, accepted article throughput is `5M / 86,400 = 58` per second on average. That seems small compared with feed reads, but each accepted article fans out into raw storage, extraction, policy scans, fingerprint lookup, cluster candidate search, article metadata, search indexing, feature updates, and cache invalidation. The design should treat ingestion as an asynchronous stream with idempotent consumers rather than a single request path that synchronously updates every index.
 
@@ -76,6 +76,8 @@ Feed cursors are opaque because offsets are unstable in news. A cursor binds the
 
 Takedowns and restrictions are not ordinary article updates. They are control-plane mutations with stronger consistency, an audit trail, and high-priority cache invalidation. A feed response should include article and policy versions so clients can discard stale prefetched cards if the server reports a newer restriction.
 
+Eligibility is checked against current policy on every page, even when a cursor freezes candidates and model versions. A cursor must never freeze permission to serve content. Cached feeds and story pages store candidate IDs or pass through the same authorization/hydration gate before emitting titles, excerpts, images, or cluster summaries. Already delivered/offline bytes cannot be revoked; online clients revalidate prefetched cards, and the API's guarantee begins at the authoritative eligibility check, not at an impossible retroactive deletion of responses.
+
 ## 4. Data model
 
 Start with the obvious entity, `Article`, identified by a URL. That fails immediately because news URLs are not stable identities. A canonical URL can redirect, a live blog can change under the same URL, syndicated copies can carry different URLs for identical text, and one URL can be republished with material changes. So the model separates a publisher's submitted or discovered URL from an immutable `ArticleVersion`.
@@ -107,6 +109,10 @@ ArticleVersion
 - language, region_tags, topic_ids, entity_ids
 - normalized_text_hash, simhash, embedding_ref
 - rights_status, safety_status, serving_status, version
+
+ArticleAuthority
+- logical_article_id, current_article_version_id, revision
+- restriction_tombstone, rights_policy_version, source_policy_ref
 
 DuplicateGroup
 - duplicate_group_id, representative_article_version_id
@@ -184,7 +190,7 @@ Cold-start articles enter through content features, source quality, followed-top
 
 ### Fix 5: Authoritative serving checks for rights and removals
 
-Search, cluster, and feed caches are derived and may lag. Therefore the final hydration step checks authoritative `serving_status`, `rights_status`, region restrictions, and user mutes before returning a card. Takedown events use a high-priority control stream to invalidate caches, but cache invalidation is treated as an optimization. Correctness comes from the final status check.
+Search, cluster, and feed caches are derived and may lag. Final hydration therefore resolves the authoritative current article version and checks logical-article/source restriction tombstones, region policy, and current user mutes. The `rights_status` copied onto an old immutable version is not authority. Takedowns advance a monotonic policy revision; delayed ingestion, old cursors, replay, and a newly discovered URL alias cannot clear the restriction. Reinstatement is a separately authorized control operation. Unknown or unavailable policy state fails closed for affected content. Cluster representatives, summaries, and image endpoints also need this gate or recomputation from eligible members, otherwise a removed article can leak through a cached derivative. High-priority invalidation accelerates removal but does not replace these checks.
 
 ### Putting it together
 
@@ -194,10 +200,11 @@ flowchart LR
     SCH --> FET["Polite fetchers"]
     FET --> RAW[("Raw object store")]
     FET --> EXT["Extractor and policy scanner"]
-    EXT --> FP["Fingerprint and duplicate service"]
+    EXT --> META[("Authoritative article metadata and outbox")]
+    META --> LOG[("Article event log")]
+    LOG --> FP["Fingerprint and duplicate service"]
     FP --> CLU["Story clustering service"]
-    CLU --> LOG[("Article event log")]
-    LOG --> META[("Article metadata store")]
+    CLU -->|"version-guarded membership changes"| META
     LOG --> SEARCH[("Search and vector indexes")]
     LOG --> POOL[("Fresh candidate pools")]
     EV["Interaction events"] --> FEAT[("Online feature store")]
@@ -214,10 +221,9 @@ flowchart LR
     META --> HYD
     HYD --> CLIENT
     GOV["Rights and takedown service"] --> META
-    GOV --> LOG
 ```
 
-A publisher update enters through a push API or the scheduler. Fetchers store raw bytes, the extractor creates an `ArticleVersion`, the duplicate service assigns a `DuplicateGroup`, and the clusterer attaches it to a `StoryCluster`. Article events update metadata, search, vector indexes, candidate pools, and features asynchronously. A feed request loads the user's controls, retrieves fresh shared candidates, ranks them with online features and a model version, diversifies by story cluster, and hydrates cards only after checking authoritative rights and serving status.
+A publisher update enters through a push API or the scheduler. Fetchers store raw bytes; the extractor commits an `ArticleVersion`, current-version pointer, and outbox event under version and policy guards. Minimal eligibility can publish before clustering finishes. Log consumers build search, vectors, pools, duplicate groups, and clusters; membership changes are idempotent guarded metadata updates, not permission to overwrite restrictions. A feed request loads current user controls, retrieves shared candidates, ranks and diversifies them, and hydrates cards only after the authoritative checks. A corrected old article version cannot re-enter the pool merely because an older event was replayed.
 
 > **Key idea.** Each component traces back to a specific failure of the naive design.
 
@@ -225,7 +231,7 @@ A publisher update enters through a push API or the scheduler. Fetchers store ra
 
 ### 6.1 Ingestion discovery: feeds, sitemaps, crawling, and politeness
 
-**Question.** A major publisher updates its RSS feed every 30 seconds during a breaking event, while its sitemap contains 500,000 URLs and its robots policy allows one request per second. How does the system stay fresh without becoming an abusive crawler?
+**Question.** A major publisher updates its RSS feed every 30 seconds during a breaking event, while its sitemap collection contains 500,000 URLs and its negotiated crawl budget allows one request per second. How does the system stay fresh without becoming an abusive crawler?
 <details><summary>Answer</summary>
 
 Use separate discovery lanes. Poll the small recent-update feed or accept signed pushes for freshness, reconcile the sitemap slowly for completeness, and enforce one global per-domain token bucket across all fetchers. Conditional requests and adaptive priorities reduce wasted fetches; breaking-news priority changes scheduling order, not the politeness limit.
@@ -261,7 +267,7 @@ sequenceDiagram
 
 Conditional HTTP requests matter because freshness is usually about detecting small changes on repeated surfaces. If a publisher supports `ETag` or `Last-Modified`, the fetcher can ask cheaply whether content changed. If a publisher returns weak or bogus timestamps, the scheduler learns lower trust for that signal and relies more on feeds, canonical URLs, or content hashes.
 
-Safety is part of ingestion, not an afterthought. Fetchers validate DNS results and final redirect destinations to avoid SSRF; they block private, loopback, link-local, and cloud metadata addresses. They cap response size, redirect count, timeout, decompression ratio, and parser CPU. HTML and image parsing run in a sandbox because publisher pages are untrusted input. Every outcome writes a `FetchRecord`, even a block or parser failure, because silent failure makes the scheduler over-poll and leaves operators blind.
+Safety is part of ingestion, not an afterthought. Fetchers validate all resolved addresses and pin the approved public destination to the actual connection; they repeat checks on every redirect hop, not only the final URL. Each destination also needs its own robots decision and domain budget, so a publisher cannot redirect traffic past another site's limits. Private, loopback, link-local, and metadata destinations are blocked for HTML and image fetches alike. Size, decompression, redirect, timeout, and parser limits apply. Every outcome writes a `FetchRecord`, including blocks and parser failures.
 
 Google Search Central's feed-versus-sitemap distinction is useful production evidence: use feeds for recent URLs and sitemaps for complete discovery and reconciliation. The design also mirrors a general lesson from large crawlers: the unit of politeness is the publisher or domain, not the worker. A global lease or token service prevents regional duplication. If that service fails, the safe fallback is to stop or drastically reduce crawling for affected domains, not to let every worker guess independently.
 
@@ -351,7 +357,7 @@ flowchart LR
     I --> F
 ```
 
-Cold-start scoring relies on content and source priors: topic match, entity match, location relevance, source trust tier, article type, cluster velocity, publisher freshness reliability, and similarity to the user's profile embedding. Exploration should be explicit, not accidental. Reserve a small fraction of positions for fresh or diverse candidates that the model is uncertain about, then log impressions so the system learns unbiased negatives. Microsoft's MIND dataset illustrates why impressions matter: clicked and non-clicked exposed items, user click history, categories, and entities are all needed for training. Click logs without exposure data teach the model only from what previous models chose to show.
+Cold-start scoring relies on content and source priors: topic match, entity match, location relevance, source trust tier, article type, cluster velocity, publisher freshness reliability, and similarity to the user's profile embedding. Reserve a small fraction of positions for explicit exploration and log displayed items, positions, and selection propensities. An unclicked impression is an observed non-click, not an unbiased negative preference: placement, visibility, and the previous selection policy still bias it. Randomized exposure or propensity-aware evaluation is needed to estimate that bias. Microsoft's MIND documents clicked and non-clicked displayed items and user histories; the dataset schema alone does not establish unbiased training.
 
 Feature freshness needs infrastructure. SmartNews's feature-store design is relevant because short-window counters such as source click-through, cluster velocity, or user-topic engagement must be precomputed from streams and served as low-latency point lookups. The offline copy must remain reproducible for training. A naive sliding-window job for every feature and segment can multiply state and writes; use shared aggregations and clear window definitions.
 
@@ -359,7 +365,7 @@ The ranker must also resist feedback loops. If engagement is the only objective,
 
 Signals worth watching: fresh-article exposure within 1, 5, and 15 minutes; click and long-click by freshness bucket; source concentration; duplicate suppression rate; fallback feed rate; hide/mute rates; and model performance split by new versus mature articles.
 
-> **Strong-answer criteria.** A strong answer explains how fresh items enter the candidate set before behavior exists and how impression logging prevents the next model from learning only from previous exposure bias.
+> **Strong-answer criteria.** A strong answer explains how fresh items enter before behavior exists, distinguishes non-clicks from unbiased preference labels, and uses exposure/propensity logging plus explicit exploration to measure selection bias.
 
 | Level | Approach | Why |
 |---|---|---|

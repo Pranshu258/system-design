@@ -41,7 +41,7 @@ For aggregation, suppose reports commonly group by advertiser, campaign, creativ
 **Question.** What makes a producer retry safe when a click can become a billable charge?
 <details><summary>Answer</summary>
 
-The producer must retry with the same stable `event_id` and monotonically increasing `producer_sequence`; the server acknowledges only durable log append, not downstream counting. Every later sink uses either transactions or idempotency keys derived from that event identity.
+The producer allocates monotonically increasing `producer_sequence` values to new events and retries each event with the same sequence and stable `event_id`. The server acknowledges only durable log append, not downstream counting. Every later sink uses transactions or stable idempotency keys.
 
 </details>
 
@@ -69,9 +69,9 @@ GET /v1/report-exports/{export_id}
 POST /v1/adjustments
 ```
 
-The ingest endpoint returns `202` because it has accepted responsibility for the event, not because reports already include it. The response includes rejected records with reason codes for malformed payloads, while accepted records are only those durably appended to the replicated log. `committed_sequence` lets a producer resume after failure without guessing which batch landed.
+The ingest endpoint returns `202` because it has accepted responsibility for the event, not because reports already include it. The response includes rejected records with reason codes for malformed payloads, while accepted records are only those durably appended to the replicated log. `committed_sequence` is the contiguous prefix with durable per-event outcomes, including explicit terminal rejections, not the highest sequence seen across a batch with holes. The status API returns those outcomes so recovery neither skips unaccepted events nor retries a rejected record forever. Reusing an event ID with a different payload is a conflict, not a second event.
 
-Report APIs expose `mode=live` versus `mode=final` because a single unnamed number would be misleading. Live responses include `data_fresh_through`, `watermark`, `snapshot_version`, `is_final=false`, timezone, currency, and metric definitions. Final responses bind to a published snapshot so pagination and exports do not mix partitions from different reconciliation runs. Adjustments are explicit API objects with reason codes; they create new ledger and aggregate versions rather than patching old invoices in place.
+Report APIs expose `mode=live` versus `mode=final` because a single unnamed number would be misleading. Live responses include observed `data_fresh_through`, `watermark`, `is_final=false`, timezone, currency, and metric definitions; `snapshot_version` appears only when a retained immutable report snapshot actually exists. The ingest response's `data_fresh_after` is an estimate, not a future visibility guarantee. Final responses bind to a published snapshot so pagination and exports do not mix reconciliation runs. Adjustments create new ledger and aggregate versions rather than patching old invoices.
 
 ## 4. Data model
 
@@ -81,7 +81,7 @@ A raw event still cannot answer dashboards efficiently. We need `AggregateBucket
 
 Attribution adds another failure. A conversion may arrive before the click replica or after a late click, and fraud review may later invalidate the original touch. We represent `AttributionDecision` as an immutable decision with a model version and optional reversal link. Aggregates consume decision deltas, not hidden mutations.
 
-Billing adds the final guardrail. The invoice cannot be whatever the live dashboard currently says. `BillingLedgerEntry` is append-only and idempotent by `(source_batch_id, ledger_line_id)`, with positive charges, credits, and adjustments represented as separate entries.
+Billing adds the final guardrail. The invoice cannot be whatever the live dashboard currently says. `BillingLedgerEntry` is append-only and idempotent by `(source_batch_id, ledger_line_id)`, where the source identifies the stable approved snapshot transition, not a job execution UUID. Charges, credits, and adjustments are separate entries.
 
 ```text
 AdEvent
@@ -99,7 +99,7 @@ DedupeRecord
 - expiry_time, event_fingerprint
 
 AggregateBucket
-- aggregate_key: window_start, window_size, advertiser_id, dimensions_hash, dimensions
+- aggregate_key: window_start, window_size, advertiser_id, currency, dimensions_hash, dimensions
 - metrics: impressions, clicks, conversions, spend_micros, invalid_events
 - watermark, version, finalization_state: LIVE | CORRECTED | FINAL
 - source_manifest_id or changelog_id
@@ -111,10 +111,11 @@ AttributionDecision
 
 PublishedSnapshot
 - snapshot_id, service_date, created_at, input_manifest_id
+- publication_revision, predecessor_snapshot_id
 - aggregate_manifest_id, rule_versions, completeness_checks
 
 BillingLedgerEntry
-- ledger_entry_id, source_batch_id, ledger_line_id
+- ledger_entry_id, source_batch_id, ledger_line_id, from_snapshot_id, to_snapshot_id
 - advertiser_id, service_date, amount_micros, currency
 - entry_type: CHARGE | CREDIT | ADJUSTMENT, reason_code
 ```
@@ -165,21 +166,23 @@ flowchart LR
     C --> K[("Replicated event log")]
     K --> V["Validation and enrichment"]
     V --> Q["Quarantine"]
-    V --> L[("Immutable raw lake")]
+    K --> L[("Immutable raw lake, including quarantined inputs")]
     V --> S["Flink stream processor"]
     S --> D[("Dedupe state")]
     S --> A["Attribution and fraud streams"]
     A --> S
-    S --> H[("Live OLAP upserts")]
+    S --> Output[("Checkpoint-committed aggregate log")]
+    Output --> H[("Live OLAP upserts")]
     L --> B["Daily reconciliation"]
     B --> F[("Final OLAP snapshots")]
-    B --> G[("Billing ledger")]
+    B --> Publication[("Snapshot metadata and billing outbox")]
+    Publication --> G[("Billing ledger")]
     H --> R["Reporting API"]
     F --> R
     R --> U["Advertiser dashboard"]
 ```
 
-A click travels from producer to regional collector, is appended to the replicated log, enriched with versioned campaign metadata, and written to the immutable lake. The stream processor deduplicates by `event_id`, updates event-time aggregate buckets, performs attribution joins when needed, and writes versioned upserts to the live OLAP table. Later, the daily batch reads the raw manifest, exact-deduplicates, applies fraud and attribution rules deterministically, publishes a final snapshot, and emits idempotent ledger entries. The same `AdEvent`, `AggregateBucket`, `PublishedSnapshot`, and `BillingLedgerEntry` entities appear at different points with different consistency guarantees.
+A click travels from producer to regional collector and is appended to the replicated log. An independent archiver preserves the accepted input before downstream enrichment or quarantine can filter it; log segments cannot expire before their archive offsets and checksummed manifests are durable. The stream processor enriches with versioned metadata, deduplicates by `event_id`, updates event-time aggregate buckets, performs attribution joins when needed, and writes versioned upserts to the live OLAP table. Later, the daily batch reads the raw manifest, exact-deduplicates, applies fraud and attribution rules deterministically, publishes a final snapshot, and emits idempotent ledger entries. The same `AdEvent`, `AggregateBucket`, `PublishedSnapshot`, and `BillingLedgerEntry` entities appear at different points with different consistency guarantees.
 
 > **Key idea.** Each component traces back to a specific failure of the naive design.
 
@@ -198,7 +201,9 @@ The producer is the first line of defense. It creates a stable `event_id` when t
 
 The stream processor partitions by a key that keeps duplicates together, usually a hash of `event_id` or an aggregation owner with deterministic routing for dedupe. It stores a `DedupeRecord` keyed by `event_id` with a TTL longer than the normal retry and replay horizon. On first observation, it records the ID and emits downstream changes. On duplicate observation, it suppresses metric changes but may update diagnostic counters. The dedupe store is part of checkpointed state, so a crash restores both "I have processed event X" and "I have consumed through offset N" to a consistent point.
 
-A subtle failure occurs when the processor writes an aggregate update to OLAP, then crashes before the checkpoint completes. On restart, it replays the input and recomputes the same update. If the OLAP write was an additive increment, the click is double counted. The fix is to make the sink idempotent. One option is replacement upserts: the stream writes the whole aggregate bucket for `(window, advertiser, dimensions_hash)` with `version=123`, and the store keeps the highest version. Another option is a changelog table keyed by `(aggregate_key, changelog_id)` where `changelog_id` is deterministic from checkpoint or event ID, and a compactor materializes totals once. For a billing ledger, use `(source_batch_id, ledger_line_id)` as the uniqueness boundary and treat retries as no-ops.
+A subtle failure occurs when a processor writes directly to OLAP and crashes before its checkpoint completes. A retry can double-apply an increment; even replacement upserts are unsafe if replay assigns the same version to a different partial bucket after a different input interleaving. This design therefore publishes aggregate updates to a checkpoint-transactional output log first, and OLAP consumes only committed records. One fenced owner serializes each full aggregate key, including currency, onto one output partition. Its committed offset supplies the monotonic revision within that partition; repartitioning requires an explicit new generation and handoff. Replaying a committed record preserves both revision and payload. A checkpoint number alone does not uniquely identify multiple outputs, and one input can produce several attribution or correction deltas.
+
+For Pinot, partition the input by the full primary key and configure the revision comparison column explicitly; event time cannot order corrections to the same event-time bucket. Equal key/revision pairs must have identical payloads because equal-comparison conflicts are not deterministically resolved by upsert. Stream and batch writers must not race independent counters: a batch correction enters the same owner as a new base at a declared input cutoff. The owner pauses publication, rebuilds from that base, and replays all post-cutoff contributions, including those already processed, before publishing a newer revision. Merely overwriting the running total with the batch total would lose those contributions. Deleted dimension groups need zero replacements or tombstones. Final tables instead use immutable snapshot namespaces. These are proposed publication protocols, not guarantees supplied by Pinot or a claim that Uber implements this exact design.
 
 Uber's real-time ads processing lesson fits exactly here. Flink plus Kafka transactions gave them a strong checkpoint-aligned pipeline, but they still used record UUIDs for downstream idempotency, deduplicated in Hive, and relied on Pinot upserts for analytical rows. That is the right claim for this design: exactly once within the stream framework where supported, effectively once for live serving through idempotent upserts, and billing-grade exactness after batch dedupe and reconciliation.
 
@@ -216,11 +221,13 @@ sequenceDiagram
     Prod->>Col: "retry same event_id E"
     Col->>Log: "append duplicate E"
     Flink->>Flink: "dedupe state records E"
-    Flink->>Olap: "upsert bucket version 123"
+    Flink->>Log: "stage aggregate output in transaction"
     Flink--xFlink: "crash before checkpoint"
-    Flink->>Log: "replay from prior offset"
-    Flink->>Olap: "same upsert version 123"
-    Olap-->>Flink: "idempotent replacement"
+    Note over Log,Olap: Uncommitted output is not visible to OLAP
+    Flink->>Log: "replay input and commit output with checkpoint"
+    Log->>Olap: "committed replacement at revision 123"
+    Log->>Olap: "retry identical record at revision 123"
+    Olap-->>Log: "idempotent replacement"
 ```
 
 The main trade-off is state size. Keeping every event ID forever is impossible at 10.6 billion events per day. The stream dedupe TTL should cover producer retries, regional failover duplication, and common replay windows; the batch path performs exact dedupe for finalization from raw manifests. If an event resurfaces after the stream TTL, the live table may temporarily overcount, but the final snapshot corrects it. For money, the final path is authoritative.
@@ -245,9 +252,9 @@ The live window should accept them if they fall within the correction horizon, e
 
 Processing time is easy to operate but wrong for advertising reports. If a click happened at 09:05 in New York and arrived at 17:05 because a device was offline, an advertiser expects it in the 09:00 hour, not as a mysterious evening spike. Event time is therefore the reporting time axis. The system tracks `event_time` from the producer, bounds it against trusted `received_time` to reject impossible values, and computes windows such as minute, hour, and day from event time.
 
-Watermarks make this practical. A stream partition tracks the largest credible event time it has seen and subtracts allowed lateness, for example `watermark = max_observed_event_time - 30 minutes` for minute dashboards. When the watermark passes 10:00, the processor can emit the 09:59 minute as mostly complete. "Mostly" matters. A watermark is not a proof that no earlier event exists; it is a contract about when the system prefers freshness over waiting.
+Watermarks make this practical. A stream partition tracks the largest credible event time it has seen and subtracts an out-of-order allowance, for example `watermark = max_observed_event_time - 30 minutes`. A downstream operator takes the minimum across active input partitions, with explicit idle-partition handling. When the watermark passes 10:00, the 09:59 minute is mostly complete. To meet the roughly one-minute dashboard target, processing-time triggers publish provisional results before that watermark; waiting for it alone would delay dashboards by 30 minutes. Allowed lateness/state retention after window closure is a separate setting and must cover the eight-hour correction example, or late inputs must use a durable correction job. A watermark is not proof that no earlier event exists.
 
-For dashboards, the right behavior is correction rather than mutation without explanation. Suppose the 09:00 hour originally showed 10,000 clicks with `version=41`. An eight-hour-late batch contributes 17 valid clicks. The stream writes `version=42` for the same aggregate key with 10,017 clicks and updates `watermark` and `correction_reason=LATE_EVENT`. A report query that asks for live data gets the latest version and can show a small "corrected after late arrivals" note if the product wants that transparency. An export bound to `snapshot_version=41` remains stable.
+For dashboards, the right behavior is correction rather than mutation without explanation. Suppose the 09:00 hour originally showed 10,000 clicks with `version=41`. An eight-hour-late batch contributes 17 valid clicks. The stream writes a newer revision, illustratively `version=42`, for the same aggregate key with 10,017 clicks and updates `watermark` and `correction_reason=LATE_EVENT`. A live query gets the latest served version and can show a correction note. An export is stable only if it binds to a retained immutable report snapshot containing the old rows; a latest-value upsert table cannot reconstruct version 41 merely because an API names it. Live `snapshot_version` must identify such a materialization or be omitted in favor of freshness metadata.
 
 For billing, finalization should use a longer watermark, often tied to business policy rather than stream mechanics. An illustrative rule might wait 72 hours after the advertiser's service day, then publish a final snapshot if raw manifests, dedupe counts, attribution state, fraud classifications, and checksum completeness all pass. A click arriving after that does not silently alter an issued invoice. It creates a later adjustment with a reason code and a reference to the final snapshot it amends.
 
@@ -258,7 +265,8 @@ Google Mesa provides the serving discipline. If geo-replicated analytical tables
 ```mermaid
 stateDiagram-v2
     [*] --> Open: "window starts"
-    Open --> Provisional: "watermark passes window end"
+    Open --> Provisional: "early periodic publication"
+    Provisional --> Provisional: "watermark advances completeness"
     Provisional --> Corrected: "late event inside horizon"
     Corrected --> Provisional: "publish newer version"
     Provisional --> Final: "billing watermark and checks pass"
@@ -266,7 +274,7 @@ stateDiagram-v2
     Adjusted --> Final: "new ledger adjustment published"
 ```
 
-The cost is operational complexity. Longer lateness improves completeness but increases state size and delays finalization. Shorter lateness improves freshness but raises adjustment volume. The system should use different horizons for different products: one or a few minutes for health dashboards, hours for live advertiser reporting, days for billing, and explicit adjustments after invoice issuance. Timezones add another trap: store windows in UTC and apply advertiser timezone only when rendering or finalizing service days, otherwise daylight-saving transitions create duplicate or missing local hours.
+The cost is operational complexity. Longer retained correction horizons improve completeness but increase state size; they need not delay early provisional dashboard updates. Use different publication/finalization policies for health dashboards, advertiser reporting, and billing. Store event instants in UTC, but derive advertiser service-day boundaries using the configured named timezone before aggregation; a local day can span 23 or 25 hours. Rendering a UTC daily total in another timezone does not make it the correct advertiser-day total. Preserve timezone and rule versions in the billing snapshot.
 
 Signals worth watching: watermark lag by partition, late-event distribution by producer, correction volume by age, state size for attribution joins, and the percentage of billed days later adjusted.
 
@@ -292,7 +300,9 @@ The ingest path should classify only what is cheap and deterministic: malformed 
 
 Live dashboards should be useful but honest. They can show estimated valid clicks and spend with `is_final=false`, a freshness timestamp, and sometimes a pending-invalid-traffic amount. When a rule invalidates yesterday's traffic, the stream or reconciliation publisher writes negative deltas or replacement aggregate versions to the live OLAP table. This is not a ledger correction yet; it is a reporting correction. The advertiser can see that yesterday changed because rule version 87 classified a publisher segment as invalid.
 
-Batch reconciliation is where the platform decides what money moves. The reconciler reads raw event manifests for a service day, verifies completeness, exact-deduplicates event IDs, joins versioned campaign metadata, runs the selected fraud and attribution rule versions, and writes deterministic aggregate outputs under a `batch_id`. It compares those outputs with live aggregates by advertiser, campaign, and day. Differences are expected for late events and fraud updates, but unexplained differences beyond tolerance block publication. Only after checks pass does a publisher atomically advance the final snapshot manifest and generate ledger entries.
+Batch reconciliation is where the platform decides what money moves. The reconciler reads raw event manifests for a service day, verifies completeness, exact-deduplicates event IDs, joins versioned campaign metadata, runs the selected fraud and attribution rule versions, and writes deterministic aggregate outputs under a `batch_id`. It compares those outputs with live aggregates by advertiser, campaign, day, and currency. Differences are expected for late events and fraud updates, but unexplained differences beyond tolerance block publication. After checks pass and final serving artifacts are ready, the metadata authority atomically advances the snapshot manifest and records a billing-publication outbox item; it does not pretend the OLAP store and ledger share a transaction.
+
+Billing consumes that item in a ledger transaction. For each `(advertiser, service_day, currency)`, it conditionally advances an `applied_snapshot_id` and inserts only `new_total - previously_applied_total`, with a unique transition/line ID. Published snapshots have a monotonic revision; an incoming revision at or below the applied revision is a no-op, never a rollback. A competing newer revision recomputes against the actually applied predecessor. For example, revising a $100 total to $98 inserts a $2 credit, not a fresh $98 charge; replay inserts nothing. A new job UUID is not a new financial intent. The outbox closes the crash gap between publication and ledger application, and the applied-snapshot fence prevents two different correction jobs from issuing the same credit twice.
 
 Pinterest's ads architecture reinforces a boundary that is easy to miss: reporting aggregates should not be the budget-enforcement mechanism. Pacing and bidding need their own hot path because dashboards lag, correct, and reconcile. This design uses reporting for advertiser visibility and billing evidence; ad serving uses separate strongly consistent or highly available counters to decide whether to spend the next impression.
 
@@ -306,7 +316,8 @@ flowchart TD
     Rec --> Diff["Compare with live totals"]
     Diff -->|"checks pass"| Snap[("Published final snapshot")]
     Diff -->|"checks fail"| Hold["Hold billing and alert"]
-    Snap --> Ledger[("Billing ledger entries")]
+    Snap --> Outbox[("Durable billing-publication outbox")]
+    Outbox --> Ledger[("Fenced delta ledger entries")]
     Snap --> Final[("Final OLAP table")]
     Rec --> Live[("Corrective live upserts")]
 ```
@@ -385,3 +396,4 @@ The design starts from the binding constraint that clicks are both analytics eve
 | Pinterest | [Ensuring High Availability of Ads Realtime Streaming Services](https://medium.com/pinterest-engineering/ensuring-high-availability-of-ads-realtime-streaming-services-ea3889420490) | Shows hot-hot budget/pacing/bidding streams, health metrics, and automatic switchover for ads spend control. |
 | X/Twitter | [Processing billions of events in real time at Twitter](https://blog.x.com/engineering/en_us/topics/infrastructure/2021/processing-billions-of-events-in-real-time-at-twitter-) | Demonstrates UUID dedupe, late-event handling, Bigtable serving, and validation against batch counts at massive scale. |
 | LinkedIn | [Real-time Analytics at Massive Scale with Pinot](https://engineering.linkedin.com/analytics/real-time-analytics-massive-scale-pinot) | Explains why ads reporting needs a dedicated real-time columnar OLAP system with specialized indexes. |
+| Apache Pinot | [Stream Ingestion with Upsert](https://docs.pinot.apache.org/build-with-pinot/ingestion/upsert-dedup/upsert) | Specifies primary-key partitioning, comparison-value ordering, and equal-version conflict limitations. |

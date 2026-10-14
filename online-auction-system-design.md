@@ -77,7 +77,7 @@ WS /v1/auctions/{auction_id}/watch
 
 The bid API accepts maximum amounts in integer minor units or fixed-point decimal strings; it never accepts floating-point money. `expected_public_version` is optional because a buyer should be allowed to bid from a slightly stale page if their maximum still satisfies the current state. The response is therefore a decision, not just an acknowledgement: accepted but not leading, accepted and leading, rejected because the auction is closed, rejected because the bid is below the next required public amount, or rejected for eligibility.
 
-The idempotency key is scoped to the auction and bidder, not globally. A user can bid on two auctions with the same mobile retry key without collision, and a malicious user cannot probe another user's keys. Retention must cover at least the retry and dispute window. A timed-out response is common during close bursts, so the command result is persisted with the bid decision, not cached only at the edge.
+The idempotency key is scoped to the auction and bidder, not globally. A user can bid on two auctions with the same mobile retry key without collision, and a malicious user cannot probe another user's keys. Store a request hash under that unique key and reject reuse with a changed maximum; the hash must not create a new uniqueness scope. Retention must cover at least the retry and dispute window. A timed-out response is common during close bursts, so the command result is persisted with the bid decision, not cached only at the edge.
 
 Watch messages are deliberately thinner than the GET response. They carry a monotonic public `sequence`, enough fields to update the visible page, and instructions to resync if the gateway detects a gap. Cursors are opaque on list APIs because bid histories are naturally ordered by `(auction_id, accepted_sequence)` or by user activity projections, not by stable numeric offsets. Retraction is not `DELETE /bids/{id}` because the ledger must remain auditable; it is a policy-controlled transition with evidence and an emitted correction event if public state changes.
 
@@ -85,11 +85,11 @@ Watch messages are deliberately thinner than the GET response. They carry a mono
 
 Start with the obvious `Auction` row: title, seller, start price, start time, and end time. That is enough to browse listings, but it cannot decide a proxy bid because the public price is not simply the last bid amount. A bidder submits a hidden maximum; the system computes the visible price from the top two maximums, increment schedule, tie order, reserve, and current time. That forces an `AuctionState` record that stores the small authoritative summary needed for the next decision: current leader, leading maximum, second maximum, visible price, bid count, effective end time, state, and version.
 
-A single state row still is not an audit trail. If the bid engine updates only the current leader and crashes after responding, the marketplace cannot explain why a user lost, replay state after corruption, or investigate shill bidding. Each attempt needs a `BidLedger` entry with the submitted maximum encrypted, the decision, the accepted sequence if any, the resulting public price, and the idempotency key. Rejected attempts are useful for abuse and support, but accepted bids are the immutable source for replaying auction state.
+A single state row still is not an audit trail. If the bid engine updates only the current leader and crashes after responding, the marketplace cannot explain why a user lost, replay state after corruption, or investigate shill bidding. Each attempt needs a `BidLedger` entry with the submitted maximum encrypted, the decision, the accepted sequence if any, the resulting public price, and the idempotency key. Maintain a rebuildable `BidderMaximum` per distinct bidder from this history: the top two bid submissions might both belong to one person, and retracting a leader may require a previous third-place bidder. Retractions and administrative decisions must also be immutable sequenced records, not deletions.
 
 Now consider side effects. A bid changes public price and may extend the auction, which must reach watchers and projections. Publishing to Kafka or another event bus after the database commit creates a classic lost-event failure: the bid is accepted, but the process dies before notifying anyone. The fix is an `OutboxEvent` written in the same transaction or log append as the bid decision. A relay later publishes it at least once, and consumers deduplicate by event id and sequence.
 
-Closing adds another entity. If `Auction.state = CLOSED` is the only record, settlement workers may double-charge on duplicate close events or lose the final price that won at the close boundary. `AuctionResult` is an immutable, unique-per-auction record containing winner, final price, reserve outcome, closed sequence, and settlement state. Payment and order systems use the auction result id as their idempotency key, so settlement can retry without changing the auction result.
+Closing adds another entity. `AuctionResult` is an immutable, unique-per-auction record containing winner, final price, reserve outcome, and closed sequence. It records no sale if there are no eligible bids or the reserve is unmet. A separate mutable `Settlement` tracks payment progress. Order creation uses `result_id` as its business identity; distinct financial operations derive their own keys from that result and operation type. This prevents a duplicate close from creating another order without conflating authorization, capture, and refund.
 
 Eligibility and abuse state cannot be embedded directly in auction state because it changes by user and often comes from risk systems. `BidderEligibility` or a risk snapshot records whether a bidder is allowed to bid, high-value limits, verification status, and the version of the policy used. Whatnot's public writeup on shill-bidding defense is a reminder that this is not just a boolean: device fingerprints, account relationships, bid/cancel patterns, anomaly detection, and investigator decisions all feed the accept-or-review path. The bid engine should use a compact decision snapshot, while the trust system keeps richer evidence outside the hot state row.
 
@@ -106,17 +106,23 @@ AuctionState
 - leading_bidder_id, leading_max_amount_encrypted
 - second_bidder_id, second_max_amount_encrypted
 - visible_price, reserve_met, accepted_bid_count
-- effective_end_at, last_sequence, state_version
+- effective_end_at, last_sequence, last_decision_at, state_version, owner_epoch
+
+BidderMaximum
+- auction_id, bidder_id, active_max_amount_encrypted, max_reached_sequence
 
 BidLedger
 - bid_id, auction_id, bidder_id, client_idempotency_key
-- submitted_max_amount_encrypted, decision, rejection_reason
+- submitted_max_amount_encrypted, request_hash, decision, rejection_reason
 - accepted_sequence, resulting_visible_price, effective_end_at_after_bid
 - received_at, decided_at, policy_snapshot_id
 
 AuctionResult
 - auction_id, result_id, winner_id, final_price, reserve_met
-- closed_at, closed_sequence, settlement_state
+- closed_at, closed_sequence
+
+Settlement
+- result_id, order_id, state, payment_operation_references
 
 OutboxEvent
 - event_id, auction_id, sequence, event_type, payload, published_at
@@ -150,13 +156,13 @@ This breaks in four concrete ways. First, two bid API instances can race unless 
 
 All commands that can change one auction route through one logical authority: either a single-writer actor consuming a partitioned command log or a transactional service using a strict row lock/CAS on `AuctionState.version`. The actor form makes the queue explicit. Commands for `auction_id = A` are appended to the same ordered partition; the actor processes them one at a time, updates a local state store or transactional database, writes ledger/outbox records, and advances the sequence. The database form is simpler at moderate scale: each bid transaction locks `AuctionState(A)`, recomputes the proxy decision, inserts the ledger, increments version, and commits. Both designs must expose the same semantics: one accepted sequence per mutation, scoped idempotency, and no dependence on client clocks.
 
-The actor/log approach is usually better for hot auctions because it turns close, bid, extension, and cancellation into one stream. It also lets the router isolate a hot auction onto a dedicated partition or process before it overloads unrelated auctions. The cost is operational complexity and a new failure mode: queue delay can make bids arrive before the deadline but commit after it. This design resolves that by defining the commit decision at the bid authority as the source of truth.
+The actor/log approach makes close, bid, extension, and cancellation share one stream and allows isolation of a hot auction. It does not remove serialization cost. A replaced actor can still be running, so the state store must atomically validate its `owner_epoch` and state version while applying a command, updating ledger/outbox records, and advancing the applied offset. A consumer assignment alone is not a write fence. This design's deadline is evaluated at the authority's serialized decision point after loading current state, not at edge receipt or at the later physical commit time; a decision counts only if durably committed.
 
 ### Fix 2: Make timers advisory and close through the same command stream
 
 A delayed job or scheduler is useful for waking the system near `effective_end_at`, but it is not allowed to decide the winner by itself. Close is a command routed to the same per-auction authority as bids. When processed, it checks authoritative time and `effective_end_at`; if early, it reschedules. If due, it transitions `ACTIVE -> CLOSING -> CLOSED`, writes exactly one `AuctionResult`, and emits settlement events through the outbox. Duplicate close commands are harmless because `AuctionResult.auction_id` is unique and the state transition is conditional.
 
-This also handles anti-sniping. A bid committed inside the extension window updates `effective_end_at` in the same state transition that accepts the bid. Any close command already queued will observe the new end time and reschedule rather than close early.
+This also handles anti-sniping. A bid decided inside the extension window updates `effective_end_at` in the same committed state transition that accepts it. Any close command already queued will observe the new end time and reschedule rather than close early.
 
 ### Fix 3: Split authoritative state from public read models
 
@@ -166,7 +172,7 @@ The listing workflow feeds those indexes before publish. eBay's buyer demand arc
 
 ### Fix 4: Fan out sequenced public events, not bid transactions
 
-The bid engine writes compact `auction_update` events with public sequence numbers. Realtime gateways subscribe to internal topics, coalesce updates for hot auctions, and fan them out to clients. A gateway can drop intermediate updates if it sends a later sequence with the latest visible price and bid count; the client is not reconstructing the bid ledger. If a client sees a gap, reconnects, or falls behind, it calls `GET /auctions/{id}` and resumes from the projection's latest sequence.
+The bid engine writes compact, complete public-state `auction_update` events with sequence numbers. Realtime gateways coalesce updates and fan them out. A newer full-state message safely supersedes missing earlier messages; an intentional sequence jump does not require a GET. Reconnect or an explicit resync request uses a versioned snapshot and a subscribe/buffer handshake so a change between snapshot and subscription is not lost.
 
 Whatnot's live shopping infrastructure illustrates why this layer needs admission control and connection pooling. They prepared for very large live streams by enforcing global session caps through an admission service and by adding proxy layers so Redis, OpenSearch, and Kafka connection limits did not grow linearly with backend pods. A hot auction needs the same separation: protect admitted bidders and watchers, shed new watcher joins cleanly, and pool downstream connections so fan-out pressure does not collapse the bid path.
 
@@ -207,17 +213,21 @@ A bid request enters through the API gateway, passes authentication and lightwei
 **Question.** Two buyers submit maximum bids during the last second, both clients time out, and both retry. How does the system avoid accepting them twice or computing two different winners?
 <details><summary>Answer</summary>
 
-Route both commands to one per-auction authority, deduplicate by `(auction_id, bidder_id, idempotency_key)`, assign accepted sequences only when the command commits before `effective_end_at`, and compute the proxy-visible price from the ordered maximums. Retries return the persisted original decision rather than re-running the bid.
+Route both commands to one per-auction authority, deduplicate by `(auction_id, bidder_id, idempotency_key)`, and validate the deadline at the serialized decision point. Persist that decision and its sequence atomically. Compute the price from distinct bidders' active maximums, not raw submissions. Retries return the persisted result rather than re-running the bid.
 
 </details>
 
-The tempting implementation is `UPDATE auction_state SET visible_price = ... WHERE auction_id = ...` from any API server. That looks safe if the database is strongly consistent, but proxy bidding makes the update depend on hidden state and tie order. Suppose Alice has an accepted maximum of $100 and leads at $50. Bob submits $80 and Carol submits $120 concurrently. If two API instances read Alice's state at the same time, Bob may compute Alice leading at $81 while Carol computes Carol leading at $101. Whichever write wins hides the other decision unless the transaction locks the state and inserts a sequenced ledger row atomically. Even worse, if Bob's response is lost and he retries with a new key, the system may treat the retry as another bid and move the public price again.
+The tempting implementation is `UPDATE auction_state SET visible_price = ... WHERE auction_id = ...` from any API server. That looks safe if the database is strongly consistent, but proxy bidding makes the update depend on hidden state and tie order. For an illustrative fixed $1 increment, suppose Alice has an accepted maximum of $100 and leads at $50. Bob submits $80 and Carol submits $120 concurrently. If two API instances read Alice's state at the same time, Bob may compute Alice leading at $81 while Carol computes Carol leading at $101. Whichever write wins hides the other decision unless the transaction locks the state and inserts a sequenced ledger row atomically.
 
 The first production-grade requirement is one serialization point per auction. In a database-centered design, every bid transaction locks `AuctionState` for that `auction_id` or uses CAS on `state_version`. The transaction re-reads current state, checks idempotency, validates the bid, inserts a ledger record, updates state, writes the outbox, and commits. In a log-centered design, the router appends commands for the auction to the same partition and a single actor processes them. The actor can keep hot state in memory because the replicated log and ledger are the durable source. Both approaches are valid; the decision is mostly about expected hot-auction bursts. Conditional updates are simpler and good until lock wait time becomes the bottleneck. A single-writer actor exposes that wait as queue depth and makes it easier to isolate a hot auction.
 
-The second requirement is a precise proxy-bidding contract. A bid is a maximum authorization, not a public amount. Let `L` be the current leader's maximum, `C` the challenger's maximum, and `I` the increment for the current price bracket. If there is no leader, `C` must be at least the start price and the visible price becomes the start price. If `C <= L`, the old leader remains and the visible price becomes `min(L, C + I)`. If `C > L`, the challenger leads and the visible price becomes `min(C, L + I)`. If maximums tie, the earlier accepted sequence wins. eBay's automatic bidding documentation is useful because it makes the same product distinction: the buyer enters a maximum, the system raises the public bid only as needed, and the hidden maximum remains private. This is why the API returns `you_are_leading` and public price, never another bidder's maximum.
+The second requirement is a precise proxy-bidding contract. A maximum is a bidding instruction, not a bank authorization. Keep one active maximum per distinct bidder. Raising the leader's own maximum must not make that bidder compete with their previous bid. Reject ordinary decreases, and validate challengers against the current published minimum before acceptance; an identical repeat under a new key does not become a second competing maximum.
 
-The third requirement is idempotency at the command-decision layer. Store the idempotency key with the canonical command result before returning. A retry with the same key returns the original decision even if the auction has since closed. A retry with a different key is a new bid and must satisfy the current next required public amount. Keys should be scoped by bidder and auction so mobile clients can generate simple UUIDs without central coordination. The dedupe record must include both accepted and rejected decisions; otherwise a client can hammer the same low bid and create repeated load near close.
+Here is an explicit pricing policy for this design, rather than a claim to reproduce every eBay edge case. Freeze a monotone increment schedule `I(amount)` when publishing. A first bidder must meet the start price; a challenger must meet `visible_price + I(visible_price)` and raise their own previous maximum. The leader may simply raise their hidden maximum. After updating the per-bidder state, let `M1` and `M2` be the highest and second-highest maximums from distinct bidders. With only one bidder, the base price is the start price. Otherwise it is `max(start_price, min(M1, M2 + I(M2)))`; equal maximums choose the bidder who first reached that amount. For reserve `R`, validate `R >= start_price`; if `M1 >= R`, the visible price is at least `R`, never more than `M1`. Otherwise the reserve remains unmet and closing produces no sale. Thus a sole $100 maximum on a $10-start, $80-reserve listing sells for $80, not $10. With no reserve, raising that same bidder's maximum alone leaves the $10 price unchanged.
+
+Retractions recompute the active per-bidder maxima and ranking from eligible history, potentially restoring a third-place bidder; two cached maxima alone are insufficient. eBay's automatic bidding documentation motivates hidden limits and price-bracket increments, but the exact increment, tie, reserve, and retraction policies must be specified and replayable here.
+
+The third requirement is idempotency at the command-decision layer. Store the idempotency key with the canonical command result before returning. A retry with the same key and body returns the original decision even after close; a changed body conflicts. A different key is a new command subject to the current bidder-specific admission rules. Keys are scoped by bidder and auction. Persist accepted and rejected decisions, while retaining rate limits because a client can still generate fresh keys.
 
 There are two subtle alternatives. One is to model every proxy bid as an event and rebuild state by scanning the ledger. That is excellent for audit and disaster recovery but too slow for the synchronous decision unless the current state is cached and fenced by sequence. The other is to use a globally ordered log for all auctions. That is overkill: it reduces concurrency across independent auctions even though only per-auction ordering matters. Partition by auction, then isolate the exceptional hot auction if it threatens partition neighbors.
 
@@ -255,17 +265,19 @@ Signals worth watching: per-auction queue delay, lock wait time, duplicate-key h
 **Question.** A bid is accepted by the API gateway before the displayed countdown hits zero, but it reaches the bid authority after another command has closed the auction. Is it valid?
 <details><summary>Answer</summary>
 
-No, not under this design. A bid is on time only if the bid authority commits it before the current `effective_end_at`. Edge arrival and client timestamps are advisory. If the product wants to protect bidders from network delay, it should implement a soft-close extension or published outage policy, not infer ordering from untrusted clocks.
+No, not under this design. A bid must reach the authority's serialized decision point while the auction is active and before `effective_end_at`, and that decision must commit. Edge arrival and client timestamps are advisory. A valid pre-deadline decision can finish its commit after the deadline; close cannot overtake it on the same authority.
 
 </details>
 
 The close boundary is where vague designs fail. If the rule is "request received before the deadline," received by whom? The CDN, API gateway, regional load balancer, command log, actor, or database? If the rule is "client submitted before the deadline," malicious clients can backdate timestamps, and honest clients have clock skew. If the rule is "timer job ran," delayed jobs and worker crashes can change winners. The system needs one clock authority and one ordered mutation path.
 
-This design defines the authoritative decision point as the bid authority's commit. The authority uses its region's monitored server time or database commit timestamp, not the client's clock. A bid command processed with `now < effective_end_at` can be accepted; one processed at or after the cutoff is rejected with `AUCTION_CLOSED`. That rule is harsh but deterministic. It also makes capacity visible: if queue delay near close causes valid user attempts to miss the cutoff, the product must either add anti-sniping extensions, reserve capacity, or admit fewer bidders. It cannot silently pretend the edge queue is ordered with the close state.
+This design checks `start_at <= decision_at < effective_end_at` after acquiring serialization and loading current state. In the database implementation, sample the database clock after taking the row lock; PostgreSQL's transaction-start `now()` would backdate a transaction that waited for that lock, so use an actual current-time sample such as `clock_timestamp()`. Store `decision_at` with the decision and do not acknowledge acceptance until commit. This is not a guarantee that physical commit finishes before the deadline: that would require a different, storage-supported commit-time rule.
 
-Close itself is a command in the same stream. The scheduler enqueues `CloseAuction(auction_id, expected_end_at)` around the end time. When the bid authority processes it, it compares the current `effective_end_at` to authoritative time. If early, it re-enqueues a timer for the new end. If due, it conditionally transitions to `CLOSING`, computes reserve outcome from current state, writes `AuctionResult` with a unique constraint on `auction_id`, appends `auction_closed`, and transitions to `CLOSED`. Bids encountered after the state is `CLOSING` or `CLOSED` are rejected. Duplicate close commands become no-ops because the result already exists.
+The owner uses a monitored clock and persists a nondecreasing `last_decision_at` across takeover. A leader with unacceptable clock uncertainty pauses deadline-sensitive decisions rather than silently changing their ordering. If queue delay causes requests to reach the decision point too late, use admission control, capacity isolation, or a published soft-close/outage policy; an edge timestamp does not override the authority.
 
-Anti-sniping changes the product semantics but not the architecture. For example, if a bid commits within the last two minutes, extend `effective_end_at` to `commit_time + 2 minutes`, capped at a maximum extension window. The extension must be in the same transaction as the accepted bid and public update. This prevents a close command that was already scheduled from winning a race: it will later observe the extended end time and reschedule. The public update includes the new end time so watchers see why the countdown moved. Fixed deadlines are simpler and more predictable; soft close improves price discovery and reduces network-timing games. The key is not which policy is chosen, but that the policy is encoded in the authoritative state transition.
+Close itself is a command in the same stream. The scheduler enqueues `CloseAuction(auction_id, expected_end_at)` around the end time. The authority compares current `effective_end_at` to the same decision clock. If early, it durably schedules another wake-up. If due, it computes the winner and reserve outcome, inserts the unique `AuctionResult`, changes state to `CLOSED`, and appends `auction_closed` in one commit. `CLOSING` is an internal transition, not a separately committed state that can strand an auction after a crash. Duplicate close commands return the existing result.
+
+Anti-sniping changes the product semantics but not the architecture. For example, a valid bid decided within the last two minutes extends `effective_end_at` to `decision_at + 2 minutes`, capped by the published maximum extension deadline. Commit that extension with the bid, never shrink the current deadline, and apply the extension only to qualifying new bids, not idempotent retries. A queued close then sees the extended deadline and reschedules. Fixed deadlines are simpler; soft close reduces timing games, but the eligibility and cap rules must be replayable from the log.
 
 Exactly-once winner selection is really at-least-once execution plus idempotent state. Close workers, outbox relays, payment services, and notification systems can all retry. The unique `AuctionResult` row is the fence. Settlement consumes `auction_won(result_id)` and creates an order using `result_id` as its idempotency key. If payment authorization times out, the payment step retries or moves to a grace state; it does not reopen the auction. If the reserve is not met, the result records `reserve_met = false` and settlement emits seller notifications rather than a winner charge.
 
@@ -291,14 +303,14 @@ Signals worth watching: close-job delay, active auctions past `effective_end_at`
 |---|---|---|
 | Bad | Trust client timestamps or close auctions directly from a timer worker. | Clocks can lie or drift, timers can be late or duplicated, and close can race with in-flight bids. |
 | Good | Use server time and a conditional `ACTIVE -> CLOSED` transition. | Better, but it still needs to be ordered with bids and must handle anti-sniping extensions and duplicate workers. |
-| Great | Make close a serialized auction command, define commit-before-`effective_end_at` as the cutoff, atomically extend soft closes, and write one immutable `AuctionResult` consumed idempotently by settlement. | It gives deterministic winners under retries, crashes, and scheduler delays. |
+| Great | Serialize bids and close, record the pre-deadline decision time, durably commit its result and any extension, and write one immutable `AuctionResult` consumed idempotently by settlement. | It gives deterministic winners without confusing lock acquisition, decision time, and physical commit time. |
 
 ### 6.3 Live price fan-out with sequence numbers and resync
 
 **Question.** A hot auction has 500,000 watchers, the bid engine emits 50 accepted updates in one second, and some mobile clients miss messages. How do clients end up on the right visible price without hammering the database?
 <details><summary>Answer</summary>
 
-Send compact public updates with monotonically increasing auction sequences through realtime gateways, allow gateways to coalesce intermediate updates, and make clients apply only newer sequences. A client that detects a gap or reconnects fetches the authoritative public snapshot from the projection cache and resumes from that sequence.
+Send complete public-state updates with monotonically increasing auction sequences, coalesce intermediate updates, and apply only newer versions. A sequence jump in a full-state event is harmless. Reconnect uses a versioned projection snapshot plus buffered newer events; the projection is eventually consistent, not an authoritative bid decision.
 
 </details>
 
@@ -306,9 +318,9 @@ The naive watcher path is polling: every client calls `GET /auctions/{id}` every
 
 The right split is that the bid engine emits one public event per committed sequence, and realtime infrastructure handles delivery as best-effort. An event contains `auction_id`, `sequence`, `visible_price`, `bid_count`, `effective_end_at`, `state`, and perhaps a `leader_hint` for the current user on a private channel. It does not contain hidden maximums, reserve price, or full bid history. Projection builders update `PublicAuctionProjection`, and gateways fan out the event to subscribed clients. A client stores `last_seen_sequence`, ignores older or duplicate messages, and applies a message only if the sequence is greater than the current one.
 
-For hot auctions, gateways should coalesce. If sequences 101, 102, and 103 arrive while a gateway is still writing to a client socket, it can skip 101 and 102 and send 103 because the page only needs the latest public price and bid count. Coalescing is not valid for an audit feed, but it is valid for a public watcher view. The server can also send a `resync_required` control message when the gap is too large or when the event payload type changes. The client then performs `GET /auctions/{id}`, receives a projection snapshot at `last_sequence = 103`, and resumes the WebSocket from that value.
+For hot auctions, a gateway can skip full-state versions 101 and 102 and send 103. Do not make every such skip trigger a snapshot request from 500,000 watchers. On reconnect or `resync_required`, subscribe and buffer first, fetch a snapshot at version `v`, then discard buffered versions `<= v` and deliver the rest. Never replace a newer local view with an older projection. Gateways share snapshot fetches and jitter retries if projections lag. Delta-only protocols instead require contiguous replay or a fresh snapshot; they cannot safely use the same coalescing rule.
 
-Topic ownership needs its own coordination. A large gateway fleet cannot let every pod independently subscribe to every hot topic and open unbounded downstream connections. AWS's DynamoDB lease pattern for real-time streaming workers is a useful analogy: workers acquire time-bounded leases with conditional writes, heartbeat while they own a shard, and reconciliation reclaims expired leases. Applied here, one or a small bounded group of workers owns a hot auction fan-out shard; leases fence duplicate owners; clients can reconnect to another gateway and present `last_seen_sequence`. AWS AppSync's realtime architecture shows the managed version of the same separation: WebSocket connection handling can be offloaded, but the source of truth remains the backend state and event stream.
+Topic ownership needs its own coordination. Use bounded fan-out groups rather than unbounded downstream subscriptions. AWS's DynamoDB lease pattern for streaming workers is a useful ownership analogy, but expiry does not physically stop an old worker. Gateways must reject obsolete owner epochs or tolerate duplicate full-state events through sequence checks. AWS AppSync illustrates separating WebSocket handling from backend state; none of this makes the watcher layer authoritative for bids.
 
 Admission control is part of correctness by protection. Whatnot's large live-event work showed that adding application pods can run into Redis, search, and Kafka connection ceilings before CPU is exhausted, and that deterministic load shedding protects admitted users. For auctions, new watcher connections are cheaper to reject than bid commands are to delay. The gateway should enforce per-auction watcher caps, prefer already-connected users, reserve capacity for active bidders and sellers, and degrade from per-bid updates to lower-frequency price snapshots if needed. Bidders can still use the bid API and authoritative GET response even if the public WebSocket is degraded.
 
@@ -330,8 +342,10 @@ sequenceDiagram
     G-->>W: "Send latest available sequence 102"
     W->>W: "Ignore older messages and store last_seen=102"
     W->>G: "Reconnect with last_seen=102"
-    G-->>W: "If gap, tell client to fetch snapshot"
-    W->>P: "GET auction snapshot"
+    G->>G: "Subscribe and buffer current updates"
+    G->>P: "Fetch shared versioned snapshot"
+    P-->>G: "Snapshot at version v"
+    G-->>W: "Snapshot then buffered versions above v"
 ```
 
 Signals worth watching: fan-out latency by auction, gateway send-buffer depth, coalesced update count, reconnect rate, snapshot resync rate, and projection lag behind the bid sequence.
@@ -362,7 +376,7 @@ The reusable pattern is: accept commands at an idempotent edge, route them to th
 
 ## Review
 
-The design starts from the fact that an auction is locally sequential and publicly massive. Proxy bids require hidden maximums, deterministic tie breaks, and an ordered ledger, so each auction gets one bid authority implemented by a single-writer log consumer or a strict transactional lock/CAS. Closing is not a timer update; it is another serialized command with an exact commit-before-`effective_end_at` cutoff, optional soft-close extension, and one immutable `AuctionResult`. Public reads, search, user summaries, and WebSocket updates are derived from outbox events, use monotonic sequence numbers, and can lag, coalesce, or resync without affecting bid correctness. Settlement is an idempotent saga after the result, and hot-event reliability comes from admission control, partition isolation, and protecting the ordered bid path from watcher fan-out.
+The design starts from the fact that an auction is locally sequential and publicly massive. Proxy bids require distinct bidders' hidden maximums, deterministic tie breaks, and an ordered ledger, so each auction gets a fenced authority or a strict transactional lock/CAS. Closing is another serialized command: decisions must occur before `effective_end_at` and become durable to count, with optional atomic soft-close extension and one immutable `AuctionResult`. Public full-state updates use monotonic sequences and can coalesce without forcing per-viewer resyncs. Settlement is a separate idempotent saga, and hot-event reliability comes from protecting the ordered bid path from watcher fan-out.
 
 ### Check your understanding
 
@@ -376,14 +390,14 @@ The design starts from the fact that an auction is locally sequential and public
 2. Why not accept bids based on the time they reached the CDN or API gateway?
    <details><summary>Answer</summary>
 
-   Edge arrival is not ordered with auction state, close commands, or other bid commands. A bid could reach one gateway early and sit behind a queue while another bid commits and closes the auction. The deterministic rule is based on the bid authority's commit before `effective_end_at`.
+   Edge arrival is not ordered with auction state or close commands. A bid can sit in a gateway queue until after close. The rule checks time at the serialized decision point and then durably commits that decision; it does not promise that physical commit finishes before the deadline.
 
    </details>
 
 3. What information must a public watcher event contain, and what must it not contain?
    <details><summary>Answer</summary>
 
-   It should contain public sequence, visible price, bid count, effective end time, and state. It must not contain hidden maximum bids, reserve price, private eligibility data, or enough information to infer another bidder's strategy.
+   It should contain public sequence, visible price, bid count, effective end time, and state. It must not include hidden maximum fields, the unpublished reserve, or private eligibility data. Public price behavior inevitably reveals some bounds, so this is access control on private data, not a promise that bidder strategy cannot be inferred.
 
    </details>
 
@@ -413,3 +427,4 @@ The design starts from the fact that an auction is locally sequential and public
 | Whatnot | [Taking On Shill Bidding](https://blog.teamwhatnot.com/unitedstates/taking-on-shill-bidding) | Trust-and-safety signals for detecting seller-related bids, collusion, and manipulation. |
 | AWS | [Building resilient real-time streaming workers with Amazon DynamoDB leases](https://aws.amazon.com/blogs/architecture/building-resilient-real-time-streaming-workers-with-amazon-dynamodb-leases/) | Lease, heartbeat, and reconciliation pattern for exactly-one ownership of stateful WebSocket work. |
 | AWS | [AWS AppSync real-time reference architecture](https://aws.amazon.com/blogs/mobile/aws-appsync-real-time-reference-architecture/) | Managed WebSocket subscription fan-out pattern for delivering realtime auction read-model updates. |
+| PostgreSQL | [Date/time functions](https://www.postgresql.org/docs/17/functions-datetime.html) | Distinguishes transaction-start time from an actual clock sample when defining deadline checks. |

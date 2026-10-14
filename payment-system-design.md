@@ -24,7 +24,7 @@ A payment system lets merchants create payment attempts, charge or authorize a c
 
 ### 1.3 The binding constraint
 
-The binding constraint is that the system moves real money through external processors that cannot join our database transaction and often fail ambiguously. We can atomically update our payment row and ledger, or we can send a network request to a processor, but we cannot commit both in one serializable transaction. A timeout after an authorization request might mean no one saw it, the processor approved it, or the approval committed and only the response was lost.
+The binding constraint is that the system moves real money through external processors that cannot join our database transaction and often fail ambiguously. A payment row and its local outbox can commit atomically; a call to a separately stored ledger or processor cannot join that transaction. A timeout after an authorization request might mean no one saw it, the processor approved it, or the approval committed and only the response was lost.
 
 That constraint forces the architecture. We need scoped idempotency so client retries do not create new operations, recovery points so a retry resumes after the last completed step, stable processor operation IDs so external retries refer to the same side effect, a double-entry ledger so internal money effects are deterministic, an outbox so notifications follow committed state, and reconciliation so processor settlement becomes the final external check.
 
@@ -88,7 +88,9 @@ GET /v1/balance_transactions?cursor=bt_123&limit=100
 POST /v1/webhook_endpoints
 ```
 
-The create and mutate endpoints accept merchant-provided idempotency keys. The key is not global; it is scoped to `(merchant_id, endpoint, idempotency_key, normalized_body_hash)`. If the same key and body arrive again, the service returns the original response, including a `PROCESSING` response if the operation is still in doubt. If the key is reused with a different body, the service returns a conflict because replaying a different amount under a reused key is more dangerous than making the merchant choose a new key.
+The create and mutate endpoints accept merchant-provided idempotency keys. Enforce a unique constraint on `(merchant_id, operation_scope, idempotency_key)`, where the scope identifies the method and target resource. Store the normalized body hash as a value to compare, not as part of that unique key: otherwise a changed amount would create a second operation rather than a conflict. Concurrent inserts for the same key converge on one durable operation. A retry with the same body returns the saved response, including an initial `PROCESSING` response; the status resource exposes subsequent progress. A changed body is rejected.
+
+Idempotency has a retention contract, not an unlimited guarantee. Keep unresolved operation identities and financial business references durably even when response-cache entries expire. Processor adapters must respect the provider's deduplication window: for example, Stripe API v1 permits key pruning after at least 24 hours. Beyond that window, query or reconcile an ambiguous operation rather than assuming reuse of the key is still safe.
 
 The response model must admit asynchronous truth. A confirm call can return `200` with `AUTHORIZED`, `200` with `REQUIRES_ACTION`, or `202` with `PROCESSING` and a status resource. The merchant can poll `GET /payment_intents/{id}`, but the primary asynchronous mechanism is a signed webhook. Cursor pagination is used for balance transactions because offsets are unstable on an append-only stream. Cancel semantics are guarded by state: canceling before the processor request is sent is local, canceling an authorization may become a void request, and canceling after capture must become a refund. The API should expose that distinction instead of promising impossible synchronous cancellation.
 
@@ -97,6 +99,8 @@ The response model must admit asynchronous truth. A confirm call can return `200
 Start with the obvious entity: `PaymentIntent` stores the merchant, amount, currency, capture method, and current status. That works until a customer retries authentication, a merchant uses a new card after a decline, or an adapter must query a processor by operation. The intent is the merchant-facing object, not the external attempt, so we add `PaymentAttempt` with a stable `processor_operation_id`, processor reference, authentication state, and recovery point.
 
 A payment row still cannot explain where the money went. Updating `captured_amount` on the intent may prevent over-capture, but it cannot represent fees, reserves, processor receivables, pending balances, available balances, payouts, chargeback fees, or settlement adjustments. The system therefore needs ledger accounts, ledger transactions, and postings. Every ledger transaction balances debits and credits per currency; historical mistakes are reversed with linked transactions rather than edited.
+
+Each capture, refund, or void also needs a distinct `PaymentOperation`, not just the authorization attempt's identity. It holds the reserved amount, its own processor key, outcome, and ledger-posting status. Multiple partial captures are allowed only when the processor explicitly supports them; a partial capture can otherwise release the remaining authorization. Authorization itself records a hold, not captured revenue or merchant-available funds.
 
 Idempotency also deserves its own durable record. A cache would lose the exact boundary we need during a retry storm or failover. The `IdempotencyRecord` stores the request scope, body hash, response snapshot when available, status, locked operation ID, and recovery point. Airbnb's published payment idempotency work is a useful production analogue: they store recovery points so a repeated call continues the distributed workflow instead of replaying side effects.
 
@@ -108,6 +112,7 @@ PaymentIntent
 - capture_method: AUTOMATIC | MANUAL
 - status: REQUIRES_PAYMENT_METHOD | REQUIRES_CONFIRMATION | REQUIRES_ACTION | PROCESSING | AUTHORIZED | PARTIALLY_CAPTURED | SUCCEEDED | CANCELED | FAILED
 - payment_method_token, authorized_amount_minor, captured_amount_minor, refunded_amount_minor
+- capture_reserved_minor, refund_reserved_minor
 - version, created_at, updated_at
 
 PaymentAttempt
@@ -117,8 +122,14 @@ PaymentAttempt
 - recovery_point, last_processor_request_hash, failure_code
 - created_at, updated_at
 
+PaymentOperation
+- operation_id, attempt_id, payment_intent_id, merchant_id
+- type: CAPTURE | REFUND | VOID, amount_minor, currency
+- processor_operation_id, status, recovery_point, ledger_status
+
 IdempotencyRecord
-- merchant_id, endpoint, idempotency_key, normalized_body_hash
+- merchant_id, operation_scope, idempotency_key (unique together)
+- normalized_body_hash
 - operation_type, operation_id, status, recovery_point
 - response_code, response_body, expires_at, created_at, updated_at
 
@@ -151,7 +162,7 @@ ReconciliationRow
 - row_type, matched_reference, match_status, resolution_state
 ```
 
-Payment workflow state lives in a strongly consistent transactional store partitioned by merchant and payment ID. Ledger transactions and postings live in a ledger service with serializable writes within an account partition or balancing boundary. Raw processor payloads and settlement files live in encrypted, restricted object storage; they are referenced from transactional rows but not duplicated into merchant-facing tables. Analytical reporting receives CDC copies because unbounded queries must not compete with payment admission.
+Payment workflow state lives in a strongly consistent transactional store; route an intent, its operations, idempotency records, and outbox to the same home shard. Ledger transactions and postings live in a separate ledger service. Every journal must atomically commit all affected postings, deduplication references, and balance snapshots, not merely serialize one account at a time. Co-locate the balancing group, including partitioned clearing accounts, or use a store supporting serializable cross-partition transactions. Raw processor payloads and settlement files live in encrypted, restricted object storage; they are referenced from transactional rows but not duplicated into merchant-facing tables. Analytical reporting receives CDC copies because unbounded queries must not compete with payment admission.
 
 > **Key idea.** The payment intent answers "what is the checkout doing?" while the ledger answers "where did the money move?" Keeping those models separate avoids rewriting history when workflow state changes.
 
@@ -173,13 +184,15 @@ It breaks in concrete ways. If the processor approves but the API times out, a c
 
 The API gateway and payment service first acquire or create an `IdempotencyRecord`. The record stores the normalized body hash, operation ID, recovery point, and final response. A retry either returns the saved result or resumes the same operation. This follows the same lesson Stripe emphasizes in its idempotency guidance: network failures are ambiguous, so the server must make retries predictable rather than relying on clients to infer what happened.
 
+The intent state machine also permits only one unresolved authorization attempt at a time. Idempotency keys alone do not stop a client from submitting a new key after a timeout; that request must still resume or inspect the existing attempt, not authorize a second payment.
+
 ### Fix 2: Stable attempts and processor operation IDs
 
 Before any network I/O, the service creates a `PaymentAttempt` with a stable `processor_operation_id`. Processor adapters pass that ID as the processor's idempotency key when supported. When a call times out, the attempt moves to `PROCESSING` or `UNKNOWN`, and recovery workers query the processor by reference or retry the same operation ID according to that adapter's safety rules. The system does not fail over an in-doubt authorization to a second processor unless it first proves the original operation did not take effect.
 
 ### Fix 3: Ledger service as the source of economic truth
 
-Payment state transitions are not sufficient for money. The ledger service accepts balanced journal entries with unique business references such as `(capture, attempt_id)` or `(refund, refund_id)`. It rejects unbalanced entries, duplicate business references, currency mismatches within a balancing group, and postings that violate guarded balance constraints. Square's Books and Stripe's Ledger both point to the same production lesson: a shared, immutable double-entry primitive lets many products use one auditable money model rather than inventing product-specific settlement tables.
+Payment state transitions are not sufficient for money. The ledger service accepts balanced journal entries with unique business references such as `(merchant_id, capture, capture_operation_id)` or `(merchant_id, refund, refund_operation_id)`. A retry returns the existing journal only if its payload matches; reuse with different postings is an error. The service rejects unbalanced entries, currency mismatches within a balancing group, and postings that violate guarded balance constraints. Square's Books and Stripe's Ledger both point to the same production lesson: a shared, immutable double-entry primitive lets many products use one auditable money model rather than inventing product-specific settlement tables.
 
 ### Fix 4: Transactional outbox for merchant events
 
@@ -213,7 +226,7 @@ flowchart LR
     RC --> L
 ```
 
-A confirm request enters through the idempotency gate. The payment service creates or resumes a `PaymentAttempt`, runs risk and authentication checks, and calls the selected processor with the stable operation ID. If the outcome is definitive, it conditionally advances the `PaymentIntent`, posts ledger entries through the ledger service, and writes an outbox event. If the outcome is unknown, it persists `PROCESSING` and lets recovery and reconciliation close the loop. Processor webhooks and settlement files do not bypass the model; they drive the same guarded transitions and idempotent ledger references.
+A confirm request enters through the idempotency gate. The payment service creates or resumes a `PaymentAttempt`, runs risk and authentication checks, and calls the selected processor with the stable operation ID. A definitive capture outcome commits locally with a `ledger_pending` recovery point and an outbox command to post that capture. A worker retries the ledger command under the same business reference; after the ledger confirms its atomic journal, another local transaction records the journal ID, advances merchant-visible completion, and emits the merchant event. A crash between those commits resumes by querying or replaying that same journal, not by charging again. If the processor outcome is unknown, the operation stays `PROCESSING`. Processor webhooks and settlement files drive these same guarded transitions. This is recoverable orchestration across two internal databases, not a fictitious cross-service local transaction.
 
 > **Key idea.** Each component traces back to a specific failure of the naive design.
 
@@ -230,7 +243,7 @@ The payment is in an in-doubt state such as `PROCESSING`, tied to the original a
 
 The naive approach treats timeout as failure. It writes `FAILED`, returns an error, and lets the merchant retry from scratch. That is exactly how duplicate charges happen. The timeout tells us only that our process stopped waiting; it says nothing about whether the processor received, authorized, committed, and later tried to respond. A second call with a new processor operation ID is a new money-moving request.
 
-The robust flow starts before network I/O. The service creates an idempotency record and payment attempt in one local transaction. The attempt contains a stable processor operation ID, chosen route, request hash, and recovery point such as `attempt_created`. Only then does the adapter call the processor. If the processor supports idempotency keys, the adapter sends the operation ID. If it returns approval, the recovery point advances to `processor_authorized`; the service then commits the payment state and ledger posting with unique business references. If the process crashes after external approval but before ledger posting, the next retry sees `processor_authorized` and continues with ledger finalization rather than calling the processor again.
+The robust flow starts before network I/O. The service creates an idempotency record and payment attempt in one local transaction. The attempt contains a stable processor operation ID, chosen route, request hash, and recovery point such as `attempt_created`. Only then does the adapter call the processor. If the processor supports idempotency keys, the adapter sends the operation ID. On approval, it durably records `processor_authorized`; authorization alone does not post capture revenue. A crash after that commit resumes from it. A crash after remote approval but before the local commit instead leaves `attempt_created` or `PROCESSING`, so recovery must query the provider or safely retry the same operation within its deduplication window. A recovery point cannot reveal a remote success that was never recorded locally.
 
 ```mermaid
 sequenceDiagram
@@ -248,13 +261,14 @@ sequenceDiagram
     I->>S: Resume attempt A
     S->>P: Query or retry operation A
     P-->>S: Approved
-    S->>L: Post capture or authorization reference A
-    S-->>C: Return AUTHORIZED or SUCCEEDED
+    S->>S: Persist authorization outcome for A
+    Note over S,L: Capture is a separate durable operation and ledger journal
+    S-->>C: Return AUTHORIZED
 ```
 
 Airbnb's payment idempotency framework maps directly onto this problem. Their lesson is that a distributed payment call is not one function; it is a workflow with recovery points. A retry after `risk_checked` should not repeat a non-idempotent risk hold if that matters; a retry after `processor_authorized` should not call authorize again; a retry after `ledger_posted` should only return the stored response and publish any missing outbox event.
 
-Stripe's public idempotency design also matters because it frames idempotency as an API contract rather than a best-effort cache. The system must store the first executed result and replay it. It should also reject key reuse with different parameters. Otherwise a merchant bug could send the same key for `$49.99` and `$499.99`, and the payment provider would have to guess which amount the key means.
+Stripe's API v1 idempotency design also matters because it frames idempotency as an API contract rather than a best-effort cache. Within its retention window it replays the first executed result and rejects changed parameters. Our API documents its replay and retention rules similarly; they must not be assumed identical across providers or API versions.
 
 There are edge cases. Some processors do not provide a strong idempotency primitive or query-by-operation endpoint. In that case the adapter must mark the attempt as more dangerous: serialize operations per payment method or intent, wait for webhook or settlement evidence before retrying, and potentially require manual resolution after a threshold. Another edge is failover. Routing an in-doubt authorization from Processor A to Processor B improves apparent availability but can double-charge. Safe failover is easiest before the first external request, after a definitive decline, or after a void/refund workflow has neutralized the original approval.
 
@@ -296,13 +310,13 @@ flowchart TD
     P --> T9["Credit payout payable"]
 ```
 
-Ledger writes must be serializable within the affected account boundary. Each transaction has a unique business reference, such as `(capture, attempt_id)`, so a recovery worker can safely submit the same journal again and get a duplicate-reference no-op. The ledger rejects any transaction where debits and credits do not sum to zero per currency. FX is not hidden inside rounding; it uses explicit bridge accounts and rates so the books remain explainable.
+Ledger writes must be atomic and serializable across every account affected by a journal. Each transaction has a unique business reference, such as `(merchant_id, capture, capture_operation_id)`, so a recovery worker can safely resubmit that journal, while a second valid partial capture has its own identity. The ledger rejects any transaction where signed postings do not sum to zero per currency. FX is not hidden inside rounding; it uses explicit bridge accounts and rates so the books remain explainable.
 
 Balances are derived from postings, but deriving by scanning billions of rows is too slow for checkout and payout decisions. The practical design maintains transactional balance snapshots or account sequences alongside immutable postings. A write appends postings and updates snapshots in the same serializable transaction. Reads of merchant available balance can use the snapshot, while reconciliation jobs continuously recompute from postings and compare. If a snapshot drifts, postings win.
 
 The hard scaling problem is hot accounts. Merchant accounts partition naturally because each merchant's available balance changes with that merchant's traffic. Platform accounts do not. `ProcessorReceivable:USD` or `PlatformBankCash:USD` might receive every capture in a region. Modern Treasury's ledgers work calls this out as a first-class high-throughput problem, and Uber's Gulfstream describes the same pressure on hot financial accounts. The fix is not to weaken consistency on one row; it is to choose account partitions that preserve accounting meaning while spreading writes: by processor, currency, legal entity, merchant cohort, or time bucket. Roll-up accounts and control reports can aggregate partitions asynchronously.
 
-There is also a concurrency boundary. Two refunds racing against the same captured amount must not both observe the old refundable balance and pass. The payment service can guard counters with `WHERE refunded_amount + :amount <= captured_amount`, but the ledger should also enforce available-balance constraints for accounts that cannot go negative. For payouts, moving funds from `MerchantAvailable` to `PayoutPayable` is the reservation; the bank file is generated from payout-payable entries, not from a stale merchant balance read.
+There is also a concurrency boundary. Before an external refund, atomically insert its operation and reserve refundable capacity with `WHERE refunded_amount + refund_reserved_minor + :amount <= captured_amount`, incrementing the reservation in that same transaction. Concurrent refunds then cannot both spend the unrefunded amount. Convert the reservation to a completed refund on definitive success; release it only on definitive failure, never on timeout. Capture operations use the equivalent guard against the remaining authorization. Ledger balance guards alone cannot prevent duplicate external refunds that have already been sent. For payouts, moving funds from `MerchantAvailable` to `PayoutPayable` reserves money before the bank request, which also needs a stable operation identity and unknown-outcome recovery.
 
 Stripe's Ledger article emphasizes completeness and timeliness checks, not just double-entry arithmetic. That matters because a balanced ledger can still be wrong if a producer never posted the capture or posted it late. The ledger therefore exposes control queries: aged nonzero clearing accounts, missing expected transitions by reference ID, and settlement rows unmatched to ledger transactions. Square's Books reinforces the organizational pattern: make the ledger a shared primitive with product-neutral semantics, so refunds, disputes, subscriptions, and payouts all use the same correctness machinery.
 
@@ -327,7 +341,7 @@ Committed internal state and ledger entries are authoritative for the merchant-f
 
 The naive design publishes webhooks inline after the payment update. That loses events whenever the process crashes between commit and publish. It also tempts the system to treat webhooks as the source of truth: if the merchant got the callback, the payment must be done. In a payment system, notifications are downstream of committed state. They are important, but they are not the transaction boundary.
 
-The outbox pattern draws the boundary. When the payment service transitions an intent to `SUCCEEDED` or `AUTHORIZED`, it writes the payment update, ledger reference, and `OutboxEvent` in the same database transaction. A publisher later reads unpublished rows and sends them to an event stream. Delivery workers create one `WebhookDelivery` per subscribed endpoint, sign the raw payload with the endpoint secret, and POST it. Any documented `2xx` acknowledges that delivery. Timeouts and non-`2xx` responses retry with exponential backoff and jitter. Delivery is at-least-once, so merchants deduplicate by event ID and fetch current state if they need ordering.
+The outbox pattern draws the local boundary. An authorization update and its event commit together; a captured-payment completion records an already-confirmed ledger journal ID, the payment update, and `OutboxEvent` in one payment-database transaction. That reference is not a cross-database ledger write. The earlier ledger-command outbox closes the separate gap described in section 5. A publisher later sends committed rows to an event stream. Delivery workers create one `WebhookDelivery` per subscribed endpoint, sign the raw payload with the endpoint secret, and POST it. Any documented `2xx` acknowledges that delivery. Timeouts and non-`2xx` responses retry with exponential backoff and jitter. Delivery is at-least-once, so merchants deduplicate by event ID and fetch current state if they need ordering.
 
 ```mermaid
 sequenceDiagram
@@ -395,10 +409,10 @@ The design starts from the fact that payment processors are outside our transact
 
    </details>
 
-2. Why scope idempotency keys by merchant, endpoint, and request body hash?
+2. Why store a body hash but exclude it from the idempotency uniqueness key?
    <details><summary>Answer</summary>
 
-   The same raw key from two merchants should not collide, different endpoints have different semantics, and reusing a key with a different amount or currency should be rejected rather than silently replayed.
+   Uniqueness is by merchant, operation scope, and key. The saved hash detects changed parameters. Including the hash in uniqueness would let the same key with a different amount create another operation instead of being rejected.
 
    </details>
 
@@ -428,6 +442,8 @@ The design starts from the fact that payment processors are outside our transact
 | Source | Article | Why it matters |
 |---|---|---|
 | Stripe | [Designing robust and predictable APIs with idempotency](https://stripe.com/blog/idempotency) | Explains ambiguous network failures, idempotency keys, replayed results, and backoff for safe payment retries. |
+| Stripe | [Idempotent requests](https://docs.stripe.com/api/idempotent_requests) | Specifies parameter matching, API-version differences, and the retention boundary for safe retries. |
+| Stripe | [Place a hold on a payment method](https://docs.stripe.com/payments/place-a-hold-on-a-payment-method) | Distinguishes authorization from capture and documents expiry and partial-capture limits. |
 | Airbnb | [Avoiding double payments in a distributed payments system](https://medium.com/airbnb-engineering/avoiding-double-payments-in-a-distributed-payments-system-2981f6b070bb) | Shows a recovery-point idempotency framework for exactly-once effects across payment microservices. |
 | Stripe | [Ledger: Stripe's system for tracking and validating money movement](https://stripe.com/blog/ledger-stripe-system-for-tracking-and-validating-money-movement) | Describes immutable fund-flow modeling, clearing/timeliness/completeness checks, and data-quality tooling at payment scale. |
 | Square | [Books, an immutable double-entry accounting database service](https://developer.squareup.com/blog/books-an-immutable-double-entry-accounting-database-service/) | Details why Square built a shared double-entry ledger database for settlements, payouts, consistency, and auditability. |

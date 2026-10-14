@@ -39,7 +39,7 @@ Checkout is bounded by successful holds. If a `100,000` seat event sells out ove
 **Question.** What makes a checkout retry safe when the browser, our order service, and the payment provider can each time out independently?
 <details><summary>Answer</summary>
 
-Every mutating API takes an idempotency key scoped to the authenticated user and operation. The order service stores the first result for that key, uses the order ID as the payment-provider idempotency key, and exposes an order status resource so a retry observes progress rather than creating a second charge or a second ticket.
+Every mutating API takes an idempotency key scoped to the authenticated user and operation, with changed parameters rejected. The order service also enforces one order per hold, even if the buyer retries with a new key. Each payment attempt and operation has a distinct stable provider key; authorization and capture must not accidentally share one key. A status resource exposes progress rather than creating another charge or ticket.
 
 </details>
 
@@ -77,23 +77,23 @@ A `Hold` is not just a cache key. It is a lease with an owner, expiration, price
 
 An `Order` records the attempt to turn a hold into money and tickets. It needs a state machine because payment can succeed while our response is lost, or our finalization transaction can fail after authorization. `PaymentAttempt` is separate because one order may have several attempts while the hold remains valid, and provider webhooks can arrive after the client has left.
 
-A `Ticket` should not be a static barcode. It is an owned entitlement for an event and seat, with a current owner, credential version, and status. `TicketOwnershipEvent` gives an append-only chain for transfers, resale, refunds, and disputes. `AdmissionScan` records the first accepted scan and rejected duplicates.
+A `Ticket` should not be a static barcode. It is an owned entitlement for an event and seat, with a current owner, credential version, and status. `TicketOwnershipEvent` gives an append-only chain for transfers, resale, refunds, and disputes. Online scanning atomically verifies the current credential version and changes an active, unused entitlement to used while recording the accepted `AdmissionScan`; separately checking a barcode and then inserting a scan would let two gates admit the same ticket. Rotating credentials alone do not prevent that race.
 
 ```text
 Event(event_id, venue_id, name, starts_at, onsale_id, status, home_region, seating_plan_version)
 Seat(event_id, seat_id, section, row, number, price_level_id, state, hold_id, state_version, updated_at)
 GeneralAdmissionPool(event_id, pool_id, capacity, held_count, sold_count, version)
-Hold(hold_id, event_id, user_id, status, expires_at, idempotency_key, quote_version, total_amount, currency)
+Hold(hold_id, event_id, user_id, status: ACTIVE | CHECKOUT | CONVERTED | RELEASED, owning_order_id, expires_at, idempotency_key, quote_version, total_amount, currency)
 HoldItem(hold_id, item_id, seat_id, pool_id, quantity, unit_amount, fee_amount, tax_amount)
-Order(order_id, user_id, event_id, hold_id, status, idempotency_key, total_amount, currency, created_at)
-PaymentAttempt(payment_attempt_id, order_id, provider, provider_key, status, authorized_amount, captured_amount)
+Order(order_id, user_id, event_id, hold_id UNIQUE, status, idempotency_key, total_amount, currency, created_at)
+PaymentAttempt(payment_attempt_id, order_id, provider, authorization_key, capture_key, void_key, provider_reference, status, authorized_amount, captured_amount)
 Ticket(ticket_id, order_id, event_id, seat_id, current_owner_id, credential_version, status)
 TicketOwnershipEvent(ticket_id, sequence, from_owner_id, to_owner_id, reason, created_at)
 OutboxEvent(event_id, aggregate_type, aggregate_id, sequence, type, payload, created_at)
 AdmissionScan(ticket_id, event_id, gate_id, scanner_id, scanned_at, result)
 ```
 
-Inventory tables live in the event's home region in a strongly consistent relational database or a key-value store with conditional multi-item transactions for the access pattern. Reserved seats are partitioned by `event_id`, and for very large venues may be subpartitioned by section while keeping multi-seat holds section-local. Orders can partition by `order_id` or buyer, but order finalization calls the event home shard. Catalog, search, static seat geometry, and availability summaries live in caches, object storage, and search indexes because they are read-heavy and tolerate staleness. Raw card data deliberately does not enter the core store; tokenized payment methods and provider references do.
+Inventory tables live in the event's home region in a strongly consistent relational database or a key-value store with conditional multi-item transactions for the access pattern. Co-locate authoritative orders, holds, seat or GA state, ticket entitlements, and their outbox on the event shard so the finalization transaction described below is real. Buyer-order indexes and ticket-wallet views are asynchronous projections, not separate authorities that are somehow committed atomically by an RPC. Very large venues may subpartition by section while keeping transactions section-local or explicitly using distributed transactions. Catalog, search, static seat geometry, and availability summaries live in caches, object storage, and search indexes because they tolerate staleness. Raw card data deliberately does not enter the core store; tokenized payment methods and provider references do.
 
 > **Key idea.** The data model separates hints from rights. Availability caches hint that seats may be open; only a durable hold tied to authoritative inventory grants the temporary right to buy.
 
@@ -123,7 +123,7 @@ The waiting room absorbs burst intake, assigns queue order or lottery rank, and 
 A hold is a TTL lease recorded with the inventory transition. The system atomically moves requested seats from `AVAILABLE` to `HELD` only if every requested seat is still available, or atomically increments a GA held counter only if capacity remains. This prevents oversells without keeping locks open while the buyer checks out. Expiration is also conditional, so a delayed worker cannot release a seat that has already been converted or re-held.
 
 ### Fix 4: Make checkout an idempotent saga
-Payment cannot join an ACID transaction with inventory, so the order service advances through explicit states: pending, authorizing, authorized, confirmed, paid, failed, or compensated. If the provider times out, the service queries by idempotency key before retrying. If authorization succeeds but finalization fails, the hold remains fenced and finalization retries. Only an audited compensation releases inventory after money is voided or refunded.
+Payment cannot join an ACID transaction with inventory. Claim the hold for its unique order before sending an authorization, then advance through explicit payment and inventory states. Resolve provider timeouts through supported lookup or safe same-key replay. Finalization creates pending entitlements; capture success activates them. Unknown outcomes retain the claim, and resolved failures use audited compensation before releasing inventory.
 
 ### Fix 5: Publish state changes through a transactional outbox
 Order, inventory, and ticket updates write an outbox row in the same transaction as the state change. A relay publishes those rows to Kafka or another event bus. SeatGeek's outbox work, including WAL-based emission with Debezium/Kafka Connect, is evidence that this is not theoretical hygiene: without an atomic outbox, a crash after commit but before publish leaves stale availability, missing notifications, and broken reconciliation.
@@ -143,11 +143,10 @@ flowchart LR
     ORDER --> INVDB
     ORDER --> PAY["Payment provider"]
     ORDER --> TICKET["Ticket service"]
-    TICKET --> TICKETDB[("Ticket store")]
+    TICKET --> INVDB
     INVDB --> OUTBOX["Transactional outbox"]
-    ORDER --> OUTBOX
-    TICKETDB --> OUTBOX
     OUTBOX --> BUS["Event stream"]
+    BUS --> TICKETDB[("Ticket wallet projection")]
     BUS --> AVAIL
     BUS --> NOTIFY["Notifications and reconciliation"]
     API --> SCAN["Admission service"]
@@ -162,7 +161,7 @@ A fan first hits the edge, which serves static event data and places them in a w
 **Question.** Two buyers race for the same last pair of seats, one hold expires at the same time checkout starts, and an expiration worker is running late. How do we avoid selling or releasing the wrong seats?
 <details><summary>Answer</summary>
 
-Create holds with atomic conditional inventory updates and release them with conditional expiry checks against database time, hold status, and seat ownership. Checkout revalidates the hold inside the finalization transaction. No worker may release a seat unless the seat still references that exact active hold and the hold is expired.
+Create holds with atomic conditional inventory updates and release them with conditional expiry checks against database time, hold status, and seat ownership. Before any payment call, checkout atomically claims an unexpired `ACTIVE` hold as `CHECKOUT` for one order. Expiration and checkout contend on that same record, so only one wins. Normal expiry workers may release only `ACTIVE` holds, never a payment-owned `CHECKOUT` hold.
 
 </details>
 
@@ -192,14 +191,18 @@ release hold H only if
   and each seat.hold_id = H.hold_id
 ```
 
-Using database time prevents client-clock manipulation. Checking `seat.hold_id` prevents a delayed expiration job for an old hold from releasing a seat that was already re-held by another buyer. Checking hold status prevents expiration from undoing a successful conversion. Checkout performs the symmetric condition: it can convert only when `status = ACTIVE`, `expires_at > database_now`, and every item still belongs to that hold.
+Using database time prevents client-clock manipulation. Checking `seat.hold_id` prevents a delayed expiration job for an old hold from releasing a seat that was already re-held by another buyer. Expiry atomically marks the hold released, releases its seats or decrements its GA held count, and writes its outbox event; replaying the worker cannot decrement a pool twice.
+
+Checkout locks or conditionally updates the same hold: require `status = ACTIVE`, an unexpired deadline evaluated at the claim, and ownership of every item, then create its unique order and change the hold to `CHECKOUT` in one transaction. Finalization later requires `CHECKOUT` and that exact owning order, not the original shopping deadline. A recovery deadline escalates stuck payments for query or compensation; it does not automatically return their seats to inventory while a payment outcome is unknown.
 
 ```mermaid
 stateDiagram-v2
     [*] --> AVAILABLE
     AVAILABLE --> HELD: "atomic hold if available"
     HELD --> AVAILABLE: "conditional expiry or release"
-    HELD --> SOLD: "checkout finalization"
+    HELD --> CHECKOUT: "claim before payment"
+    CHECKOUT --> SOLD: "owning order finalizes"
+    CHECKOUT --> AVAILABLE: "resolved failure and conditional release"
     SOLD --> REVOKED: "refund or cancellation policy"
 ```
 
@@ -268,15 +271,15 @@ Signals worth watching: queue depth, token issue rate, protected-zone active use
 **Question.** The payment provider authorizes the card but our order service times out before marking seats sold. What state is the order in, and can those seats be released to other buyers?
 <details><summary>Answer</summary>
 
-The order is in an authorized-but-not-finalized state, and the hold remains fenced. A retry or reconciler queries the provider by idempotency key and finalizes the same order. The seats are not released unless the system voids or refunds the authorization through an audited compensation path.
+If approval was durably recorded, the order is authorized but not finalized; if the response was lost, its outcome is unknown. Either way, the hold was claimed before the call and remains fenced to that order. Recovery queries the provider by reference, or safely retries the same operation under its idempotency contract. Seats stay unavailable until finalization or a resolved compensation. An uncaptured authorization is voided; an actual capture is refunded.
 
 </details>
 
 The naive checkout transaction is impossible: update inventory, charge the card, create tickets, send confirmation, and commit. The payment provider is external, slow, and failure-prone; notifications and event streams are also external. Holding a database transaction open across those calls would block scarce inventory and still would not make the provider roll back if our database commit failed.
 
-The better design is a saga with explicit state and idempotency. First, checkout validates that the hold belongs to the user, has not expired according to database time, contains the expected items, and matches the expected decimal money total. It creates an `Order` in `PENDING_PAYMENT` or returns the existing order for the same idempotency key. Then it creates a `PaymentAttempt` using the order ID as the provider idempotency key and asks for authorization. Authorization is preferred for high-value ticketing because it reserves funds before final inventory conversion; capture can happen after tickets are durably issued.
+The better design is a saga with explicit state and idempotency. First, checkout atomically validates and claims the hold, creates its unique `Order` in `PENDING_PAYMENT`, and records a payment attempt before network I/O. A retry with a different client key still finds the same order by `hold_id`. Authorization, capture, and void each use stable keys derived from the order, attempt, and operation; a new card can create a new attempt only after the previous attempt is definitively resolved. A provider may support replay with a key without offering lookup by that key, so recovery uses its documented reference/query API or safe replay window.
 
-On authorization success, the order service performs one local finalization transaction in the event home region: mark held seats `SOLD` only if they still point to the hold, mark the hold `CONVERTED`, create ticket rows, advance the order to `CONFIRMED` or `PAYMENT_AUTHORIZED`, and write outbox events. Then it captures payment if authorization and capture are separate, records the capture, and marks the order `PAID`. If the provider uses immediate charge rather than auth/capture, the same principle applies: record the provider's successful charge and finalize or compensate.
+On authorization success, one local transaction on the event shard checks the `CHECKOUT` hold's owning order, marks its seats `SOLD` (or moves GA quantity from held to sold), marks the hold `CONVERTED`, creates `PENDING_PAYMENT` ticket entitlements, advances the order to `PAYMENT_AUTHORIZED`, and writes outbox events. Capture then runs as a separate idempotent operation. Only definitive capture success atomically marks the order `PAID`, activates its entitlements, and emits the paid confirmation; pending tickets cannot be scanned or transferred. Capture timeout keeps inventory fenced and tickets pending. Definitive capture failure triggers compensation, revokes pending tickets, and releases inventory only after any authorization or charge has been resolved. Authorization has an expiry, so monitor the provider's capture deadline. Immediate-charge rails use the same recovery and compensation rules without pretending they support separate authorization.
 
 ```mermaid
 sequenceDiagram
@@ -284,22 +287,21 @@ sequenceDiagram
     participant Order as Order service
     participant Inv as Inventory store
     participant PSP as Payment provider
-    participant Ticket as Ticket service
     participant Outbox as Outbox relay
     Buyer->>Order: "POST /orders with hold and idempotency key"
-    Order->>Inv: "Validate active hold"
-    Order->>Order: "Create or load pending order"
-    Order->>PSP: "Authorize with order idempotency key"
+    Order->>Inv: "Atomically claim hold and create unique order and attempt"
+    Order->>PSP: "Authorize with stable attempt authorization key"
     PSP-->>Order: "Authorized or timeout"
-    Order->>PSP: "Lookup by key if timeout"
-    Order->>Inv: "Finalize hold to sold and write outbox"
+    Order->>PSP: "Resolve timeout by query or safe same-key retry"
+    Order->>Inv: "Commit sold seats, pending tickets, auth state and outbox"
     Inv-->>Order: "Committed"
-    Order->>Ticket: "Create tickets in finalization boundary or same store"
-    Order->>PSP: "Capture"
+    Order->>PSP: "Capture with distinct stable capture key"
+    PSP-->>Order: "Capture confirmed"
+    Order->>Inv: "Commit PAID, activate tickets and confirmation outbox"
     Outbox-->>Buyer: "Confirmation notification"
 ```
 
-Timeouts drive most edge cases. If the call to authorize times out, the service does not send a blind second charge. It asks the provider for the result by idempotency key. If the provider is unavailable, the order remains `AUTHORIZING` until a retry or webhook resolves it, while the hold remains active or is extended under an internal fence. If authorization succeeded but our finalization transaction fails transiently, we retry finalization and keep the seats unavailable. Releasing seats at this point would create the worst failure: another buyer purchases them while the first buyer has an approved charge.
+Timeouts drive most edge cases. If authorization times out, the service does not send a blind second charge. It resolves the original attempt through the provider's supported recovery path. If the provider is unavailable, the order remains `AUTHORIZING` and the hold remains `CHECKOUT`, excluded from ordinary TTL expiry. If finalization times out after approval, query the order on its home shard before retrying or compensating: the transaction may already have committed. Capture and compensation workers use guarded order states so they cannot race a release against a late successful capture.
 
 If finalization becomes permanently impossible, perhaps because an operator canceled the event inventory or a data corruption check fails, the compensation is financial first: void the authorization or refund the capture, mark the order compensated, then release or block the inventory according to policy. Compensation must be rare and audited. It is not a normal timeout path.
 
@@ -313,7 +315,7 @@ Signals worth watching: orders stuck in `AUTHORIZING`, authorized-not-finalized 
 |---|---|---|
 | Bad | Charge first, then try to mark seats sold. | A finalization failure creates paid buyers without inventory or tickets. |
 | Good | Hold seats, charge, then convert the hold. | This is directionally right but incomplete without timeout handling and idempotency. |
-| Great | Use an explicit saga with order/payment states, provider idempotency lookup, fenced holds, transactional finalization, capture, compensation, and outbox events. | This produces exactly-once business effects over at-least-once networks and external payment behavior. |
+| Great | Use pre-payment hold claiming, unique orders, operation-specific provider keys, transactional finalization, capture-gated ticket activation, compensation, and outbox events. | Safe retries depend on the provider's actual idempotency/recovery contract, with unresolved outcomes kept unavailable rather than guessed. |
 
 ## 7. Variants
 **10x scale.** If the largest sale is `50 million` interested fans for `1 million` seats, the read plane must become more edge-native: static pages, queue status, and most availability summaries served from CDN or edge workers. The write plane should still not become multi-master for the same seat. Instead, split the event into section-local inventory shards, bias the UI toward section-local choices, raise waiting-room sophistication, and reserve cross-section holds for limited cases with a coordinator. The invariant remains one authoritative owner for each seat transition.
@@ -354,7 +356,7 @@ The design is built around one invariant: a seat is sold exactly once. Browsing,
 4. If payment authorization succeeds but finalization times out, why can't we release the hold?
    <details><summary>Answer</summary>
 
-   The buyer may already have an approved charge. Releasing the hold could let another buyer purchase the same seats. The system must retry finalization under the same order or void/refund first through an audited compensation path.
+   The original order still owns the checkout claim, and the finalization transaction may already have committed. Query and resume that order rather than releasing seats behind it. Resolve an uncaptured authorization by voiding it, or an actual capture by refunding it, before compensated inventory release.
 
    </details>
 5. What problem does the transactional outbox solve?
@@ -377,3 +379,4 @@ The design is built around one invariant: a seat is sold exactly once. Browsing,
 | Cloudflare | [Building Waiting Room on Workers and Durable Objects](https://blog.cloudflare.com/building-waiting-room-on-workers-and-durable-objects/) | Details global slot allocation, encrypted queue cookies, bucketed users, and bounded edge coordination for waiting rooms. |
 | Cloudflare | [Waiting Room: Random Queueing and Custom Web/Mobile Apps](https://blog.cloudflare.com/waiting-room-random-queueing-and-custom-web-mobile-apps/) | Compares FIFO and random queueing and explains when hype launches need randomized fairness instead of arrival-order dominance. |
 | AWS | [Introducing AWS Virtual Waiting Room](https://aws.amazon.com/blogs/compute/introducing-aws-virtual-waiting-room/) | Reference implementation for signed time-limited admission tokens, authorizers, burst buffering, and protected API integration. |
+| Stripe | [Place a hold on a payment method](https://docs.stripe.com/payments/place-a-hold-on-a-payment-method) | Defines authorization expiry and capture semantics for the checkout saga. |

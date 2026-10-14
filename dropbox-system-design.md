@@ -36,7 +36,7 @@ Assume an average file is `5 MB`. Upload ingress is `20M × 20 × 5 MB = 2,000,0
 
 Downloads are larger. If each daily active user downloads or syncs `100` files, that is `20M × 100 × 5 MB = 10 PB/day`, about `116 GB/s` average before CDN and local-cache hits. Immutable content-addressed chunks make CDN caching simple because a new version has new chunk hashes rather than invalidating an old key.
 
-Storage dominates everything. If `100M` users each store `10 GB`, logical storage is `1 EB`. With fixed `4 MB` chunks, `1 EB / 4 MB = 268,435,456,000` logical chunks, about `268B` chunk references before versions and deduplication. A transactional metadata database cannot store hot per-chunk placement details for every read path in one row per request; it needs compact manifests, cold manifest storage, batching, and a storage layer that groups chunks into larger extents for erasure coding and compaction.
+Storage dominates everything. If `100M` users each store `10 GB`, logical storage is `1 EB`. Using decimal units consistently, fixed `4 MB` chunks give `1 EB / 4 MB = 250,000,000,000`, about `250B` full-chunk equivalents before partial final chunks, versions, and deduplication. A transactional metadata database cannot store hot per-chunk placement details for every read path in one row per request; it needs compact manifests, cold manifest storage, batching, and a storage layer that groups chunks into larger extents for erasure coding and compaction.
 
 > **Key idea.** The numbers say the architecture is not a generic CRUD app with file blobs attached. File bytes need a direct, content-addressed data plane, while metadata commits and sync ordering need a strongly consistent control plane sharded by namespace.
 
@@ -58,13 +58,13 @@ POST   /v1/uploads/{upload_id}/chunks
        returns: {missing_chunks: [{index, upload_url, expires_at}]}
 
 POST   /v1/uploads/{upload_id}/commit
-       body: {node_id?, parent_node_id?, name, base_version_id?, chunks: [{index, hash}], idempotency_key}
+       body: {node_id?, parent_node_id?, name?, base_revision?, base_version_id?, chunks: [{index, hash}], idempotency_key}
 
 GET    /v1/nodes/{node_id}/download?version_id={version_id}
        returns: {manifest_id, chunks: [{index, hash, download_url, expires_at}], file_hash}
 
 PATCH  /v1/nodes/{node_id}
-       body: {base_revision, parent_node_id?, name?, deleted?}
+       body: {base_revision, parent_node_id?, name?, deleted?, idempotency_key}
 
 GET    /v1/namespaces/{namespace_id}/changes?cursor={cursor}&limit={limit}
        returns: {changes[], next_cursor, has_more}
@@ -80,7 +80,7 @@ The upload API deliberately has two phases. Registering chunks is not a file-sys
 
 Downloads return manifests rather than forcing the metadata service to stream bytes. The service checks current permissions, chooses storage replicas or CDN URLs, and issues short-lived signed URLs scoped to specific chunk keys and HTTP methods. For highly sensitive folders, the service can proxy through an authorization gateway, but the default path should keep large bodies away from application servers.
 
-The changes API uses cursors, not offsets. An offset assumes a stable list, but a sync journal is compacted and partitioned. A cursor represents the last durable namespace sequence applied by that client. Push notifications are only hints: a device receiving `namespace X changed` still calls `/changes` and advances its cursor only after applying changes locally. If the cursor is too old, the server returns `CURSOR_EXPIRED`, and the client performs a snapshot reconciliation.
+The changes API uses cursors, not offsets. An offset assumes a stable list, but a sync journal is compacted and partitioned. A cursor represents the last durable namespace sequence applied by that client. Push notifications are only hints: a device receiving `namespace X changed` still calls `/changes` and advances its cursor only after applying changes locally. If the cursor is too old, the server returns `CURSOR_EXPIRED`, and the client reconciles a consistent namespace snapshot at sequence `S`, then replays changes after `S`. The server retains that tail during snapshot transfer; a moving tree scan followed by a newly sampled cursor could otherwise skip concurrent edits.
 
 Mutation APIs include both idempotency keys and base versions. Idempotency handles transport uncertainty; base versions handle semantic uncertainty. If a client edited `V10` and the server current version is `V11`, replaying the request safely is not enough. The server must either reject the commit with a conflict response or commit it as a separate conflicted file.
 
@@ -119,7 +119,12 @@ ManifestChunk
 
 ChunkIndex
 - chunk_hash, tenant_id, physical_extent_id, size_bytes, checksum, encryption_metadata
-- refcount_estimate, quarantine_until, state: PRESENT | QUARANTINED | DELETING
+- generation, liveness_revision, refcount_estimate, quarantine_until
+- state: PRESENT | QUARANTINED | DELETING
+
+ChunkPin
+- tenant_id, chunk_hash, generation, commit_intent_id
+- retained until abort is fenced or a committed reference is covered by a completed GC mark
 
 Permission
 - resource_id, principal_id, role: OWNER | EDITOR | VIEWER, inherited_from
@@ -221,7 +226,9 @@ Each chunk is named by a hash such as `sha256(bytes)`. The client sends the mani
 
 The coordinator returns signed URLs for missing chunks. The storage layer verifies checksums while accepting bytes; a client-provided hash is only a claim. The chunk becomes `PRESENT` only after the storage system has enough durable replicas or erasure-coded fragments for the service's write policy. At exabyte scale, chunks should not each be an independent placement unit forever. The storage layer groups immutable chunks into larger extents or volumes for repair, erasure coding, and compaction.
 
-The commit is the semantic boundary. It runs as a metadata transaction: load the idempotency record, validate the request hash if the key was seen before, verify all chunk hashes are `PRESENT`, create a manifest and `FileVersion`, update the node with `WHERE current_version_id = :base_version_id`, append the next namespace `ChangeEvent`, update quota, and store the idempotency result. If the response is lost, the retry finds the same idempotency record and returns the same `version_id`. If another client already committed a newer current version, the compare-and-swap updates zero rows. The service can return `409 CONFLICT` with both versions or create `report (Alice's conflicted copy).pdf` as a new node, but it must not silently advance the original node over someone else's edit.
+The commit is the semantic boundary. Before entering the metadata transaction, it durably pins the verified chunk generations against GC under a commit-intent ID; a presence check alone has a check-to-delete race. The transaction loads the idempotency record, validates the request hash if the key was seen before, checks the still-active intent, creates a manifest and `FileVersion`, updates the node with `WHERE current_version_id = :base_version_id AND deleted_at IS NULL`, appends the next namespace `ChangeEvent`, updates quota, and stores the idempotency result. Current permission, a live parent, and destination-name uniqueness are validated in that same serialization boundary with deletes, moves, and ACL changes. If the response is lost, the retry finds the same idempotency record and returns the same `version_id`. If another client already committed a newer version or deleted the node, the update fails. The service can return `409 CONFLICT` or create a conflicted copy under an authorized live parent, but it must not silently overwrite another edit or resurrect a deleted node.
+
+For an existing node, a content-only commit preserves its current parent and name. A request that also moves or renames it must supply `base_revision` and conditionally match `Node.revision`; `base_version_id` alone does not detect a concurrent rename. New nodes require parent and name. A retry of an already successful commit resolves idempotency before reacquiring chunks, since later retention or deletion must not turn that retry into a new mutation.
 
 ```mermaid
 sequenceDiagram
@@ -236,8 +243,8 @@ sequenceDiagram
     C->>S: PUT missing chunks with checksums
     S-->>C: Chunk durable
     C->>M: Commit manifest with base_version_id
-    M->>S: Verify chunks are PRESENT
-    M->>D: Transaction: CAS node, create version, append event
+    M->>S: Verify and durably pin chunk generations
+    M->>D: Transaction: validate intent and auth, CAS live node, append version and event
     D-->>M: Committed version_id and sequence
     M-->>C: Success or cached idempotent result
 ```
@@ -303,7 +310,7 @@ Signals worth watching: end-to-end commit-to-visibility latency, cursor expirati
 **Question.** A user deletes a folder, the recovery window expires, and a GC worker sees chunk `H` with refcount zero. Is it safe to delete `H` immediately?
 <details><summary>Answer</summary>
 
-No. Reference counts are hints that can drift. The worker should quarantine the chunk, run mark-and-sweep from authoritative live versions and manifests, account for in-progress commits and replication lag, and only then let the storage tier delete or compact physical extents.
+No. Reference counts are hints that can drift. The worker should quarantine the chunk, run mark-and-sweep from authoritative roots, and fence deletion against concurrent commit pins. A delay and a second liveness check alone do not prevent a new reference immediately after that check.
 
 </details>
 
@@ -311,9 +318,9 @@ The naive storage lifecycle is seductive: increment a chunk refcount on commit, 
 
 The storage tier should treat chunks as immutable content-addressed blobs grouped into larger physical extents. Replication is simple conceptually but expensive at this scale. Erasure coding reduces overhead by storing data and parity fragments across failure domains. For example, a `10+4` code stores `10` data fragments and `4` parity fragments, so storage overhead is `14 / 10 = 1.4×` before metadata, repair slack, and multi-region copies. That is far cheaper than `3×` replication for cold data, but reads and repairs are more complex. Hot chunks may still use replication or cache copies at edges for latency, then migrate to erasure-coded extents when cold.
 
-Garbage collection should follow the metadata lifecycle. A delete first tombstones nodes and versions so users can restore within the retention window. When a version expires, the system marks its manifest references as candidates for dereference. Candidate chunks enter `QUARANTINED` with a future timestamp rather than immediate deletion. During quarantine, any new commit can still reference the chunk by hash and move it back to `PRESENT` if policy permits.
+Garbage collection should follow the metadata lifecycle. A delete first tombstones nodes and versions so users can restore within the retention window. When a version expires, the system marks its manifest references as candidates for dereference. Candidate chunks enter `QUARANTINED` with a future timestamp rather than immediate deletion. During quarantine, a commit may atomically acquire a pin on the current chunk generation and move it back to `PRESENT`. Acquiring a pin and transitioning to `DELETING` serialize in the same chunk-liveness registry; once deletion wins, a new commit must wait for a verified replacement generation instead of referencing the old one.
 
-The authoritative safety pass is mark-and-sweep. Mark starts from live namespaces, non-expired versions, restore windows, legal holds, and in-progress upload sessions that have reached commit eligibility. It marks all manifests and chunks reachable from those roots. Sweep can delete only chunks that are unmarked, past quarantine, and not required by storage repair or region replication. Refcount estimates remain useful for prioritization, but they are not proof.
+The authoritative safety pass is mark-and-sweep. Mark starts from a consistent view of live namespaces, non-expired versions, restore windows, legal holds, and commit intents. Sweep can delete only generations that are unmarked, past quarantine, unpinned, and not required by storage repair or region replication. Every new reference, including restore, acquires a durable pin before metadata commit. Pins remain until a completed mark covers the committed reference, or a metadata transaction has definitively aborted the intent so a delayed commit cannot succeed. Pin changes increment `liveness_revision`; sweep conditionally checks the revision captured before its mark, so an old sweep cannot act after a pin was acquired and later released. A crashed or uncertain intent is retained for reconciliation, not expired on a timer. Thus references created after the mark snapshot remain protected during sweep. This pin protocol is a proposal for this design, not a claim about Dropbox's implementation.
 
 Compaction is separate from logical liveness. Dropbox's Magic Pocket compaction write-up makes this concrete: immutable blobs remain inside closed volumes after delete. If an extent contains `70%` dead chunks and `30%` live chunks, deleting dead entries may not release a disk allocation. Compaction copies live chunks into new extents, verifies checksums, atomically updates physical placement indexes, waits through a safety window, and then frees the old extent. This creates write amplification, so the system should compact only when reclaimed space justifies the extra IO and repair risk.
 
@@ -330,7 +337,7 @@ sequenceDiagram
     G->>S: Quarantine unmarked chunks
     S-->>G: Quarantine durable
     G->>M: Recheck roots after safety delay
-    G->>S: Authorize deletion of still-unmarked chunks
+    G->>S: CAS unchanged liveness revision, unmarked and unpinned, to DELETING
     S->>C: Extents with high dead-byte ratio
     C->>S: Copy live chunks, verify, then free old extent
 ```
@@ -400,7 +407,7 @@ The design follows from one constraint: huge immutable bytes and small mutable m
 5. Why not delete chunks immediately when reference counts reach zero?
    <details><summary>Answer</summary>
 
-   Reference counts can drift after crashes, delayed commits, restore races, and replication lag. Safe reclamation quarantines candidates, marks live data from authoritative metadata roots, rechecks after a safety delay, and then compacts physical extents if needed.
+   Reference counts can drift after crashes, delayed commits, restore races, and replication lag. Safe reclamation quarantines candidates, marks authoritative roots, and atomically fences deletion against durable commit pins before reclaiming physical extents. A safety delay alone cannot close the race with a new reference.
 
    </details>
 

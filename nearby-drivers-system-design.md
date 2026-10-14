@@ -51,7 +51,7 @@ Trip creation uses a rider-scoped idempotency key and returns the existing trip 
 
 ```http
 POST /v1/drivers/me/locations
-{ "lat": 37.78, "lng": -122.41, "observed_at": "2026-10-14T02:16:05Z", "sequence": 8841, "accuracy_m": 8 }
+{ "lat": 37.78, "lng": -122.41, "observed_at": "2026-10-14T02:16:05Z", "session_epoch": 27, "sequence": 8841, "accuracy_m": 8 }
 
 POST /v1/drivers/me/availability
 { "status": "AVAILABLE", "idempotency_key": "drv-2026-10-14-shift-7" }
@@ -73,9 +73,11 @@ POST /v1/trips/{trip_id}/cancel
 { "idempotency_key": "rider-abc-cancel-3", "expected_version": 12 }
 ```
 
-The location endpoint is intentionally not a durable command API. It accepts duplicates, rejects impossible coordinates, and returns success once the gateway has handed a valid update to the regional ingestion path. A mobile client may also use a streaming channel for locations, but the semantics are the same: newer per-driver sequence numbers replace older ones in the serving index.
+The location endpoint is intentionally not a durable command API. It accepts duplicates, rejects impossible coordinates, and returns success once the gateway has handed a valid update to the regional ingestion path. A mobile client may also use a streaming channel for locations. A server-issued session epoch fences old connections; within the current epoch only a newer sequence can replace the point. Sequence reset after an app restart requires a new epoch, not an arbitrarily larger client number.
 
 Nearby display is a read API over soft state. It should return anonymous vehicle tokens, jittered positions, coarse headings, or density summaries, not driver IDs. Caching it for a few seconds is acceptable because it is not a promise that a displayed car can be assigned. Dispatch never says, "the rider saw driver D, therefore D is available." It creates a trip, searches fresh candidates, and checks authoritative driver state before offering.
+
+Independent random jitter is not a privacy guarantee: repeated queries can average it away and link a moving trace even without a driver ID. Use cohort/time-bucketed synthetic display points or thresholded density, suppress sparse cells, rotate unlinkable tokens, and limit repeated spatial queries. Exact coordinates are available only to authorized operational callers and, under the tracking policy, the assigned rider; display caches cannot bypass those rules.
 
 Trip creation is idempotent because riders retry when mobile networks fail. The server stores `(rider_id, idempotency_key)` with the trip request and returns the existing `trip_id` if the same key appears again. Cancellation is versioned because it races with assignment. A cancellation that arrives after `DRIVER_ASSIGNED` may still succeed depending on product rules, but it is a state transition against a known version, not a blind deletion.
 
@@ -83,9 +85,11 @@ Offers use push for latency and pull for recovery. The driver app receives an of
 
 ## 4. Data model
 
-Start with the obvious entity: `DriverLocation(driver_id, lat, lng, observed_at)`. That is enough to draw a dot, but it fails as soon as the mobile network reorders packets. A driver can go through a tunnel, reconnect, and upload an older point after a newer one. The location record therefore needs a per-driver `sequence_number`, `received_at`, `accuracy_m`, and a computed `cell_id`. The index accepts only updates newer than the stored sequence and expires entries by server receive time so a device with a bad clock cannot keep itself visible forever.
+Start with the obvious entity: `DriverLocation(driver_id, lat, lng, observed_at)`. That is enough to draw a dot, but it fails as soon as the mobile network reorders packets or the app resets its counter. The record needs a server-issued `session_epoch`, per-session `sequence_number`, original gateway `received_at`, `accuracy_m`, and `cell_id`. Replays and consumer processing must not reset receive time or refresh a duplicate's TTL. Server receive time bounds pipeline age, not the age of a GPS fix buffered on the device; dispatch also needs a validated observation-age bound or a newly sampled point after a server challenge.
 
 Next, add `DriverState`. Location alone cannot tell whether the driver is offline, available, considering an offer, already assigned, or on a trip. If availability were stored only inside the geo index, an index rebuild could resurrect a busy driver as available. `DriverState` is authoritative and versioned. It has `availability`, `active_trip_id`, `state_version`, `lease_expires_at`, product capabilities, and a home market. The geo index may cache a projection of availability for fast filtering, but dispatch rechecks the source of truth.
+
+An availability command and a presence timeout must use this state machine too. They cannot overwrite `ASSIGNED` or `ON_TRIP` with `AVAILABLE`, clear `active_trip_id`, or release a trip merely because GPS stopped. Only an authorized trip-completion/cancellation transition releases that ownership. Market changes transfer the same global driver authority; creating an independent driver row in a neighboring city would bypass the one-trip invariant.
 
 A `RideRequest` starts as pickup, destination, product, rider, and status. That is insufficient because creation retries can duplicate demand. We add a rider-scoped `idempotency_key` and a `version`. The request evolves into a trip state machine: `REQUESTED`, `SEARCHING`, `DRIVER_ASSIGNED`, `DRIVER_ARRIVING`, `IN_PROGRESS`, `COMPLETED`, or `CANCELLED`. Every command includes an expected version or is explicitly idempotent.
 
@@ -108,7 +112,7 @@ DriverLocation
 - driver_id
 - latitude, longitude, heading, speed, accuracy_m
 - observed_at, received_at
-- sequence_number
+- session_epoch, sequence_number
 - cell_id
 
 RideRequest / Trip
@@ -119,7 +123,7 @@ RideRequest / Trip
 - product_type
 - status
 - assigned_driver_id nullable
-- dispatch_epoch
+- dispatch_epoch, dispatch_lease_expires_at
 - version
 - created_at, updated_at
 
@@ -182,7 +186,7 @@ This is where straight-line distance reaches its limit. Grab's Pharos describes 
 
 ### Fix 4: Fence dispatch ownership and make acceptance atomic
 
-A dispatch worker owns a trip search only under a lease and epoch. It records offer attempts and sends a token to the selected driver. The accept endpoint executes a transaction or linearizable compare-and-swap: verify the offer token and expiry, verify the trip is still searching or offered in the same epoch, verify the driver is still `OFFERED` for that trip or otherwise claimable under the exact state version, then update driver, trip, active assignment index, attempt result, and outbox event together.
+A dispatch worker owns a trip search only under a lease and epoch. It transactionally records the offer and driver hold before sending the token through an outbox. Acceptance uses a multi-record transaction or an equivalent single-authority state-machine command: verify token, expiry, matching offer/trip IDs and epoch, a still-`SEARCHING` trip, and the driver still `OFFERED` for that exact offer/version; then update driver, trip, active assignment index, attempt result, and outbox together. Independent per-row compare-and-swaps are not that transaction.
 
 Uber's fulfillment rearchitecture is relevant here because fulfillment state is not just a stream of messages; it needs transactions, state models, and secondary indexes. A stream can notify, recover, and audit, but it cannot be the only mechanism enforcing "one driver, one trip" unless all conflicting commands are serialized through the same authoritative partition.
 
@@ -228,7 +232,7 @@ Because the dominant write path is high-volume soft state. A database geospatial
 
 The index exists to answer two different questions cheaply: "what should the rider roughly see nearby?" and "which drivers are plausible dispatch candidates?" Neither question requires permanent storage of every point. If a location update is dropped, the next update arrives in a few seconds. If a driver disappears, a TTL removes the entry. If a geo shard fails, it can rebuild from a recent snapshot plus the location stream. These properties make memory a feature, not a shortcut.
 
-A hierarchical cell index is usually the first practical design. On ingest, compute a cell ID for the point at a resolution appropriate for dispatch in that market. Store a per-cell map from `driver_id` to a compact latest record: coordinates, heading, speed, accuracy, observed time, received time, sequence number, and an availability projection. Also store a per-driver reverse pointer to the previous cell. When a newer update crosses a cell boundary, the shard removes the driver from the old cell and upserts into the new one. When updates arrive out of order, the shard ignores any sequence number at or below the stored sequence.
+A hierarchical cell index is usually the first practical design. A stable driver-keyed owner serializes `(session_epoch, sequence_number)` updates and retains the latest point and previous cell pointer. Geographic cell shards are asynchronous search projections, not competing update owners. A cell crossing sends versioned additions and removals, potentially to different shards; a removal applies only to the matching old membership generation so a delayed delete cannot erase a later return to that cell. Queries deduplicate IDs and resolve finalists against the driver's latest owner record. Temporary duplicate memberships or misses are acceptable soft-state effects, but an old cell row cannot supply a fresh dispatch location. Owner handoff fences the old writer and transfers session/sequence high-water state; rebuilds preserve original timestamps rather than making snapshots fresh again.
 
 H3, S2, and quadtrees are not interchangeable slogans; they optimize different operations. H3 gives hexagonal cells and convenient k-ring expansion, which keeps neighbor rings more uniform and makes rollups useful for marketplace balance. S2 maps the sphere to hierarchical cells with strong library support and range-friendly IDs. A quadtree can split hot rectangular regions dynamically and is easy to reason about for storage ranges, but square cells create less uniform neighbor distances and awkward behavior near diagonals. Any of them can work if the design includes adaptive resolution, bounded fan-out, and clear ownership. The bad design is pretending the cell library itself solves dispatch.
 
@@ -236,17 +240,17 @@ Cell proximity is not road proximity. A driver across a river may be in the firs
 
 Hot cells need special handling. Imagine a cell near a stadium with `20,000` available drivers and many riders refreshing the map. If every query copies the full set, p99 latency collapses. The cell can maintain small randomized samples for display, separate candidate heaps by product type, and child-cell summaries. Dispatch queries should request up to a budget per ring, for example "return the best 500 fresh compatible IDs by cheap score," not "return every driver." If a cell is consistently hot, split it to a finer resolution for serving while keeping coarse rollups for supply-demand metrics. If reads are hot but writes are manageable, replicate the cell read projection; if writes are hot, partition ownership by child cell or driver hash while preserving one update owner per driver.
 
-Staleness policy must be explicit. The index should expire by `received_at` after, say, `10-20` seconds for dispatch candidates, because the server knows when it last heard from the device. `observed_at` is still useful for ranking, but client clocks lie. Accuracy also matters: a point with `accuracy_m = 200` should not be treated like a curbside pickup. The dispatch filter can keep it for sparse areas with lower confidence, but the ranker should penalize it.
+Staleness policy must be explicit. Require both original gateway receive age and validated GPS observation age to be below an illustrative `10-20` seconds for dispatch. Reject old buffered fixes even when they have a higher sequence; if device clock uncertainty prevents establishing age, obtain a fresh fix under a short-lived server challenge before making it eligible. Processing lag, replay, and duplicates never extend the deadline. Accuracy also matters: a point with `accuracy_m = 200` should not be treated like a curbside pickup. Sparse markets may accept it with lower confidence, but not invent freshness.
 
 Uber's Ringpop lesson fits exactly at this layer: cooperative in-memory workers can hold and route ephemeral geospatial state at high update rates. Uber's H3 lesson also fits here: hierarchy is useful both for search and for rollups such as hot-cell detection and marketplace balance. The production-grade answer is to combine them while drawing a hard line before assignment truth.
 
 ```mermaid
 flowchart TD
-    U["Driver update"] --> S["Sequence check"]
+    U["Driver update"] --> S["Session, sequence, and observation-age check"]
     S -->|"older or duplicate"| DROP["Ignore"]
     S -->|"newer"| C["Compute cell"]
-    C --> M["Move from old cell to new cell"]
-    M --> T["Set TTL by received time"]
+    C --> M["Versioned cell projections from driver owner"]
+    M --> T["TTL from original receive and observation time"]
     T --> Q["Searchable candidate"]
     Q --> E["Expired if heartbeat missing"]
 ```
@@ -309,22 +313,24 @@ Signals worth watching: ETA latency, ETA error after actual pickup, candidate co
 **Question.** Two riders request at the same time. The same driver receives two offers due to stale geo projections or worker failover and taps accept on one while the other is timing out. What exact state transition prevents double assignment?
 <details><summary>Answer</summary>
 
-The accept endpoint performs an atomic conditional transition in the strong store: the offer is pending and unexpired, the dispatch epoch matches, the trip is still claimable, and the driver state version is still `OFFERED` for that offer or otherwise exactly available for that claim. The transaction updates driver, trip, attempt, active assignment index, and outbox together; only one acceptance can commit.
+The accept endpoint performs an atomic conditional transition in the strong store: the offer is pending and unexpired, the dispatch epoch matches, the trip is still searching, and the driver is still `OFFERED` for that exact offer and state version. The transaction updates driver, trip, attempt, active assignment index, and outbox together; only one acceptance can commit.
 
 </details>
 
-Dispatch begins with a trip lease. A worker claims `Trip(status=SEARCHING, dispatch_epoch=e)` for a short period. The epoch fences old workers: if a worker pauses for garbage collection or loses network and later resumes, its writes include an old epoch and are rejected. The worker searches candidates and tries to move a chosen driver from `AVAILABLE` to `OFFERED(trip_id, offer_id)` with a versioned conditional update. In a strict serial-offer design, this prevents the same driver from being offered to multiple trips. In a looser design, the system may allow multiple pending offers in rare cases, but acceptance still must atomically claim the driver.
+Dispatch begins with a trip lease. A worker claims `Trip(status=SEARCHING, dispatch_epoch=e)` for a short period; every orchestration mutation checks both the epoch and the unexpired lease in the authority. This design allows one outstanding offer per driver, although a trip may offer to a small batch of different drivers. One transaction verifies the searching trip and worker lease, changes a chosen driver from `AVAILABLE` to `OFFERED`, inserts `DispatchAttempt(PENDING)`, and creates the offer-delivery outbox event. Separate writes could strand a driver after a crash or send an offer after cancellation. A new owner cancels/releases old-epoch offers conditionally before issuing replacements. Supporting several simultaneous offers to one driver would require a different model than the single `current_offer_id` used here.
 
 The key is that push delivery is not state ownership. Sending an offer to a device only creates an opportunity for a command. The driver may never see it, may see it after timeout, may tap twice, or may reconnect through another gateway. Therefore `OfferService` records `DispatchAttempt(PENDING, expires_at, offer_token_hash)` and sends an opaque token. The token is validated at accept time, but token validity alone is not enough. A stolen or duplicated token cannot override the current driver and trip state.
 
-The acceptance transaction can be expressed as conditional logic:
+The authenticated accepting driver must match the attempt's driver, and the attempt must reference this trip. If the offer already committed as `ACCEPTED`, a retry returns that recorded outcome and current trip state before testing the old expected driver version; otherwise a lost response would falsely look like a failed assignment. The acceptance transaction locks or conditionally updates all participating records, using authoritative server time for the unexpired predicate at the serialized decision point:
 
 ```text
 IF Offer.offer_id = ?
 AND Offer.result = PENDING
 AND Offer.expires_at > now()
 AND Offer.dispatch_epoch = Trip.dispatch_epoch
-AND Trip.status IN (SEARCHING, OFFERED)
+AND Offer.trip_id = Trip.trip_id
+AND Trip.status = SEARCHING
+AND authenticated_driver_id = Offer.candidate_driver_id
 AND Driver.driver_id = Offer.candidate_driver_id
 AND Driver.state_version = expected_version
 AND Driver.availability = OFFERED
@@ -356,11 +362,14 @@ sequenceDiagram
     participant O as Offer service
     participant S as Strong store
     participant T as Trip service
-    O->>S: create DispatchAttempt PENDING
+    O->>S: transaction creates PENDING attempt, driver hold, offer outbox
     O-->>D: push offer token
     D->>T: accept offer token and expected driver version
     T->>S: transaction verifies offer, trip, driver, epoch
-    alt commit wins
+    alt same offer already accepted
+        S-->>T: recorded acceptance and current trip state
+        T-->>D: 200 recorded outcome
+    else commit wins
         S-->>T: committed assigned state and outbox event
         T-->>D: 200 DRIVER_ASSIGNED
     else another transition won
@@ -383,7 +392,7 @@ Signals worth watching: assignment CAS conflict rate, offers accepted after expi
 
 **10x scale.** If online drivers and update rates grow by `10x`, the location stream becomes the first bottleneck, not the assignment store. The design would add more regional ingestion partitions, stronger on-device adaptive sampling, per-driver update coalescing at gateways, and more aggressive cell-level display summaries. The assignment transaction remains narrow because trip requests do not grow at the same multiplier as location pings, and each trip still needs only one winning driver.
 
-**Active-active regions.** Most cities should have a home region because dispatch is local and latency-sensitive. A paired region can receive replicated trip logs and driver snapshots asynchronously. During failover, the system must fence the old dispatch epoch before the secondary accepts new assignments. It is better to pause matching in an uncertain city for seconds than to let two regions assign the same driver. Location ingestion can resume from clients quickly, but driver assignment truth needs explicit ownership transfer.
+**Active-active regions.** Most cities should have a home region because dispatch is local and latency-sensitive. A paired region can receive asynchronous location snapshots, but an asynchronous trip replica may be missing an acknowledged assignment. Fencing the old owner alone does not recover that assignment. Resume new assignments only after recovering every committed driver/trip transition from a surviving quorum or synchronous durable replica; otherwise keep affected drivers unavailable until reconciled. Location ingestion can resume quickly, but driver assignment truth requires both fencing and no loss of committed ownership.
 
 **Large event surge.** A stadium release creates adjacent hot cells, synchronized rider requests, and unreliable cellular networks. The geo index should split cells or use precomputed samples, nearby display should degrade to density or fewer vehicles, dispatch should cap candidate budgets per ring, and offer rounds may batch slightly more aggressively. Strong assignment semantics do not change; the system sheds visualization precision and search breadth before it weakens correctness.
 
