@@ -1,6 +1,6 @@
 # Curated Engineering Blogs
 
-Official engineering blog posts and papers from companies that run these systems in production, curated per design. Each design doc folds these lessons into a `Lessons from production systems` section and lists the sources under `Further reading: curated engineering blogs`.
+Official engineering blog posts and papers from companies that run these systems in production, curated per design. Each design weaves these lessons into its fixes and deep dives and lists the sources under `Sources and further reading`.
 
 ## Collaboration and storage
 

@@ -1,545 +1,387 @@
-# Google Docs-like Collaborative Editor
+# Google Docs Collaborative Editor System Design
+
+A Google Docs-like editor lets many people edit the same rich document, see one another's changes quickly, work through brief disconnections, and recover a complete attributed history. This design focuses on text and structured document collaboration: rich text, lists, comments, suggestions, sharing, autosave, offline edits, and revision history are in scope; spreadsheets, video calls, and desktop-publishing layout are not.
 
 ## 1. Requirements
+### 1.1 Functional requirements
+- Create, open, rename, move, copy, trash, restore, and delete documents.
+- Edit rich text concurrently from web and mobile clients with immediate local echo.
+- Show collaborator presence, cursors, selections, and names in near real time.
+- Preserve attributed revision history and support named versions and restore.
+- Support comments, replies, suggestions, mentions, and resolved threads anchored to document content.
+- Share documents with users, groups, domains, and links using viewer, commenter, and editor roles, including offline edit replay after reconnect.
 
-### Functional requirements
+### 1.2 Non-functional requirements
+- **Convergence.** Every authorized collaborator must eventually see the same document state, even when edits arrive in different orders at different clients.
+- **Low edit latency.** A keystroke must render locally immediately and should become visible to healthy in-region collaborators within about 200 ms; otherwise the editor feels broken.
+- **Durability.** Once an edit is acknowledged, it must survive process crashes, leader failover, and retries.
+- **Bounded failover.** Editing may briefly pause during failover, but the system must not fork one document into two accepted histories.
+- **Permission safety.** ACL revocation must quickly stop new edits and exports from revoked users, while preserving already committed history.
+- **Replayable history.** The system must reconstruct a document, anchors, suggestions, and audit trail from snapshots plus operations without trusting volatile memory.
 
-1. Create, rename, move, copy, and delete documents.
-2. Edit a document concurrently from web and mobile clients.
-3. Show collaborator presence, cursors, selections, and names in near real time.
-4. Preserve a complete, attributable revision history and support restore.
-5. Support comments, replies, suggestions, mentions, and resolved threads.
-6. Share with users, groups, domains, or links using viewer, commenter, and editor roles.
-7. Work offline and merge queued edits after reconnection.
-8. Autosave without an explicit save action.
-9. Export and import common formats.
-10. Search document titles and permitted content.
+### 1.3 The binding constraint
+The binding constraint is not storing documents; it is accepting concurrent edits to the same document while every collaborator converges, sees local echo, and can come back from offline work. A naive database row update cannot express two users typing at the same position from different base revisions. If the server accepts both without a canonical order, clients can render different documents. If the server waits for each keystroke before rendering, the editor feels unusable.
 
-### Non-functional requirements
+The architecture is therefore shaped by one idea: each document needs one authoritative, durable operation sequence, while clients are allowed to speculate locally. That forces operational transformation or CRDT-style merge rules, per-document routing to a live session owner, a write-ahead journal with fencing for failover, and a reconnect protocol that rebases offline edits against the canonical log while rechecking permissions.
 
-- Local keystrokes should render immediately.
-- Remote edits should normally appear within 200 ms in-region and 500 ms globally.
-- No acknowledged edit may be lost.
-- All replicas must converge to the same document.
-- Document reads should be highly available; editing may briefly pause rather than fork during failover.
-- Permission changes, especially revocation, require strong consistency.
-- Support millions of simultaneously open documents and hundreds of active editors on a hot document.
-- Encrypt traffic and stored content, and retain auditable edit attribution.
+## 2. Back-of-the-envelope estimation
+Assume these numbers are illustrative, not claims about a particular company. Suppose there are 100 million daily active users, and 10% have an editor tab or mobile session connected during peak. That gives `100M × 0.10 = 10M` concurrent collaboration sessions. If those sessions are spread over 2 million active documents, the mean is `10M / 2M = 5` connected sessions per active document, but the mean hides the real problem: a company all-hands doc or classroom worksheet can have hundreds of viewers and editors on one document.
 
-Rich text, tables, lists, images, comments, and suggestions are in scope. General-purpose spreadsheets, video calls, and full desktop publishing are not.
+Typing traffic is modest per person and enormous in aggregate. If an active editor emits 2 logical operations per second after client-side keystroke coalescing, peak write ingress is `10M × 2 = 20M` edit operations per second. With five collaborators per document, the sender already has the edit locally, so each operation fans out to roughly `5 - 1 = 4` peers on average, or `20M × 4 = 80M` remote edit frames per second before presence. Presence and cursor events can exceed edit events, but they are lossy and should not share the durable edit path.
 
-## 2. Scale assumptions
+Storage is driven by the operation log more than the latest document body. If the average persisted operation, including actor, revision, IDs, and payload, is 300 bytes, daily raw edit log volume is `20M × 300 × 86,400 = 518,400,000,000,000` bytes, about 518 TB/day. Triple replication makes the sustained replicated write volume about `518 TB × 3 / 86,400 ≈ 18 GB/s`. This number implies append-only partitioned logs, snapshots, and compaction; it rules out treating every keystroke as a heavyweight relational transaction with secondary indexes updated synchronously.
 
-State assumptions explicitly:
+Open latency is driven by replay length. If a document snapshot is 50 KB and the retained tail since the snapshot is 2,000 operations at 300 bytes each, open must fetch about `50 KB + 600 KB = 650 KB` before compression. That is fine for normal documents, but a hot document at 500 editors and 2 ops/sec can produce `500 × 2 = 1,000` ops/sec; a 2,000-operation replay window is only two seconds. Hot documents therefore need more frequent incremental snapshots or catch-up from an in-memory session owner.
 
-- 500 million registered users and 100 million daily active users.
-- 10 million concurrently connected editing sessions at peak.
-- 2 million documents actively edited at peak.
-- Average document: 50 KB structured content; p99: 10 MB.
-- Average active editor: 2 operations/second while typing.
-- Average 5 active editors per open document; hot documents may have 500.
-- 10 billion stored documents and 500 TB/day of new operation-log data before compaction.
-- Read-to-write ratio for document metadata: about 5:1.
+> **Key idea.** The math says the hard path is a tiny but strictly ordered per-document write stream with large fan-out. Durable edits, lossy presence, search indexing, and export generation must be separated so cursor storms and slow consumers cannot delay acknowledged edits.
 
-Peak collaboration traffic:
+## 3. API design
+**Question.** What makes a retry safe when the client showed the keystroke locally but lost the acknowledgement?
+<details><summary>Answer</summary>
 
-```text
-10M active editing sessions x 2 operations/second
-= 20M edit operations/second
+The client gives every edit a stable `operation_id` and monotonically increasing `client_sequence`. The document owner deduplicates by `(document_id, client_id, client_sequence)` and returns the original committed revision if the retry already succeeded. The client can retry until it receives either a committed revision or a permanent rejection such as lost permission.
+
+</details>
+
+```http
+POST /v1/documents
+  Idempotency-Key: <uuid>
+  body: {"title":"Design notes", "parent_id":"folder-7"}
+
+GET /v1/documents/{document_id}?known_revision=418
+  -> {"snapshot_revision":400, "snapshot_url":"...", "operations_after_snapshot":[...], "current_revision":427, "acl_version":12, "collaboration_endpoint":"wss://..."}
+
+WS join
+  {"type":"join", "document_id":"doc-123", "known_revision":427, "client_id":"tab-9", "acl_version":12}
+
+WS edit
+  {"type":"edit", "operation_id":"op-uuid", "client_sequence":81, "base_revision":427, "ops":[{"kind":"insert_text", "node_id":"p-19", "offset":12, "text":"hello"}]}
+
+WS ack
+  {"type":"ack", "operation_id":"op-uuid", "committed_revision":428, "canonical_ops":[...]}
+
+WS remote_edit
+  {"type":"remote_edit", "committed_revision":428, "actor_id":"u-7", "canonical_ops":[...]}
+
+PUT /v1/documents/{document_id}/acl/{principal_id}
+  If-Match: acl_version=12
+  body: {"role":"VIEWER"}
+
+POST /v1/documents/{document_id}/restore
+  Idempotency-Key: <uuid>
+  body: {"target_revision":390}
 ```
 
-At 500 TB/day and 20M operations/second, the average persisted operation budget is about 290 bytes before replication:
+The API is split because opening a document is not the same as joining the live edit stream. The initial `GET` is a permission-checked bootstrap that returns a snapshot, the operation tail, and the collaboration endpoint. Edits then move over WebSocket because polling for every keystroke adds avoidable latency and load. Each WebSocket frame carries a short-lived session token scoped to one document, so stealing one token does not grant broad account access.
 
-```text
-500 TB/day / (20M ops/sec x 86,400 sec/day) ~= 290 bytes/op
-```
-
-With 3x log replication this is about 1.5 PB/day, or 17 GB/sec of sustained replicated write bandwidth. Average fan-out is roughly four remote recipients per operation, so peer delivery is about 80M frames/second before presence. Most operations are tiny, but connection fan-out and per-document ordering dominate. Presence events are more frequent and less durable than edits, so they need a separate path.
-
-## 3. High-level architecture
-
-```mermaid
-flowchart LR
-    C[Web / Mobile Clients]
-    EDGE[Global Edge / WebSocket Gateway]
-    API[REST API Gateway]
-    AUTH[Identity and ACL Service]
-    ROUTER[Document Session Router]
-    COLLAB[Collaboration Servers]
-    PRES[Presence Service]
-    DOC[Document Metadata Service]
-    COMMENT[Comments Service]
-    HIST[History / Snapshot Service]
-    BUS[Durable Event Stream]
-    META[(Sharded Metadata DB)]
-    OPLOG[(Partitioned Operation Log)]
-    SNAP[(Snapshot Object Store)]
-    CACHE[(Document / ACL Cache)]
-    SEARCH[(Permission-filtered Search)]
-    EXPORT[Import / Export Workers]
-
-    C <--> EDGE
-    C --> API
-    EDGE --> ROUTER --> COLLAB
-    COLLAB --> AUTH
-    COLLAB --> OPLOG
-    COLLAB --> BUS
-    COLLAB <--> PRES
-    API --> DOC --> META
-    API --> COMMENT --> META
-    DOC --> AUTH
-    DOC --> CACHE
-    BUS --> HIST --> SNAP
-    BUS --> SEARCH
-    BUS --> EXPORT
-```
-
-Separate:
-
-- **Durable collaboration plane:** ordered edits, acknowledgements, snapshots, and recovery.
-- **Ephemeral collaboration plane:** presence, cursors, and typing indicators.
-- **Control plane:** metadata, permissions, comments, sharing, and document lifecycle.
-
-Each active document has one logical leader at a time. The session router maps `document_id` to that leader and moves clients together during rebalancing.
+Versions are explicit. `known_revision` lets the server avoid resending work the client already has. `base_revision` tells the sequencer what state the user edited against. `acl_version` prevents a collaboration server from appending under a stale permission decision after revocation. ACL writes use conditional updates because two admins may race; an `If-Match` failure makes the loser refetch current permissions rather than overwrite silently. Restore is modeled as a new operation range that transforms the document toward an older version, not as mutation of history.
 
 ## 4. Data model
+Start with the obvious entity: `Document(document_id, title, owner_id, current_revision)`. That is enough to list files and open the latest version, but it cannot explain how Alice's insert at revision 427 and Bob's delete at revision 427 both become revision 428 and 429 without losing one edit. We need immutable `EditOperation` rows with a base revision, canonical committed revision, actor, client sequence, and operation payload.
+
+An operation log alone still makes opening expensive, because a long-lived document may have millions of operations. Add `Snapshot(document_id, revision, object_key, content_hash)` so open can load a normalized tree and replay only the tail. The snapshot pointer is metadata; the snapshot object is immutable. A failed snapshot build must never corrupt the document, so the system writes the object first and advances `latest_snapshot_revision` with a conditional metadata update after validation.
+
+A rich document is not an HTML blob. Comments, suggestions, lists, tables, and formatting need stable targets. The content model is an ordered tree of nodes with stable IDs, text leaves, marks, and structural operations such as `move_node`, `split_paragraph`, and `apply_style`. Stable node IDs let comment anchors survive nearby insertions. For ordered non-text collections such as block children, fractional positions can reduce write size; Figma uses fractional indexing for ordered sequences, but prose still needs text-specific OT or a sequence CRDT because arbitrary character interleavings are user-visible.
+
+Permissions look like they could live on the document row until inheritance, folders, groups, domains, and link sharing enter. Add `DocumentACL` with `acl_version`. Notion's public writeups are a useful warning here: render-order content arrays and parent pointers serve different purposes. The editable tree can move blocks around, but permission ancestry should follow a separate authoritative parent pointer so a transient collaborative move cannot create ambiguous access.
+
+Comments and suggestions are separate from body text. A comment has an anchor in terms of stable node IDs plus the revision where it was created; as edits commit, the anchor is transformed. A suggestion stores proposed operations and a terminal state. Accepting a suggestion is a conditional transition from `PENDING` to `ACCEPTED` plus a new edit operation against the current revision; rejecting changes only suggestion state.
 
 ```text
 Document
-- document_id
-- owner_id
-- title
-- home_region
-- current_revision
-- latest_snapshot_revision
+- document_id, owner_id, title, parent_id, home_region
+- current_revision, latest_snapshot_revision, acl_version
 - state: ACTIVE | TRASHED | PURGED
-- created_at
-- updated_at
+- created_at, updated_at
 
 DocumentACL
-- document_id
-- principal_id
-- role: OWNER | EDITOR | COMMENTER | VIEWER
-- inherited_from
-- granted_by
-- version
+- document_id, principal_id, role: OWNER | EDITOR | COMMENTER | VIEWER
+- inherited_from, granted_by, version, updated_at
 
 EditOperation
-- document_id
-- revision
-- operation_id
-- client_id
-- client_sequence
-- base_revision
-- operation_payload
-- actor_id
-- committed_at
+- document_id, committed_revision, operation_id
+- client_id, client_sequence, base_revision
+- canonical_payload, actor_id, acl_version_checked
+- owner_epoch, committed_at
 
 Snapshot
-- document_id
-- revision
-- object_key
-- content_hash
-- schema_version
-- created_at
+- document_id, revision, object_key, content_hash, schema_version, created_at
 
 CommentThread
-- thread_id
-- document_id
-- anchor_start
-- anchor_end
-- anchor_revision
-- state: OPEN | RESOLVED
-- created_by
-
-Comment
-- comment_id
-- thread_id
-- body
-- mentions
-- created_by
-- created_at
-- edited_at
+- thread_id, document_id, anchor, anchor_revision
+- state: OPEN | RESOLVED | DETACHED, created_by, created_at
 
 Suggestion
-- suggestion_id
-- document_id
-- operation_range
-- author_id
-- state: PENDING | ACCEPTED | REJECTED
+- suggestion_id, document_id, proposed_ops, base_revision
+- state: PENDING | ACCEPTED | REJECTED, author_id, decided_by, decided_at
 
 ClientSession
-- session_id
-- document_id
-- user_id
-- client_id
-- last_acknowledged_revision
-- connected_at
+- session_id, document_id, user_id, client_id
+- last_acknowledged_revision, connected_region, acl_version, connected_at
+
+DocumentOwnerLease
+- document_id, owner_worker_id, owner_epoch, lease_until, journal_position
 ```
 
-Document content is an ordered tree, not an HTML blob. Stable node and character identifiers make structural operations and comment anchors resilient to nearby edits.
+Metadata, ACLs, comments, and suggestion state belong in a strongly consistent sharded metadata store partitioned by a workspace or document container when those rows are commonly read and updated together. The operation log is partitioned by `document_id` so all revisions for one document remain ordered. Snapshots and attachments live in object storage behind signed URLs. Presence does not go in the transactional store; it belongs in ephemeral memory with short TTLs because losing a cursor position is acceptable and blocking edits behind presence writes is not.
 
-Operations and snapshots are immutable. Metadata points to the latest committed revision. An `operation_id` plus `(client_id, client_sequence)` provides retry deduplication.
+> **Key idea.** The data model separates the mutable pointer to the latest state from immutable evidence: operations, snapshots, comments, ACL versions, and owner epochs. That separation is what makes retries, replay, restore, and failover safe.
 
-For rich documents, keep structural parent pointers separate from render-order child arrays. The parent pointer is the authority for permissions and ancestry checks; ordered child arrays are the editable render tree. This avoids ambiguous ACL inheritance when content is moved, linked, or temporarily referenced from multiple places.
+## 5. High-level design
+The simplest design is one web server per WebSocket connection and one database row per document. The server receives a keystroke, updates the document body, writes the row, and broadcasts the new body to connected clients.
 
-## 5. Core APIs and protocols
-
-### Open a document
-
-```http
-GET /v1/documents/{document_id}?known_revision=418
+```mermaid
+flowchart LR
+    C1["Client A"] --> S["Web server"]
+    C2["Client B"] --> S
+    S --> DB[("Document row")]
+    S --> C1
+    S --> C2
 ```
 
-```json
-{
-  "document_id": "doc-123",
-  "snapshot_revision": 400,
-  "snapshot_url": "https://signed.example/...",
-  "operations_after_snapshot": [],
-  "current_revision": 427,
-  "permission": "EDITOR",
-  "collaboration_endpoint": "wss://collab.example/session"
-}
+This works for a toy editor and fails in predictable ways. Two web servers can update the same document row from different base versions and overwrite each other. Broadcasting full bodies turns a one-character edit in a 10 MB document into a bandwidth spike. A server crash between memory broadcast and database write creates clients that saw edits the log cannot replay. A database failover can let an old server continue accepting edits unless writes are fenced. Offline clients return with edits based on old revisions, not patches against the current body. ACL revocation races with in-flight edits unless the edit path checks a current permission fence.
+
+### Fix 1: Canonical per-document operation order
+Give every active document one logical session owner. All edit operations for that document go through that owner, which validates the operation, transforms it against committed operations since the client's base revision, assigns the next revision, appends the canonical operation to the durable log, and only then acknowledges and broadcasts. This mirrors the core idea described in Google Docs material: collaborative editing is a revision log of typed operations, not direct mutation of a character buffer.
+
+The owner is not chosen because one machine can handle every document. It is chosen because one document needs one serialization point. Millions of documents distribute across many owners; one hot document remains ordered. That trade-off is acceptable because for a single prose document, convergence is more important than squeezing out a few milliseconds by accepting independent regional histories.
+
+### Fix 2: Optimistic clients with bounded in-flight state
+The client renders local edits immediately and keeps an unacknowledged queue. Apache Wave's OT design made this distinction explicit: local optimism keeps typing responsive, while server acknowledgement bounds shared state. In this design, a client can batch keystrokes while one operation is in flight, but it does not create an unbounded stream of speculative server work. When an acknowledgement returns, the client drops the acknowledged operation and sends the next batch rebased on the new revision.
+
+Remote operations are transformed against the local pending queue before rendering. If the client cannot transform safely, it pauses, fetches a fresh snapshot, and reapplies the user's queued local operations. The important product rule is that offline or speculative text is never silently discarded.
+
+### Fix 3: Write-ahead journal and fenced ownership
+An in-memory session owner gives low latency but cannot be the source of truth. Each accepted operation is appended to a replicated per-document journal or log before acknowledgement. The log write includes an owner epoch, and the log service rejects writes from stale epochs. Figma hit this exact reliability boundary: checkpoint-only multiplayer state was not enough, so they added a write-ahead journal, ownership locks, and replay validation. The same lesson applies here: memory makes collaboration fast; a fenced journal makes it recoverable.
+
+On failover, a router assigns a higher epoch to a new owner only after the old lease expires or is fenced. The new owner loads the latest snapshot, replays journal entries after it, resumes at the next revision, and deduplicates client retries by operation ID and client sequence.
+
+### Fix 4: Split durable edits from ephemeral presence and derived consumers
+Presence, cursor positions, search, notifications, exports, and analytics should not sit in the edit acknowledgement path. The edit log is the source of truth. Consumers read it asynchronously and are idempotent by `(document_id, revision)`. Presence is stored in memory with TTL and coalescing; a missed cursor update is harmless. Search indexes snapshots or grouped revisions and checks current ACLs at query time instead of trusting stale permissions embedded in an index.
+
+Linear's delta-sync work demonstrates the cost of permission-aware replay at scale. Historical catch-up can become a large set-intersection problem, so serving old ranges may require secondary inverted indexes plus an authoritative recent slice from the primary log. That is a read-path optimization; it must not change the commit protocol.
+
+### Fix 5: Permission fences on the write path
+Sharing is part of collaboration, not a side feature. ACL mutations increment `acl_version` and publish invalidations. The document owner records the version it checked for each session and must refresh before appending if its version is stale. Revocation returns only after the new ACL version is durable and a revocation fence has been published to active owners. Already committed edits remain in history; future edits from the revoked user fail.
+
+### Putting it together
+```mermaid
+flowchart LR
+    C["Web and mobile clients"] <--> E["Edge WebSocket gateways"]
+    C --> API["REST API"]
+    API --> M["Metadata and ACL service"]
+    M --> MDB[("Metadata DB")]
+    E --> R["Document session router"]
+    R --> O["Per-document owner"]
+    O --> A["ACL check and version fence"]
+    A --> M
+    O --> J[("Replicated operation journal")]
+    O --> P["Presence service"]
+    J --> H["Snapshot and history workers"]
+    H --> S[("Snapshot object store")]
+    J --> X["Search export notification consumers"]
+    O --> E
 ```
 
-### Join the collaboration session
+A client opens `doc-123` through the REST API, receives snapshot revision 400 and tail operations through revision 427, then joins the WebSocket endpoint returned by the router. When the user types, the client applies the edit locally, sends an operation with `base_revision=427`, and keeps it in the pending queue. The document owner checks the session's ACL version, transforms the operation over any newer committed revisions, appends it to the replicated journal as revision 428 with the current owner epoch, then acknowledges the sender and broadcasts the canonical operation to peers. Snapshot workers later compact revisions into object storage, while metadata holds the latest pointers and ACLs.
 
-```json
-{
-  "type": "join",
-  "document_id": "doc-123",
-  "known_revision": 427,
-  "client_id": "device-tab-9"
-}
+> **Key idea.** Each component traces back to a specific failure of the naive design: the owner gives order, the journal gives durability, fencing prevents split brain, snapshots bound replay, and ACL versions close revocation races.
+
+## 6. Deep dives
+### 6.1 OT with a central sequencer versus CRDTs
+**Question.** Alice and Bob both insert text at offset 10 from revision 427 while Alice is online and Bob is offline. How do we guarantee that every collaborator ends at the same text?
+<details><summary>Answer</summary>
+
+Pick one canonical order per document. With OT, the owner transforms Bob's operation over Alice's committed operation before assigning Bob's revision; clients apply the same transform rules against their local pending queues. A CRDT can make the operations commute by giving inserted characters stable identifiers, but still needs deterministic ordering, tombstone or garbage-collection rules, and permission checks on reconnect.
+
+</details>
+
+Operational transformation fits the design when there is a central sequencer. Each edit names the revision it was authored against. If Alice's insert becomes revision 428 and Bob's edit arrives later with `base_revision=427`, the owner transforms Bob's position through revision 428 before committing it as 429. Concurrent inserts at the same logical position get a deterministic tie-breaker, such as canonical revision order plus operation ID. Deletes carry enough context to transform later operations that targeted deleted ranges. Styling operations target stable ranges and can be split when text is inserted or removed inside them.
+
+The hard part is not the sentence-level example; it is the transform library. Rich documents have nested lists, tables, suggestions, comments, and formatting ranges. A generic JSON patch is too weak because it says what changed in one representation, not what the user intended. Microsoft Fluid SharedTree's merge model is useful evidence here: it sequences tree edits as intentions, treats moves as moves, and uses last-writer-wins only for incompatible intentions. A Docs-style system should encode operations such as `move_node`, `split_paragraph`, and `apply_style`, not arbitrary DOM mutations.
+
+Clients also run transforms, but the server is authoritative. Local echo means the client may render text that has not committed. When a remote operation arrives, the client transforms it through local pending operations so the user's cursor and text stay stable. When the acknowledgement arrives, the client replaces its speculative operation with the canonical one. If a transform cannot be performed safely because the schema version changed or a base snapshot is too old, the client must resync rather than guess.
+
+A CRDT changes the failure mode. Instead of transforming positions through a sequenced log, each insert creates an identifier that orders it relative to neighboring identifiers; deletes mark identifiers as removed. This is attractive for peer-to-peer or very long offline editing because operations can commute without a live central server. It is not free. Character identifiers, tombstones, vector clocks or Lamport timestamps, garbage collection, and permission-aware compaction all add state. Server-side search, export, and abuse scanning still require a canonical materialized document. ACL revocation is also awkward: a user may generate valid-looking offline CRDT operations after losing permission, so reconnect must still reject operations whose authorization window has closed.
+
+Figma chose a centralized, CRDT-inspired approach for design objects instead of general OT. That is the useful lesson, not that one algorithm wins everywhere. Object properties can often merge with last-writer-wins registers, stable object IDs, and server authority. Ordered non-text lists can use fractional indexing. Prose needs tighter semantics because interleaved words are visible and often wrong. A practical Docs design can use OT for text sequences, CRDT-like object IDs for structural nodes, fractional indexes for non-text child order, and conditional state machines for comments and suggestions.
+
+The central sequencer is the simplifier. It means the server can publish one revision history, group revisions into human-readable named versions, and use the operation log for audit. It also means a single hot document cannot be written concurrently by many leaders. The design accepts that limit because the binding constraint is convergence for one document. To scale globally, we distribute documents, not the history of one document.
+
+```mermaid
+sequenceDiagram
+    participant Alice as Alice client
+    participant Owner as Document owner
+    participant Bob as Bob client
+    Alice->>Alice: Render insert locally at rev 427
+    Alice->>Owner: edit A base 427
+    Owner->>Owner: Transform over revisions 428..head
+    Owner->>Owner: Append A as rev 428
+    Owner-->>Alice: ack A rev 428
+    Bob->>Bob: Offline insert from rev 427
+    Bob->>Owner: reconnect edit B base 427
+    Owner->>Owner: Transform B over rev 428
+    Owner->>Owner: Append B as rev 429
+    Owner-->>Alice: remote edit B rev 429
+    Owner-->>Bob: ack B rev 429
 ```
 
-### Submit an edit
+Signals worth watching: transform failures, revision gap at submit, property-test coverage by operation type, client resync rate, and divergence detected by synthetic multi-client documents.
 
-```json
-{
-  "type": "edit",
-  "operation_id": "uuid",
-  "client_sequence": 81,
-  "base_revision": 427,
-  "operations": [
-    {"kind": "insert_text", "node_id": "p-19", "offset": 12, "text": "hello"}
-  ]
-}
+> **Strong-answer criteria.** A senior answer must explain both local optimism and canonical ordering, and must choose merge semantics per data type rather than saying only "use OT" or only "use CRDT."
+
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Store the latest HTML and let last write win | Concurrent edits overwrite each other and clients diverge. |
+| Good | Use OT through a central server | Establishes a canonical order, but is incomplete without deterministic transforms, retry IDs, and reconnect handling. |
+| Great | Use a per-document sequencer with OT for text, CRDT-like stable IDs for objects, fractional indexing where appropriate, exhaustive transform tests, and server-authoritative replay | Matches merge semantics to data types while preserving one auditable history. |
+
+### 6.2 Document ownership, routing, journaling, and failover
+**Question.** The owner for a hot document pauses during a network partition, the router elects a new owner, and the old owner later resumes. How do we avoid two accepted histories?
+<details><summary>Answer</summary>
+
+Every owner write carries a fencing epoch obtained from the ownership service. The journal accepts appends only from the current epoch. A new owner must obtain a higher epoch, load the latest snapshot, replay the journal, and resume from the last committed revision. The old owner may still broadcast stale frames, but its journal writes fail and clients resync to the canonical log.
+
+</details>
+
+A live collaboration session keeps hot document state in memory: the current revision, recent operations, transformed cursor positions, connected sessions, and small fan-out buffers. That memory is a performance cache, not the authority. Without a durable journal, a crash after acknowledgement loses edits. Without fencing, a slow or partitioned owner can accept edits after a replacement starts, creating a fork that cannot be repaired without asking humans which text to keep.
+
+Routing starts with `document_id -> owner_worker`. Edge gateways do not choose arbitrary workers; they ask the session router. The router either returns the current owner or initiates placement. Placement writes `DocumentOwnerLease(document_id, worker_id, owner_epoch, lease_until)` using a compare-and-swap. The epoch monotonically increases. The owner renews its lease while healthy, but the lease alone is not enough. Every journal append includes `owner_epoch`, and the journal service checks it against the current fenced epoch. This protects against delayed packets and stop-the-world pauses.
+
+The commit path is intentionally ordered: validate operation, check ACL version, transform against in-memory head, append to the replicated journal with epoch and expected previous revision, then acknowledge and broadcast. The expected previous revision is another guardrail. If the owner believes head is 428 but the journal already has 429, append fails and the owner must recover. The log is the serialization proof.
+
+Figma's reliability work is a close production analogy. They described moving from checkpoint-only persistence every 30-60 seconds to a write-ahead journal, made writes conditional on document ownership, and validated replay against checkpoints before rollout. That is exactly the reliability posture this design needs. A per-document owner makes collaboration easy to reason about, but only if its memory can be replayed and only if stale owners cannot write.
+
+Failover is a short pause, not active-active editing. When an owner is suspected dead, the router stops assigning new joins to it and attempts to acquire a higher epoch. Existing clients may still be connected to the old owner. Once a new owner is established, clients reconnect through edge gateways with `last_acknowledged_revision` and their unacknowledged operations. If a client sent an operation that committed but lost the acknowledgement, deduplication returns the committed revision. If the old owner acknowledged an operation before durable append, that is a protocol bug; acknowledgement must happen only after the journal quorum accepts the write.
+
+There is a subtle broadcast race. The old owner might broadcast an operation that later fails to append because its epoch was fenced. Clients must treat remote frames as provisional until they are backed by a committed revision from the canonical owner. In practice, `remote_edit` frames include committed revisions only after journal append. If a client receives frames from a stale connection and then reconnects, it trusts the log and rolls back or rebases any speculative state not in the log.
+
+Hot documents need careful placement. The average document has five collaborators, but a 500-editor document creates `500 × 2 = 1,000` ops/sec and roughly `1,000 × 499 = 499,000` recipient deliveries per second if every editor receives every edit. A single owner may still serialize operations, but fan-out encoding can be offloaded to regional relays. The owner builds one canonical frame per revision, relays replicate it near clients, and slow clients are disconnected and resynchronized rather than accumulating unbounded buffers.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unowned
+    Unowned --> Owned: acquire epoch 10
+    Owned --> Recovering: owner crash suspected
+    Recovering --> Owned: acquire epoch 11 and replay journal
+    Owned --> Fenced: higher epoch observed
+    Fenced --> [*]: stop appends and disconnect clients
 ```
 
-The server responds with the committed revision and transformed operation. Other clients receive the same canonical operation.
+Signals worth watching: owner election rate, append failures by stale epoch, journal append latency, replay time, duplicate operation rate after reconnect, and slow-client disconnects on hot documents.
 
-Other endpoints:
+> **Strong-answer criteria.** A strong answer distinguishes session ownership from durability and includes both fencing tokens and expected revision checks. It also states that failover pauses editing rather than allowing split-brain histories.
 
-```http
-POST   /v1/documents
-PATCH  /v1/documents/{document_id}
-DELETE /v1/documents/{document_id}
-GET    /v1/documents/{document_id}/revisions
-POST   /v1/documents/{document_id}/restore
-GET    /v1/documents/{document_id}/acl
-PUT    /v1/documents/{document_id}/acl/{principal_id}
-POST   /v1/documents/{document_id}/comments
-POST   /v1/comments/{thread_id}/replies
-POST   /v1/comments/{thread_id}/resolve
-POST   /v1/documents/{document_id}/exports
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Keep active document state only in the collaboration server's memory | A crash loses acknowledged edits and failover can fork history. |
+| Good | Write every edit to a replicated log | Preserves durability, but stale owners can still write without fencing. |
+| Great | Route each document to one owner, append with owner epoch and expected revision, recover from snapshots plus journal, and make clients reconnect with deduplicated pending edits | Prevents split brain and gives a deterministic recovery story. |
+
+### 6.3 Persistence, snapshots, revision history, and offline reconnect
+**Question.** A user edits offline for two hours, reconnects after compaction removed their base log range, and their editor permission was revoked five minutes ago. What happens?
+<details><summary>Answer</summary>
+
+The server first rechecks current permission; if the user is no longer an editor, queued edits cannot be appended. The client must preserve the offline changes in a recoverable local copy and explain that permission changed. If permission still exists but the base log is gone, the client fetches a current snapshot and performs a semantic three-way rebase of queued operations, escalating unrepresentable conflicts to the user.
+
+</details>
+
+The persistence model has three jobs that often get conflated. First, it must make acknowledged edits durable. Second, it must make opening and reconnect fast enough. Third, it must preserve human-meaningful revision history. The operation journal solves the first job. Snapshots solve the second. Revision grouping and attribution solve the third.
+
+Snapshotting is a compaction protocol, not a replacement for the log. A worker reads snapshot revision `R`, replays operations through revision `N`, serializes the normalized document tree, writes it to object storage with a content hash, validates it, and conditionally advances `latest_snapshot_revision` to `N`. If the worker crashes after writing the object but before advancing the pointer, the orphan object can be garbage-collected later. If it advances the pointer without validation, every future open may start from corrupt state, so the pointer update is the dangerous step.
+
+Retention policy is a product and cost decision. Keeping every operation forever gives perfect forensic history but creates high storage volume. Aggressive compaction reduces cost but hurts offline reconnect and detailed revision history. A balanced design keeps the full recent operation tail, retains grouped human revisions for long periods, and may archive raw old operations to colder storage. Revision history shown to users should not display every keystroke. It groups operations by idle windows, actor changes, paste/import boundaries, and explicit named versions.
+
+Offline reconnect is a permission-aware rebase. The client persists a cached snapshot, `last_acknowledged_revision`, unacknowledged operations in client-sequence order, and attachment blobs waiting for upload. On reconnect, it opens the document, receives the current ACL version and revision, and asks for operations after its checkpoint. If the log still covers that range, the client applies remote operations, rebases local queued operations, and resubmits them with stable IDs. If the log was compacted past the checkpoint, the client downloads a current snapshot and runs a semantic three-way rebase: old local base, current server state, and local offline state.
+
+Notion's offline work is instructive because it treats offline availability as a complete subtree with reasons, not a best-effort cache accident. A Docs client should similarly mark a document available offline only after all needed records are durable locally: snapshot, relevant operation tail, comments required for rendering, and pending attachments. It should track why the document is offline, such as explicit pinning or recent access, so one cleanup path does not evict data another feature promised.
+
+ACL revocation is the hardest reconnect race. Suppose the user had editor access at 10:00, went offline, was revoked at 11:55, and reconnects at 12:00 with two hours of edits. The server cannot append those operations merely because they were authored earlier; it cannot reliably prove when the user typed them, and accepting them violates revocation expectations. The operation owner checks current ACL version before append. If the user is not an editor, it rejects with a permanent permission error. The client keeps the local changes as an offline copy, perhaps allowing export or owner-mediated recovery depending on product policy, but it must not silently merge them.
+
+Attachments add another edge case. Offline edits may reference images that have not uploaded. The client should upload immutable attachments first, receive content-addressed IDs, then submit document operations referencing those IDs. If an attachment upload is denied because permission was revoked, the document operation must also be denied or rewritten into a recoverable local copy.
+
+```mermaid
+sequenceDiagram
+    participant Client as Offline client
+    participant API as Open API
+    participant Owner as Document owner
+    participant Log as Operation log
+    Client->>Client: Persist snapshot, base rev, queued ops
+    Client->>API: Reopen doc with last ack rev
+    API-->>Client: Current snapshot, head rev, ACL version
+    Client->>Owner: Submit queued op with stable ID
+    Owner->>Owner: Refresh ACL and check editor role
+    alt still editor and log covers base
+        Owner->>Log: Append rebased op
+        Owner-->>Client: ack committed revision
+    else permission revoked
+        Owner-->>Client: permanent rejection
+        Client->>Client: Preserve offline copy and explain conflict
+    else base compacted
+        Client->>Client: Fetch snapshot and semantic rebase
+    end
 ```
 
-All mutations use idempotency keys. WebSocket frames carry session tokens scoped to one document and expire quickly.
+Signals worth watching: snapshot age, replay bytes per open, compaction lag, offline rebase failure rate, rejected offline edits after ACL changes, and orphaned attachment cleanup.
 
-## 6. Real-time editing flow
+> **Strong-answer criteria.** A strong answer separates durable commit, compaction, and user-facing revision history, and treats offline replay as a permission-checked rebase rather than blind queue drain.
 
-1. The client downloads a recent snapshot plus subsequent operations.
-2. It opens a WebSocket and is routed to the document leader.
-3. A keystroke is applied locally immediately and queued as an unacknowledged operation.
-4. The client sends the operation with its base revision.
-5. The leader validates the editor permission and deduplicates the operation.
-6. It transforms the operation against operations committed since the base revision.
-7. The leader appends the canonical operation to a quorum-replicated log.
-8. After durable commit, it assigns a revision, acknowledges the sender, and broadcasts to peers.
-9. Clients transform incoming operations against their unacknowledged local queue and converge.
-10. Snapshot workers periodically compact the log.
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Store only latest document state and overwrite it on reconnect | Loses history, cannot rebase, and accepts stale permissions. |
+| Good | Keep an operation log and snapshots | Enables replay and compaction, but misses ACL revocation and base-compaction conflicts. |
+| Great | Use immutable ops, validated snapshots, grouped revision history, permission-aware reconnect, semantic rebase, and recoverable offline copies | Preserves durability and user trust under long disconnects and permission changes. |
 
-Acknowledgement happens only after durable replication. Rendering does not wait for acknowledgement, which preserves typing responsiveness.
+## 7. Variants
+**10x scale.** At 100 million concurrent sessions and `100M × 2 = 200M` ops/sec, the design still distributes by document, but every supporting path must become more hierarchical. Edge gateways use regional relays for fan-out, owners are placed with hot-document isolation, snapshots become incremental, and catch-up reads use indexed historical ranges plus authoritative head slices. The per-document single owner remains because splitting one document into multiple writers would attack the convergence guarantee.
 
-To keep server state bounded, clients should coalesce local keystrokes and maintain a small in-flight window, often one outstanding batch per document session. While waiting for acknowledgement, new local edits stay optimistic in the client queue and are sent as the next batch.
+**Multi-region active-active editing.** If the product demands low-latency writes from multiple continents to the same document, the design must choose between accepting higher coordination latency or changing to CRDT-first semantics with more complex conflict and permission handling. For a Docs-like editor, home-region ownership is usually the cleaner default: remote users relay edits to the document's home region, and acknowledged edits have zero RPO inside the replicated log. A secondary region can take over only with a higher fencing epoch.
 
-## 7. Operational transformation and alternatives
+**Enterprise residency and legal hold.** Residency mostly changes placement and retention, not the collaboration algorithm. The document's home region, snapshots, journal replicas, and search indexes must stay inside allowed regions. Legal hold can disable destructive compaction of raw operations for selected documents, while normal documents retain only grouped history and archived logs according to policy.
 
-For a centralized service, operational transformation (OT) is a practical choice:
+**End-to-end encryption.** True end-to-end encryption conflicts with server-side OT, search, export, abuse scanning, and semantic rebase. A variant could move transformation and conflict resolution to clients and store opaque CRDT operations on the server, but then permission revocation, web search, import/export, and recovery all become weaker or more expensive. That is a different product, not a small flag.
 
-- Each operation states its base revision.
-- The leader transforms it over later canonical operations.
-- Concurrent inserts receive deterministic ordering.
-- Deletes retain enough context to transform later positions.
-- Clients apply the same transform rules against pending local edits.
+## 8. The transferable pattern
+This is the pattern of optimistic local work plus canonical serialized commit. It appears whenever the user needs immediate feedback but the system needs one durable truth: collaborative documents, multiplayer design tools, code editors, inventory reservations, and financial ledgers all split speculative client state from committed state. The reusable move is to make the commit log the source of truth, make retries idempotent, and make recovery replay the same evidence rather than reconstructing from caches.
 
-Example:
+The closest siblings are systems with hot-key serialization and fan-out. A Ticketmaster-like system has a similar binding constraint around racing for scarce seats, though its merge rule is rejection rather than transformation; see [Ticketmaster](./ticketmaster-system-design.md). A chat system shares fan-out and reconnect mechanics, but messages append without rewriting prior positions, so it avoids the hardest OT/CRDT problem. Google Docs is harder because the same logical position can be changed by multiple people and all clients must converge without making typing feel remote.
 
-```text
-Base text: "cat"
-Alice inserts "s" at position 3.
-Bob inserts "big " at position 0 from the same base.
-Canonical result after transformation: "big cats"
-```
+## Review
+The design is built around one document having one canonical operation history. Clients render optimistically, but every edit is validated, transformed, fenced, appended to a replicated journal, assigned a revision, and then broadcast. Snapshots and grouped revision history keep open and restore practical without replacing the operation log. A per-document owner simplifies OT and fan-out, while owner epochs and expected revision checks prevent split brain during failover. Offline reconnect is not a blind upload; it is a permission-checked rebase that preserves local work when ACLs or compaction make automatic merge unsafe.
 
-The transform library must be deterministic, versioned, and exhaustively property-tested for convergence.
+### Check your understanding
+1. Why not store each document as one HTML blob and use last-write-wins?
+   <details><summary>Answer</summary>
 
-A CRDT simplifies peer-to-peer and offline merging because operations commute, but per-character identifiers, tombstones, version vectors, Lamport timestamps, and garbage collection can increase document size and implementation cost. A server-authoritative OT design fits centralized Docs; a sequence CRDT is attractive if long offline editing or decentralized replicas dominate. For non-text ordered lists such as layers or block children, fractional indexing can be simpler than OT because moving an item updates one ordering value, but it can interleave concurrent inserts and is a poor fit for prose.
+   Last-write-wins loses concurrent edits and gives different clients no principled way to converge after local echo or offline work. A collaborative editor needs intent-preserving operations, base revisions, transformation or CRDT merge rules, and a canonical committed order.
 
-## 8. Offline editing and reconnection
+   </details>
+2. Why does a per-document owner not mean one server handles all documents?
+   <details><summary>Answer</summary>
 
-The client persists:
+   Ownership is per document. Millions of documents are spread across many workers, but all edits for one active document route through one logical owner so that document has one revision order. The scalability unit is documents, while the correctness unit is a single document history.
 
-- Last durable server revision.
-- A cached snapshot.
-- Unacknowledged operations in client-sequence order.
-- Imported images or attachments awaiting upload.
+   </details>
+3. What must happen before an edit acknowledgement is sent?
+   <details><summary>Answer</summary>
 
-On reconnection:
+   The owner must validate the operation and permission, transform it against committed operations since its base revision, append it durably to the replicated journal with the current fencing epoch and expected previous revision, and assign a committed revision. Broadcasting or acknowledging before durable append risks losing edits clients believe were saved.
 
-1. Fetch operations after the last acknowledged revision.
-2. Apply remote operations and rebase queued local operations.
-3. Resubmit local operations with their stable IDs.
-4. If the retained log no longer covers the base revision, fetch a current snapshot and run a three-way semantic rebase.
-5. If an operation cannot be represented safely, preserve it in a recoverable offline copy and tell the user.
+   </details>
+4. How does ACL revocation interact with offline edits?
+   <details><summary>Answer</summary>
 
-Never discard offline edits silently. Only advertise a document or subtree as available offline after all records required to render and edit it are durably cached. Track why each item is offline, such as explicit pinning, recent access, or inheritance from an offline parent, so removing one reason does not accidentally evict needed data. Long offline intervals may produce visible formatting conflicts even when text converges.
+   Reconnect checks current permission before appending queued operations. If the user was revoked while offline, the server rejects the edits even if they were authored from an older revision. The client should preserve them in a recoverable local copy rather than silently discarding or merging them.
 
-## 9. Comments, suggestions, and anchors
+   </details>
+5. Why keep presence separate from the operation log?
+   <details><summary>Answer</summary>
 
-Comments are durable entities, not document text. An anchor references stable content identifiers plus the revision where it was created. As edits commit, anchor positions are transformed. If all anchored content is deleted, keep the thread with surrounding quoted context and mark the anchor detached.
+   Presence is high-volume and lossy. Cursor positions can be stale or dropped without corrupting the document, while edit operations require durable ordering and replay. Mixing them would let cursor storms and slow presence consumers delay acknowledged edits.
 
-Suggestion mode records proposed operations separately:
+   </details>
 
-- Readers render the base content plus pending suggestion overlays.
-- Accept applies the operations against the current revision after transformation.
-- Reject changes only suggestion state.
-- Accept/reject is conditional and idempotent so two reviewers cannot decide twice.
-
-Mentions create notification outbox records in the same transaction as the comment. Notification delivery is at-least-once and deduplicated by event ID.
-
-## 10. Consistency and concurrency
-
-Guarantees:
-
-- Strict revision order within one document.
-- Read-your-writes for an editing session.
-- Eventual convergence for connected clients.
-- Strongly consistent permission and ownership mutations.
-- No global ordering across documents.
-- Presence is best effort and may be stale.
-
-The collaboration leader is a per-document serialization point. It is not a durability boundary: the replicated operation log is. A fencing epoch prevents an old leader from committing after a new leader is elected.
-
-ACL changes increment an ACL version and publish a revocation fence before returning success. Collaboration servers subscribe to invalidations, include the ACL version in session state, and must refresh a stale version before appending any new edit. Revoked editors are disconnected promptly; already committed edits remain in history.
-
-## 11. Partitioning, snapshots, and storage
-
-Partition operation logs by hash of `document_id`; all operations for a document remain ordered in one partition. Metadata is sharded by `document_id` or by a workspace/domain container when many documents share permissions and navigation state. Keep the document, ACL rows, comments, and other transactionally related records co-located where possible; cross-shard writes require an outbox or saga and must not be needed for the edit acknowledgement path.
-
-Snapshots:
-
-1. Read a committed snapshot at revision `R`.
-2. Replay operations through revision `N`.
-3. Serialize the normalized document tree.
-4. Write it to object storage with a hash.
-5. Atomically advance `latest_snapshot_revision` to `N`.
-6. Retain older operations according to history policy.
-
-Snapshot every few thousand operations or when replay time exceeds a target. Hot documents need more frequent incremental snapshots. Images live in object storage behind signed URLs; document nodes reference immutable attachment IDs.
-
-Hot partitions are mitigated by isolating extremely active documents onto dedicated collaboration workers. A single document remains sequential, but transformation, fan-out encoding, and snapshotting can use parallel supporting workers.
-
-## 12. Reliable event publication
-
-Committing an edit and emitting downstream events must not diverge. The operation log itself can be the source for history, search, notifications, analytics, and audit consumers. Metadata mutations use a transactional outbox.
-
-Consumers track `(document_id, revision)` and are idempotent. Search indexes snapshots asynchronously rather than every keystroke, and query-time filtering checks current ACL state rather than trusting a stale indexed permission copy. Revision history groups operations into human-sized versions based on idle windows, actor changes, and explicit named versions.
-
-Delta sync for reconnecting clients is a permission-aware log query: fetch revisions after the client's checkpoint, filter by current access and subscriptions, and stream in order. For very large tenants, serve most of the historical range from a secondary metadata index, overlap with an authoritative head slice from the primary log, and deduplicate by revision so index lag cannot hide committed edits.
-
-Slow consumers do not block editing. Lag alarms and replayable retention allow recovery.
-
-## 13. Caching and fan-out
-
-Cache document metadata, recent snapshots, and short-lived ACL decisions. Do not cache authorization beyond revocation objectives.
-
-The collaboration server broadcasts once per committed operation to all sessions on the document. For very hot documents:
-
-- Build one encoded frame and reuse it.
-- Use regional fan-out relays rather than cross-region connections to the leader.
-- Coalesce presence updates.
-- Apply per-session backpressure.
-- Disconnect and resynchronize clients that cannot keep up instead of retaining unbounded buffers.
-
-CDNs serve immutable snapshots, images, and export artifacts. They do not cache mutable edit streams.
-
-If collaboration workers keep active document state in memory, pair checkpoints with a durable journal. Each journal entry has a per-document sequence range, and each worker write is conditional on the current document ownership epoch. Recovery loads the latest checkpoint, replays newer journal entries, and rejects split-brain writers whose epoch is stale.
-
-## 14. Multi-region design
-
-Assign each document a home region:
-
-- The home region owns the collaboration leader and synchronous multi-AZ log replicas.
-- Remote users connect to nearby edge gateways, which relay edits to the home region.
-- Snapshots replicate asynchronously and immutable attachments use multi-region object storage.
-- Read-only opening can use a nearby sufficiently fresh replica.
-
-Active-active editing of the same document across regions adds ordering latency or forks. A home-region leader keeps one history. Enterprise residency policies determine placement.
-
-On region failure, promote a caught-up secondary only after obtaining a higher fencing epoch. Clients reconnect, send their last acknowledged revision and unacknowledged operations, and deduplicate safely. The RPO target is zero for acknowledged edits; RTO might be under five minutes.
-
-## 15. Security and privacy
-
-- TLS for all traffic and KMS-backed encryption at rest.
-- Short-lived session and signed attachment tokens.
-- Authorize every document open, edit, export, comment, and share mutation.
-- Domain policies can prohibit public links or external sharing.
-- Audit ACL changes, exports, ownership transfer, and administrative access.
-- Scan imported files and rendered exports.
-- Sanitize pasted HTML and prevent script execution in documents.
-- Rate-limit creation, edits, comments, exports, and invitation fan-out.
-- Detect credential abuse and anomalous bulk downloads.
-- Enforce retention, legal hold, regional residency, and verified purge workflows.
-- Redact sensitive document content from logs, metrics, and traces.
-
-End-to-end encryption conflicts with server-side OT, search, export, and abuse scanning. It would require a materially different client-controlled collaboration design.
-
-## 16. Reliability and important failure cases
-
-| Failure | Handling |
-|---|---|
-| Client retries an edit | Deduplicate by operation ID and client sequence |
-| Sender loses acknowledgement | Return the already committed revision |
-| WebSocket drops | Rejoin from last acknowledged revision |
-| Client is far behind | Load a fresh snapshot and rebase pending edits |
-| Collaboration leader crashes | Elect a replica with a higher fencing epoch |
-| Old leader returns | Log rejects writes from its stale epoch |
-| Slow client accumulates backlog | Bound buffers, disconnect, then snapshot-resync |
-| Snapshot worker fails midway | Immutable partial output is ignored; pointer is unchanged |
-| Search consumer lags | Editing continues; alert on indexing freshness SLO |
-| Permission is revoked mid-session | Invalidate ACL cache and disconnect the session |
-| Two reviewers accept a suggestion | Conditional state update permits one terminal decision |
-| Malformed operation reaches server | Reject before append; never broadcast unvalidated state |
-
-## 17. Observability
-
-Track:
-
-- Local-to-acknowledged edit latency and remote visibility latency.
-- WebSocket connection count, reconnect rate, and regional relay latency.
-- Operation transformation time by revision gap.
-- Log append latency, replication health, and leader elections.
-- Snapshot age, replay length, and compaction backlog.
-- Duplicate operation rate and offline-rebase failures.
-- Active editors and operations/second per hot document.
-- Fan-out queue depth and slow-client disconnects.
-- ACL invalidation latency.
-- Comment mention and export delivery failures.
-- Search freshness and permission-filter errors.
-
-An end-to-end SLI is:
-
-```text
-Time from durable acknowledgement of edit E
-to E being rendered by every healthy connected collaborator
-```
-
-Use synthetic multi-client documents to continuously verify convergence, reconnect, and permission revocation.
-
-## 18. Major trade-offs
-
-### OT versus CRDT
-
-- OT has compact state and fits a central sequencer.
-- CRDT operations commute and support longer offline work.
-- CRDT metadata and garbage collection can be expensive.
-
-### Per-document leader versus multi-leader
-
-- One leader gives a clear order and simple history.
-- Multi-leader reduces cross-region latency but needs complex conflict resolution.
-
-### Operation retention versus aggressive compaction
-
-- Longer retention simplifies incremental reconnect and detailed history.
-- Aggressive compaction reduces cost but forces more snapshot downloads.
-
-### Durable edits versus ephemeral presence
-
-- Combining them seems simpler.
-- Separating them prevents cursor storms from affecting edit durability.
-
-### Immediate search indexing versus snapshots
-
-- Per-operation indexing is fresher.
-- Snapshot-based indexing is cheaper and avoids indexing transient intermediate states.
-
-## 19. Lessons from production systems
-
-### Google Docs: revision logs and OT
-
-Google described Docs as a revision log of changes, not direct mutation of a character buffer. Edits such as `InsertText`, `DeleteText`, and `ApplyStyle` are appended, and each editor transforms incoming changes relative to its local state. This supports the design's immutable operation log and reinforces that style ranges, deletes, and structural edits need explicit transform rules, not generic JSON patches.
-
-### Apache Wave: optimistic UI with bounded server state
-
-The Wave OT whitepaper used local optimistic execution so typing never waits for the network, but required a client to wait for server acknowledgement before sending more operations. While waiting, the client batches local operations. That maps directly to this design's optimistic client queue and explains why limiting in-flight batches reduces per-client server state without sacrificing local responsiveness.
-
-### Figma: centralized, CRDT-inspired documents
-
-Figma rejected general OT for its design-document tree and used a centralized, CRDT-inspired model with object IDs, properties, last-writer-wins registers, and server authority. The lesson is to choose conflict semantics per data type: rich text may need OT or a sequence CRDT, while object properties, comments, and layout attributes can often use deterministic last-writer-wins or intent-preserving merges.
-
-### Figma: journals, ownership locks, and validation
-
-Figma moved from checkpoint-only persistence every 30-60 seconds to a write-ahead journal, reporting that 95% of edits were saved within 600 ms. It also made journal writes conditional on a document lock UUID and validated journal replay against checkpoints on about 400K consecutive cases before rollout. This strengthens the design's durable acknowledgement path: active in-memory leaders need fencing, journal replay, and dark validation.
-
-### Figma: fractional indexing for ordered non-text sequences
-
-For layer ordering, Figma stores arbitrary-precision fractional positions between 0 and 1, so insert or move usually changes one value. This is useful for block children, outline nodes, or comment ordering, but not for prose because concurrent inserts may interleave. The editor should therefore use text OT or CRDTs for character sequences and reserve fractional indexing for non-text ordered collections.
-
-### Notion: blocks, parent pointers, and transaction boundaries
-
-Notion models text, images, pages, database rows, and lists as blocks with UUIDs, properties, type, ordered content pointers, and a separate parent pointer used for permissions. That maps to the document tree here: use stable node IDs for anchors and moves, but keep ACL ancestry independent from render ordering so permissions stay unambiguous during collaboration.
-
-### Notion: shard by locality, not just row count
-
-Notion sharded Postgres by workspace ID because related blocks, comments, collections, and spaces are normally queried and updated together. It created 480 logical shards over 32 physical databases to preserve future rebalancing options. For Docs, hash by document for the operation log, but shard metadata by workspace or document container when that is the transactional and permission locality boundary.
-
-### Notion: complete offline subtrees
-
-Notion's offline mode evolved a SQLite cache into a persistent store that tracks which pages are fully available offline and why. It keeps a forest of offline page trees, so a page is removed only when its last offline reason disappears, and reconnect fetches only pages whose server timestamp changed. This design should similarly avoid partial offline documents and track offline coverage explicitly.
-
-### Microsoft Fluid SharedTree: sequenced tree intents
-
-Fluid SharedTree sequences edits through a relay, then merges by applying valid intentions in sequence order. It treats moves as true moves rather than copy-plus-delete, treats removal as movement to a detached state, and uses last-writer-wins only for incompatible intentions. The implication is that structured document operations should encode intent, such as move node X, not low-level diffs.
-
-### Linear: permission-aware delta sync
-
-Linear's local-first sync uses ordered immutable sync actions that clients replay after a checkpoint. At large scale, reconnect became a permission-aware set intersection over more than 20 TB of sync actions, so Linear moved historical filtering to inverted indexes, kept payloads in Postgres, overlapped with an authoritative recent Postgres slice, and deduplicated. Docs needs the same separation between committing the log and serving catch-up queries.
-
-## 20. Recommended interview presentation
-
-A clear 45-minute sequence is:
-
-1. Clarify editing, offline, comments, sharing, and scale.
-2. Draw the split between durable edits, ephemeral presence, and metadata.
-3. Explain the document leader and ordered operation log.
-4. Walk through optimistic local rendering and durable acknowledgement.
-5. Deep-dive into OT, convergence, and reconnect rebasing.
-6. Cover snapshots, history, comments, and suggestion anchors.
-7. Discuss hot documents, fan-out, and partitioning.
-8. Explain home-region failover, fencing, permissions, and security.
-9. Tie the design to production lessons: OT revision logs, durable journals, offline coverage, sharding locality, and permission-aware delta sync.
-10. Finish with OT-versus-CRDT and latency-versus-consistency trade-offs.
-
-The central design insight is:
-
-> Render edits optimistically at the client, but establish one durable canonical operation order per document. Transform concurrent operations against that order, separate ephemeral presence from durable content, and recover every session from snapshots plus an idempotent operation log.
-
-## Further reading: curated engineering blogs
-
+## Sources and further reading
 | Source | Article | Why it matters |
 |---|---|---|
 | Google Drive Blog | [What’s different about the new Google Docs: Conflict resolution](https://drive.googleblog.com/2010/09/whats-different-about-new-google-docs_22.html) | Explains Google Docs' revision log and OT transform model for insert, delete, and style changes. |

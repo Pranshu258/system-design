@@ -1,317 +1,442 @@
-# Uber-like Nearby Drivers and Dispatch System
+# Nearby Drivers and Dispatch System Design
+
+This system powers an Uber-like marketplace path from live driver location to rider-facing nearby cars to a correct trip assignment. It includes location ingestion, geospatial search, ETA-based candidate ranking, offers, acceptance, cancellation, and trip-state reconciliation; it excludes pricing, payments, full navigation, and long-term marketplace forecasting except where those signals affect matching.
 
 ## 1. Requirements
 
-### Functional requirements
+### 1.1 Functional requirements
 
-1. Ingest frequent driver locations and availability changes.
-2. Show riders a low-latency, privacy-safe view of nearby available drivers.
-3. Estimate pickup times.
-4. Match a ride request to one suitable driver without double assignment.
-5. Handle offers, acceptance, timeout, cancellation, and reassignment.
-6. Track an active trip and publish location updates to rider and driver.
+- Drivers can come online, report location and availability frequently, and receive offers on a realtime channel.
+- Riders can see a low-latency, privacy-safe approximation of nearby available vehicles before requesting a trip.
+- Riders can create a trip request idempotently and receive progress while the system searches, offers, assigns, or fails to find a driver.
+- The dispatch system can search nearby candidates, estimate pickup ETA, rank them, and send one or a small controlled batch of offers.
+- A driver can accept, decline, time out, or lose an offer, and the system must assign that driver to at most one active trip.
+- Riders and drivers can reconnect and recover authoritative trip state even if push messages were missed.
 
-### Non-functional requirements
+### 1.2 Non-functional requirements
 
-- Nearby search p99 below 300 ms; dispatch decision typically within seconds.
-- Millions of online drivers and tens of millions of location updates/second at peak.
-- Strong correctness for driver assignment; eventual consistency for map dots.
-- Graceful degradation during city events, cellular loss, or regional failures.
-- Location privacy, retention limits, and abuse resistance.
+- **Freshness.** Candidate search should usually see driver updates within a few seconds, because stale positions create bad ETAs and offers that drivers cannot practically accept.
+- **Low latency.** Nearby visualization should be sub-second and dispatch should make useful progress within seconds, or riders abandon before the marketplace has a chance to recover.
+- **Assignment correctness.** A driver may appear in multiple soft indexes, but the authoritative state transition from available to assigned must be strongly consistent.
+- **Write scalability.** Location writes dominate the system by orders of magnitude, so the location path must be append-heavy, in-memory, sharded, and tolerant of loss.
+- **Graceful degradation.** During concerts, storms, map incidents, cellular loss, or ETA overload, the system should reduce display precision and widen search carefully rather than corrupt trip state.
+- **Privacy.** Exact driver coordinates are sensitive operational data; rider maps should reveal density or jittered anonymous cars, not stable driver identities.
 
-Pricing, payment settlement, and full turn-by-turn navigation are adjacent but out of scope.
+### 1.3 The binding constraint
 
-## 2. Scale assumptions
+The binding constraint is that two adjacent subsystems want opposite consistency models. Driver locations are written by millions of mobile devices every few seconds. They are ephemeral, naturally lossy, frequently duplicated, and only useful while fresh. Forcing every location update through a strongly consistent transactional database would spend the system's consistency budget on data that expires in seconds. Matching, however, has a hard invariant: one driver cannot be assigned to two active trips, even if two riders request at the same time, two dispatch workers race, or a driver taps accept just as an offer times out.
 
-- 10 million online drivers globally at peak.
-- Active drivers send one update every 3 seconds: 3.3 million updates/second average, 10 million/second peak.
-- 2 million ride requests/minute at exceptional global peak, about 33,000 requests/second.
-- Location event about 150 bytes encoded before replication: about 500 MB/s average and 1.5 GB/s peak before stream/storage replication.
-- Nearby query radius usually 2-10 km; display 8-20 anonymized vehicles.
-- Driver location is considered stale after 10-20 seconds.
-- Offer timeout: 10-15 seconds; target match under 30 seconds.
+That tension shapes the architecture. The location index is a sharded in-memory soft-state service fed by streams, sequence numbers, TTLs, and hierarchical cells. Dispatch treats it as a candidate generator, not truth. The assignment path then crosses into a strongly consistent driver/trip store using offer tokens, state versions, leases, and atomic compare-and-swap or transactions. The design is therefore not one database or one index; it is an explicit handoff from approximate high-volume search to fenced, authoritative state transitions.
 
-Workload is geographically skewed. A concert can make several adjacent cells hot while most of the world is quiet.
+## 2. Back-of-the-envelope estimation
 
-## 3. High-level architecture
+Use illustrative peak assumptions, not claims about any real company. Suppose `10M` drivers are online globally at a busy moment and each sends a location every `3` seconds while moving. The average location write rate is `10M / 3 = 3.33M updates/s`. If mobile clients synchronize after connectivity gaps or several large cities peak together, a `3x` burst gives about `10M updates/s`. At `150 bytes` for a compact encoded update before replication and protocol overhead, raw ingress is `3.33M × 150 = 499.5 MB/s` on average and `10M × 150 = 1.5 GB/s` during bursts. Replication, stream metadata, indexes, and TLS framing can multiply that, so location cannot be a normal request/response write to a relational table.
 
-```mermaid
-flowchart LR
-    DA[Driver App] --> EDGE[Realtime Gateway]
-    RA[Rider App] --> API[API Gateway]
-    EDGE --> LOC[Location Ingestion]
-    LOC --> BUS[(Location Stream)]
-    BUS --> GEO[Geo Index Service]
-    GEO --> IDX[(In-memory Cell Index)]
-    API --> NEAR[Nearby Service]
-    NEAR --> IDX
-    API --> TRIP[Trip Service]
-    TRIP --> DIS[Dispatch Orchestrator]
-    DIS --> GEO
-    DIS --> ETA[ETA / Routing Service]
-    DIS --> STATE[(Strong Driver / Trip Store)]
-    DIS --> OFFER[Offer Service]
-    OFFER <--> DA
-    TRIP --> EVT[(Trip Event Log)]
-    EVT --> PUSH[Realtime Notifications]
-    PUSH --> RA
-```
+Ride requests are much smaller in count but much more correctness-sensitive. If an exceptional global peak is `2M` trip requests per minute, that is `2M / 60 = 33,333 requests/s`. If each request considers `200` candidate driver IDs from cells and sends batched ETA calls for the best `20`, candidate reads are roughly `33,333 × 200 = 6.67M candidate checks/s`, while expensive ETA work is `33,333 × 20 = 666,660 driver ETAs/s`. This implies a two-stage ranker: cheap cell and distance filtering first, then batched road-network ETA for a much smaller set.
 
-Separate the soft-state geo index from the authoritative driver/trip state. A driver dot may be briefly stale; assignment ownership may not be ambiguous.
+Freshness also drives storage choices. If the index only needs the last `20` seconds of searchable locations for `10M` drivers, the hot working set is approximately `10M × 150 = 1.5 GB` of raw latest points, plus indexes, replicas, and per-cell sets. Even at a generous `10x` overhead, this is memory-scale per global fleet when partitioned by city and cell. Long-term trip events are durable, but raw nearby location history should not be retained in the dispatch serving path.
 
-## 4. Data model
+Hotspot math is more important than global averages. A stadium egress could put `50,000` drivers and riders around a few adjacent cells. If every nearby query scanned one huge downtown cell, a single partition would become a CPU and lock hotspot. Cells must split or use fine-enough resolution in dense areas, and dispatch must cap candidate reads per ring so one burst does not starve the rest of the city.
 
-```text
-DriverState
-- driver_id, availability: OFFLINE | AVAILABLE | OFFERED | ASSIGNED | ON_TRIP
-- vehicle_type, capabilities, city_id
-- active_trip_id, state_version, lease_expires_at
+> **Key idea.** The numbers split the design in two: millions of loss-tolerant writes per second belong in sharded memory and streams, while tens of thousands of match decisions per second need strong, narrow transactions only at the moment of assignment.
 
-DriverLocation
-- driver_id, latitude, longitude, heading, speed
-- accuracy_m, observed_at, received_at, sequence_number
-- cell_id
+## 3. API design
 
-RideRequest
-- trip_id, rider_id, pickup, destination
-- product_type, requested_at, status, version
+**Question.** If a rider retries trip creation after a timeout and a driver retries offer acceptance after reconnecting, what makes those retries safe instead of creating duplicate trips or double assignments?
+<details><summary>Answer</summary>
 
-DispatchAttempt
-- attempt_id, trip_id, round, candidate_driver_id
-- score, offer_token, offered_at, expires_at
-- result: ACCEPTED | DECLINED | EXPIRED | CANCELLED
+Trip creation uses a rider-scoped idempotency key and returns the existing trip for the same request. Offer acceptance carries an opaque offer token, the expected driver state version, and the offer expiry; the server accepts it only if the trip and driver are still in compatible states in the authoritative store.
 
-TripEvent
-- trip_id, sequence_number, event_type, actor_id, timestamp, payload
-```
-
-Exact coordinates are short-lived operational data. Long-term analytics uses coarse or access-controlled data according to policy.
-
-## 5. Core APIs and streams
+</details>
 
 ```http
 POST /v1/drivers/me/locations
-{"lat":37.78,"lng":-122.41,"observed_at":"...","sequence":8841,"accuracy_m":8}
+{ "lat": 37.78, "lng": -122.41, "observed_at": "2026-10-14T02:16:05Z", "sequence": 8841, "accuracy_m": 8 }
 
-GET /v1/nearby-drivers?lat=...&lng=...&product=standard
+POST /v1/drivers/me/availability
+{ "status": "AVAILABLE", "idempotency_key": "drv-2026-10-14-shift-7" }
+
+GET /v1/nearby-drivers?lat=37.78&lng=-122.41&product=standard
 
 POST /v1/trips
-{"pickup":{...},"destination":{...},"product":"standard","idempotency_key":"..."}
+{ "pickup": { "lat": 37.78, "lng": -122.41 }, "destination": { "lat": 37.62, "lng": -122.38 }, "product": "standard", "idempotency_key": "rider-abc-req-991" }
+
+GET /v1/trips/{trip_id}
 
 POST /v1/offers/{offer_id}/accept
-{"offer_token":"...","driver_state_version":731}
+{ "offer_token": "opaque", "driver_state_version": 731 }
+
+POST /v1/offers/{offer_id}/decline
+{ "offer_token": "opaque", "reason": "too_far" }
 
 POST /v1/trips/{trip_id}/cancel
-GET  /v1/trips/{trip_id}
+{ "idempotency_key": "rider-abc-cancel-3", "expected_version": 12 }
 ```
 
-Realtime WebSocket/gRPC channels carry offers and trip events, but durable APIs remain the source of truth after reconnect.
+The location endpoint is intentionally not a durable command API. It accepts duplicates, rejects impossible coordinates, and returns success once the gateway has handed a valid update to the regional ingestion path. A mobile client may also use a streaming channel for locations, but the semantics are the same: newer per-driver sequence numbers replace older ones in the serving index.
 
-## 6. Location ingestion flow
+Nearby display is a read API over soft state. It should return anonymous vehicle tokens, jittered positions, coarse headings, or density summaries, not driver IDs. Caching it for a few seconds is acceptable because it is not a promise that a displayed car can be assigned. Dispatch never says, "the rider saw driver D, therefore D is available." It creates a trip, searches fresh candidates, and checks authoritative driver state before offering.
 
-1. Gateway authenticates device and applies rate/accuracy checks.
-2. Reject impossible coordinates and excessively old or future timestamps.
-3. Deduplicate/reorder by per-driver sequence number.
-4. Append valid updates to the regional stream.
-5. Geo consumer snaps or associates the point with the road graph when road-network ETA search is needed, then maps location to an H3/S2 cell.
-6. Atomically remove the driver from the prior cell and add/update the new cell.
-7. Expire index entries by server receive time if no heartbeat arrives; keep this soft state in memory and rebuild from snapshots plus stream replay.
-8. Fan out sampled updates for active trips and analytics.
+Trip creation is idempotent because riders retry when mobile networks fail. The server stores `(rider_id, idempotency_key)` with the trip request and returns the existing `trip_id` if the same key appears again. Cancellation is versioned because it races with assignment. A cancellation that arrives after `DRIVER_ASSIGNED` may still succeed depending on product rules, but it is a state transition against a known version, not a blind deletion.
 
-Network duplicates and minor reordering are normal. The index accepts an update only if its sequence is newer than the stored sequence.
+Offers use push for latency and pull for recovery. The driver app receives an offer over WebSocket, HTTP/2, or a mobile push-assisted channel. If that message is lost, reconnect can fetch outstanding offers. Acceptance is not trusted merely because it arrives before a client-side timer ends; the server checks the offer's expiry, token, dispatch epoch, driver version, and trip state. This makes driver taps safe across duplicated messages, reconnects, and worker failover.
 
-## 7. Geospatial indexing and nearby queries
+## 4. Data model
 
-Use hierarchical cells such as H3 or S2. H3-style hexagonal hierarchy is useful because rings have more uniform neighbor distance than square grids and can be rolled up for marketplace balancing, but exact dispatch ranking still needs road-network distance. For a query:
+Start with the obvious entity: `DriverLocation(driver_id, lat, lng, observed_at)`. That is enough to draw a dot, but it fails as soon as the mobile network reorders packets. A driver can go through a tunnel, reconnect, and upload an older point after a newer one. The location record therefore needs a per-driver `sequence_number`, `received_at`, `accuracy_m`, and a computed `cell_id`. The index accepts only updates newer than the stored sequence and expires entries by server receive time so a device with a bad clock cannot keep itself visible forever.
 
-1. Cover the search radius with the pickup cell and neighboring rings.
-2. Read available driver IDs from those cells in parallel.
-3. Remove stale, inaccurate, incompatible, or authoritative-nonavailable drivers.
-4. Compute great-circle distance as a cheap first pass, or use a road-network KNN index in dense/complex road networks where haversine distance is often wrong.
-5. Request batched road ETA only for the top candidates.
-6. Return a small, jittered visualization set or candidates to dispatch.
+Next, add `DriverState`. Location alone cannot tell whether the driver is offline, available, considering an offer, already assigned, or on a trip. If availability were stored only inside the geo index, an index rebuild could resurrect a busy driver as available. `DriverState` is authoritative and versioned. It has `availability`, `active_trip_id`, `state_version`, `lease_expires_at`, product capabilities, and a home market. The geo index may cache a projection of availability for fast filtering, but dispatch rechecks the source of truth.
 
-Adaptive resolution prevents dense downtown cells from becoming huge. Sparse areas expand rings gradually up to a latency and distance budget.
+A `RideRequest` starts as pickup, destination, product, rider, and status. That is insufficient because creation retries can duplicate demand. We add a rider-scoped `idempotency_key` and a `version`. The request evolves into a trip state machine: `REQUESTED`, `SEARCHING`, `DRIVER_ASSIGNED`, `DRIVER_ARRIVING`, `IN_PROGRESS`, `COMPLETED`, or `CANCELLED`. Every command includes an expected version or is explicitly idempotent.
 
-## 8. Nearby display versus dispatch
+Now consider the offer. If dispatch simply sends a push notification and waits, two workers can offer the same driver after a lease handoff, or one worker can time out an offer while the driver accepts it. `DispatchAttempt` records `attempt_id`, `round`, `candidate_driver_id`, `offer_id`, opaque `offer_token`, `dispatch_epoch`, `offered_at`, `expires_at`, and result. The token is not just authentication; it identifies a bounded state transition. Accepting it must prove that the offer is pending, unexpired, from the current epoch, and still attached to the same trip.
 
-The rider map is indicative, not a promise. To protect privacy and reduce bandwidth:
-
-- Return randomized/jittered positions or server-rendered density representations.
-- Rotate anonymous vehicle tokens.
-- Do not expose driver IDs, exact timestamps, or precise headings.
-- Cache cell-level responses for a few seconds.
-- Prefer server push or streaming subscriptions over aggressive mobile polling; clients still reconcile after reconnect.
-
-Dispatch performs a fresh authoritative availability check and never relies solely on the cached nearby response.
-
-## 9. Dispatch algorithm
-
-1. Persist the ride request idempotently.
-2. Query expanding geo rings for candidates.
-3. Filter product, capacity, accessibility, safety, work-rule, and stale-location constraints.
-4. Rank by pickup ETA, acceptance probability, idle time/fairness, destination constraints, and marketplace balance.
-5. Offer to one driver or a small controlled batch.
-6. On acceptance, atomically claim both driver and trip.
-7. If all offers decline/expire, widen radius and begin another round.
-
-A simple lower-is-better score:
+Finally, trip history needs an ordered event log. Current state is optimized for reads and transactions, but clients need replay after reconnect and downstream systems need a durable audit trail. `TripEvent` carries a per-trip sequence number, event type, actor, timestamp, and payload. It is written through a transactional outbox with the current trip transition so push delivery can fail without losing the event.
 
 ```text
-score = w1 * pickup_eta
-      - w2 * acceptance_probability
-      - w3 * idle_time
-      + w4 * marketplace_penalty
+DriverState
+- driver_id
+- city_id, product_capabilities, vehicle_type
+- availability: OFFLINE | AVAILABLE | OFFERED | ASSIGNED | ON_TRIP
+- active_trip_id nullable
+- current_offer_id nullable
+- state_version
+- lease_expires_at
+- updated_at
+
+DriverLocation
+- driver_id
+- latitude, longitude, heading, speed, accuracy_m
+- observed_at, received_at
+- sequence_number
+- cell_id
+
+RideRequest / Trip
+- trip_id
+- rider_id
+- idempotency_key
+- pickup, normalized_pickup, destination
+- product_type
+- status
+- assigned_driver_id nullable
+- dispatch_epoch
+- version
+- created_at, updated_at
+
+DispatchAttempt
+- attempt_id
+- trip_id
+- round
+- candidate_driver_id
+- score_snapshot
+- offer_id, offer_token_hash
+- dispatch_epoch
+- offered_at, expires_at
+- result: PENDING | ACCEPTED | DECLINED | EXPIRED | CANCELLED | LOST_RACE
+
+TripEvent
+- trip_id
+- sequence_number
+- event_type
+- actor_id
+- timestamp
+- payload
 ```
 
-Avoid optimizing only nearest distance: road barriers, driver direction, fairness, acceptance likelihood, and downstream supply balance matter.
+`DriverLocation` and per-cell membership live in the regional geo index, backed by a location stream and periodic snapshots. `DriverState`, `Trip`, and the active driver-to-trip mapping live in a strongly consistent transactional store partitioned to support atomic assignment. `DispatchAttempt` is durable enough to recover offer rounds and audit races. `TripEvent` goes to a durable log or event table through an outbox. What deliberately does not go in the transactional store is every raw location update; only the latest operational projection and assignment-critical state cross that boundary.
 
-## 10. Assignment consistency and races
+> **Key idea.** The model separates soft presence from hard ownership: a driver can be stale or duplicated in search structures, but only one versioned `DriverState` row can move into `ASSIGNED`.
 
-Acceptance uses a transaction or compare-and-swap:
+## 5. High-level design
+
+The simplest design is tempting: every driver writes location and availability to one database table, the rider request queries nearby rows with a geospatial index, the server chooses the nearest driver, and it writes the trip ID back to that driver row.
+
+```mermaid
+flowchart LR
+    DA["Driver app"] --> DB[("Geo database")]
+    RA["Rider app"] --> API["API server"]
+    API --> DB
+    API --> PUSH["Push service"]
+    PUSH --> DA
+```
+
+This breaks in four concrete ways. First, location writes are so frequent that the database spends most of its I/O on replacing data that expires almost immediately. Second, hot downtown cells become read and write hotspots even if global capacity is sufficient. Third, straight-line nearest-driver selection fails around rivers, one-way streets, gates, airports, and traffic. Fourth, the offer/accept race is not solved by a geospatial query; two dispatchers can see the same driver as available and both attempt to assign them.
+
+### Fix 1: Split ephemeral location from authoritative state
+
+Location updates go to regional realtime gateways, then to an append-only stream, then to an in-memory geo index. Each driver has a single owner shard for update ordering, and each index entry has a TTL. Uber's Ringpop work is a useful production analogue: its geospatial service used cooperative in-memory workers for continuously pinged driver locations because the state is fleeting and load must be distributed. The important boundary is that Ringpop-like membership and routing are appropriate for soft location serving, not for deciding legal trip ownership.
+
+Authoritative `DriverState` remains in a strongly consistent store. The geo index may cache `AVAILABLE` to avoid returning obviously busy drivers, but dispatch still performs a fresh state check before offering and again at acceptance. This accepts that the index can be wrong for a few seconds while preserving the assignment invariant.
+
+### Fix 2: Shard the search space with hierarchical cells
+
+A flat latitude/longitude index does not explain how to distribute load. Partition the index by `(city_id, cell_id_prefix)` using H3, S2, or an equivalent hierarchy. Uber's H3 shows why hexagonal hierarchical cells are attractive: neighboring rings are more uniform than square grids, and the same hierarchy can roll up supply-demand counts for balancing and surge-like controls. H3 cells do not by themselves know driving distance, but they are good at limiting which in-memory shards a query touches.
+
+Cell resolution should be adaptive. In sparse suburbs, a query expands through multiple rings. In dense downtown areas, the service uses finer cells or caps per-cell candidates and samples fairly so a single huge set does not dominate CPU. Hot-cell detection is then natural: if candidate set size, update rate, or lock contention crosses a threshold for a cell prefix, split to child cells or replicate read ownership while keeping each driver's update stream owned by one writer.
+
+### Fix 3: Use candidate search before expensive ranking
+
+The dispatch path should not call a routing engine for every driver in a ten-kilometer radius. It first gathers a bounded set from nearby cell rings, drops stale or incompatible entries, and uses cheap distance and heading filters. Only then does it ask an ETA service for batched many-to-one pickup estimates for the top candidates.
+
+This is where straight-line distance reaches its limit. Grab's Pharos describes the stronger version for complex road networks: store drivers in memory, map-match them to road graph nodes, and search by driving distance or ETA through incremental network expansion. Uber's DeepETA work points in the same direction from the prediction side: graph shortest paths need historical data, real-time traffic, and ML correction. The design can start with H3 rings plus batched ETA, but dense cities with bridges, one-way grids, gated communities, or airport loops may need road-network KNN earlier in the pipeline.
+
+### Fix 4: Fence dispatch ownership and make acceptance atomic
+
+A dispatch worker owns a trip search only under a lease and epoch. It records offer attempts and sends a token to the selected driver. The accept endpoint executes a transaction or linearizable compare-and-swap: verify the offer token and expiry, verify the trip is still searching or offered in the same epoch, verify the driver is still `OFFERED` for that trip or otherwise claimable under the exact state version, then update driver, trip, active assignment index, attempt result, and outbox event together.
+
+Uber's fulfillment rearchitecture is relevant here because fulfillment state is not just a stream of messages; it needs transactions, state models, and secondary indexes. A stream can notify, recover, and audit, but it cannot be the only mechanism enforcing "one driver, one trip" unless all conflicting commands are serialized through the same authoritative partition.
+
+### Putting it together
+
+```mermaid
+flowchart LR
+    DA["Driver app"] --> GW["Realtime gateway"]
+    GW --> ING["Location ingestion"]
+    ING --> LS[("Location stream")]
+    LS --> GEO["Geo index shards"]
+    GEO --> MEM[("In-memory cells")]
+    RA["Rider app"] --> API["API gateway"]
+    API --> NEAR["Nearby display service"]
+    NEAR --> MEM
+    API --> TRIP["Trip service"]
+    TRIP --> STORE[("Strong trip and driver store")]
+    TRIP --> DIS["Dispatch orchestrator"]
+    DIS --> MEM
+    DIS --> ETA["ETA and routing"]
+    DIS --> STORE
+    DIS --> OFFER["Offer service"]
+    OFFER --> DA
+    STORE --> OUTBOX[("Transactional outbox")]
+    OUTBOX --> PUSH["Realtime push"]
+    PUSH --> RA
+```
+
+A driver location flows through the gateway into the location stream and updates an in-memory cell entry if its sequence number is newer. A rider's nearby map reads those cells and receives an anonymized, jittered view. When the rider requests a trip, `TripService` creates a versioned trip idempotently, `DispatchOrchestrator` searches geo cells for candidates, `ETA` ranks a bounded set, and `OfferService` pushes a token. Acceptance crosses into the strong store, where `DriverState`, `Trip`, `DispatchAttempt`, active assignment mapping, and outbox event update atomically. `TripEvent` then reaches clients through push, and clients reconcile through `GET /trips/{trip_id}` after reconnect.
+
+> **Key idea.** Each component traces back to a specific failure of the naive design: memory absorbs expiring writes, cells distribute search, ETA fixes geometric lies, and transactions protect the assignment invariant.
+
+## 6. Deep dives
+
+### 6.1 Location index: H3, quadtree, or road graph?
+
+**Question.** A city center has hundreds of thousands of location updates per second and riders querying every few seconds. Why not put the latest point for every driver in a geospatial database and query `ORDER BY distance LIMIT 20`?
+<details><summary>Answer</summary>
+
+Because the dominant write path is high-volume soft state. A database geospatial query may work at small scale, but replacing millions of expiring points per second creates write amplification and hotspots. Use sharded in-memory cells fed by a stream, with sequence checks and TTLs, and reserve durable stores for state that must survive and be consistent.
+
+</details>
+
+The index exists to answer two different questions cheaply: "what should the rider roughly see nearby?" and "which drivers are plausible dispatch candidates?" Neither question requires permanent storage of every point. If a location update is dropped, the next update arrives in a few seconds. If a driver disappears, a TTL removes the entry. If a geo shard fails, it can rebuild from a recent snapshot plus the location stream. These properties make memory a feature, not a shortcut.
+
+A hierarchical cell index is usually the first practical design. On ingest, compute a cell ID for the point at a resolution appropriate for dispatch in that market. Store a per-cell map from `driver_id` to a compact latest record: coordinates, heading, speed, accuracy, observed time, received time, sequence number, and an availability projection. Also store a per-driver reverse pointer to the previous cell. When a newer update crosses a cell boundary, the shard removes the driver from the old cell and upserts into the new one. When updates arrive out of order, the shard ignores any sequence number at or below the stored sequence.
+
+H3, S2, and quadtrees are not interchangeable slogans; they optimize different operations. H3 gives hexagonal cells and convenient k-ring expansion, which keeps neighbor rings more uniform and makes rollups useful for marketplace balance. S2 maps the sphere to hierarchical cells with strong library support and range-friendly IDs. A quadtree can split hot rectangular regions dynamically and is easy to reason about for storage ranges, but square cells create less uniform neighbor distances and awkward behavior near diagonals. Any of them can work if the design includes adaptive resolution, bounded fan-out, and clear ownership. The bad design is pretending the cell library itself solves dispatch.
+
+Cell proximity is not road proximity. A driver across a river may be in the first ring and still fifteen minutes away. A driver just outside the ring may be on a highway ramp and arrive quickly. That is why the index should return candidates, not final winners. In many markets the cheap sequence is H3 or S2 rings, stale filtering, haversine sort, then batched ETA. In markets where barriers dominate, Grab's Pharos-style road-network KNN can replace the first ranking stage: map-match drivers to graph nodes and expand along the road network from the pickup until enough reachable drivers are found. This is more CPU- and map-data-intensive, but it avoids wasting ETA calls on geometrically close but unreachable drivers.
+
+Hot cells need special handling. Imagine a cell near a stadium with `20,000` available drivers and many riders refreshing the map. If every query copies the full set, p99 latency collapses. The cell can maintain small randomized samples for display, separate candidate heaps by product type, and child-cell summaries. Dispatch queries should request up to a budget per ring, for example "return the best 500 fresh compatible IDs by cheap score," not "return every driver." If a cell is consistently hot, split it to a finer resolution for serving while keeping coarse rollups for supply-demand metrics. If reads are hot but writes are manageable, replicate the cell read projection; if writes are hot, partition ownership by child cell or driver hash while preserving one update owner per driver.
+
+Staleness policy must be explicit. The index should expire by `received_at` after, say, `10-20` seconds for dispatch candidates, because the server knows when it last heard from the device. `observed_at` is still useful for ranking, but client clocks lie. Accuracy also matters: a point with `accuracy_m = 200` should not be treated like a curbside pickup. The dispatch filter can keep it for sparse areas with lower confidence, but the ranker should penalize it.
+
+Uber's Ringpop lesson fits exactly at this layer: cooperative in-memory workers can hold and route ephemeral geospatial state at high update rates. Uber's H3 lesson also fits here: hierarchy is useful both for search and for rollups such as hot-cell detection and marketplace balance. The production-grade answer is to combine them while drawing a hard line before assignment truth.
+
+```mermaid
+flowchart TD
+    U["Driver update"] --> S["Sequence check"]
+    S -->|"older or duplicate"| DROP["Ignore"]
+    S -->|"newer"| C["Compute cell"]
+    C --> M["Move from old cell to new cell"]
+    M --> T["Set TTL by received time"]
+    T --> Q["Searchable candidate"]
+    Q --> E["Expired if heartbeat missing"]
+```
+
+Signals worth watching: update ingest lag, per-cell update rate, stale-driver ratio, candidates returned per ring, cell split frequency, index rebuild time, and disagreement between geo-index availability and authoritative driver state.
+
+> **Strong-answer criteria.** A senior answer separates expiring location state from assignment truth, compares cell indexes by operational behavior rather than naming one winner, and explains how staleness, hot cells, and road distance affect dispatch quality.
+
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Store every driver point in one durable geo table and query nearest rows directly. | It spends durable write capacity on expiring data and creates hot geospatial partitions. |
+| Good | Use H3 or S2 cells in memory with TTL and ring expansion. | It scales writes and search, but still needs adaptive hot-cell handling and road-aware ranking. |
+| Great | Use sharded in-memory hierarchical cells, sequence checks, snapshots, adaptive resolution, bounded candidate budgets, and optional road-network KNN in hard markets. | It treats the index as a recoverable candidate generator and makes its failure modes explicit. |
+
+### 6.2 Candidate search to ranking: from k-rings to ETA
+
+**Question.** The nearest driver by straight-line distance is 400 meters away, but the pickup ETA is eight minutes; another driver is 900 meters away and can arrive in three minutes. Where should this correction happen?
+<details><summary>Answer</summary>
+
+The geo index should generate plausible candidates quickly, but dispatch ranking should use road-network ETA for the bounded finalist set, or road-network KNN earlier in cities where geometry is consistently misleading. The final score should include pickup ETA, acceptance probability, freshness, fairness, and marketplace balance, not straight-line distance alone.
+
+</details>
+
+A naive matcher expands cell rings and picks the closest coordinate. It will look good in a demo because most nearby points are reachable in open grids. It fails in the places that generate support tickets: airports with designated pickup zones, gated communities, bridges, tunnels, one-way streets, divided highways, ferry terminals, campuses, and event road closures. Lyft's gated pickup work illustrates that pickup normalization is not cosmetic. If the system routes the driver to a locked gate or tells the rider to wait at an unreachable pin, the location index did its job and the product still failed.
+
+The production path starts before dispatch with pickup normalization. A raw rider coordinate becomes a `normalized_pickup`: curb side, venue entrance, airport zone, gate instruction, or safe walking point. Uber's geofence service lesson matters here because product availability, airport rules, and pricing or dispatch zones may be high-QPS point-in-polygon checks. Those checks should be served from specialized low-latency in-memory policy data near dispatch, not from slow per-candidate calls.
+
+Candidate search then proceeds in stages. First, cover the normalized pickup with the base cell and neighboring rings. The ring count grows until one of three things happens: enough compatible candidates are found, the distance budget is reached, or the latency budget is reached. Second, filter by product, capacity, accessibility, driver state projection, location freshness, and accuracy. Third, compute a cheap score using distance, heading, and maybe cell-level traffic. Fourth, request batched ETA for the top `N`, where illustrative `N = 20` keeps the expensive path bounded. If `33,333` trip requests per second each asked ETA for all `200` candidates, routing would see `6.67M` ETA pairs per second; by narrowing to `20`, it sees `666,660` pairs per second before cache hits and batching. That arithmetic is why the two-stage ranker exists.
+
+ETA itself is not one number from one service. A practical routing service map-matches driver origins, uses live traffic and road restrictions, and caches coarse origin-destination cell pairs for seconds to minutes. Uber's DeepETA work highlights that learned corrections over graph estimates improve arrival predictions. The dispatch system should consume ETA with metadata: confidence, age, fallback reason, and maybe a prediction interval. A three-minute ETA with low confidence due to stale traffic may be worse than a four-minute ETA with high confidence.
+
+Ranking has to balance immediate pickup time against marketplace health. A simple score might be `w1 * pickup_eta - w2 * acceptance_probability - w3 * idle_time + w4 * marketplace_penalty + w5 * uncertainty`. Acceptance probability captures driver behavior, offer distance, destination hints where legal, and whether the driver is moving away. Idle time and fairness prevent the same drivers from always losing. Marketplace penalty prevents draining supply from a neighboring area that is about to spike. Uber's marketplace balance work frames matching as a sequential decision: nearest now is not always best for the next few minutes. The guardrail is that long-term optimization cannot justify unreasonable pickup times or discriminatory outcomes.
+
+Batching offers is a ranking and consistency choice. Serial offers reduce double-accept races and driver spam, but can add `10-15` seconds per failed offer. A sparse suburb may need small batches of two or three drivers to meet rider latency. A dense downtown can offer one at a time because alternatives are abundant. If batching is used, each driver receives a distinct pending offer token, and the first valid acceptance wins the trip transaction. Losing acceptances return a clear terminal response and must not leave drivers stuck in `OFFERED`.
+
+When ETA degrades, the system should fail soft but not silently. Nearby display can show broader ranges or fewer cars. Dispatch can fall back to distance plus historical speed in low-risk markets, widen search more conservatively, or pause certain products that require precise pickup rules. What it should not do is overload the ETA service by retrying every candidate synchronously or pretend low-confidence estimates are exact.
+
+```mermaid
+flowchart LR
+    P["Normalized pickup"] --> R["Cell ring expansion"]
+    R --> F["Freshness and product filter"]
+    F --> C["Cheap distance and heading score"]
+    C --> E["Batched road ETA"]
+    E --> M["Marketplace and fairness ranker"]
+    M --> O["Offer set"]
+```
+
+Signals worth watching: ETA latency, ETA error after actual pickup, candidate count by ring, fallback rate, offer acceptance by ETA bucket, cancellations caused by pickup confusion, and supply imbalance after dispatch decisions.
+
+> **Strong-answer criteria.** A strong answer explains why geospatial nearest-neighbor is only candidate generation, includes pickup normalization and policy lookups, bounds expensive ETA work, and treats ranking as a marketplace decision with guardrails.
+
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Pick the nearest coordinate from the nearby index. | It fails around road barriers, access constraints, and stale or inaccurate points. |
+| Good | Generate cell candidates, then rank finalists with batched road ETA. | It fixes most pickup-time errors while keeping routing load bounded. |
+| Great | Normalize pickups, serve policy/geofence checks locally, use road-network KNN where needed, rank with ETA confidence, acceptance, fairness, and marketplace balance. | It addresses the real causes of bad matches rather than only replacing one distance metric. |
+
+### 6.3 Dispatch and assignment race: offer to accept
+
+**Question.** Two riders request at the same time. The same driver receives two offers due to stale geo projections or worker failover and taps accept on one while the other is timing out. What exact state transition prevents double assignment?
+<details><summary>Answer</summary>
+
+The accept endpoint performs an atomic conditional transition in the strong store: the offer is pending and unexpired, the dispatch epoch matches, the trip is still claimable, and the driver state version is still `OFFERED` for that offer or otherwise exactly available for that claim. The transaction updates driver, trip, attempt, active assignment index, and outbox together; only one acceptance can commit.
+
+</details>
+
+Dispatch begins with a trip lease. A worker claims `Trip(status=SEARCHING, dispatch_epoch=e)` for a short period. The epoch fences old workers: if a worker pauses for garbage collection or loses network and later resumes, its writes include an old epoch and are rejected. The worker searches candidates and tries to move a chosen driver from `AVAILABLE` to `OFFERED(trip_id, offer_id)` with a versioned conditional update. In a strict serial-offer design, this prevents the same driver from being offered to multiple trips. In a looser design, the system may allow multiple pending offers in rare cases, but acceptance still must atomically claim the driver.
+
+The key is that push delivery is not state ownership. Sending an offer to a device only creates an opportunity for a command. The driver may never see it, may see it after timeout, may tap twice, or may reconnect through another gateway. Therefore `OfferService` records `DispatchAttempt(PENDING, expires_at, offer_token_hash)` and sends an opaque token. The token is validated at accept time, but token validity alone is not enough. A stolen or duplicated token cannot override the current driver and trip state.
+
+The acceptance transaction can be expressed as conditional logic:
 
 ```text
-Driver: AVAILABLE/OFFERED -> ASSIGNED(trip_id)
-Trip: SEARCHING -> DRIVER_ASSIGNED(driver_id)
-Offer: PENDING -> ACCEPTED
+IF Offer.offer_id = ?
+AND Offer.result = PENDING
+AND Offer.expires_at > now()
+AND Offer.dispatch_epoch = Trip.dispatch_epoch
+AND Trip.status IN (SEARCHING, OFFERED)
+AND Driver.driver_id = Offer.candidate_driver_id
+AND Driver.state_version = expected_version
+AND Driver.availability = OFFERED
+AND Driver.current_offer_id = Offer.offer_id
+THEN
+  Offer.result = ACCEPTED
+  Driver.availability = ASSIGNED
+  Driver.active_trip_id = Trip.trip_id
+  Driver.current_offer_id = null
+  Driver.state_version = Driver.state_version + 1
+  Trip.status = DRIVER_ASSIGNED
+  Trip.assigned_driver_id = Driver.driver_id
+  Trip.version = Trip.version + 1
+  ActiveDriverTrip[driver_id] = trip_id
+  Outbox += DRIVER_ASSIGNED event
 ```
 
-The transaction verifies offer token, expiry, driver/trip versions, and fenced dispatch epoch. Only one acceptance can win. Losers receive `OFFER_NO_LONGER_AVAILABLE`.
+The active driver-to-trip mapping is not redundant bureaucracy. It is a convenient invariant check and lookup path: there should be at most one active row for a driver. In a relational or NewSQL store, this can be a unique index updated in the same transaction. In a linearizable KV design, put driver assignment and active mapping behind the same partition or use a transaction primitive. What does not work is writing `Trip.assigned_driver_id` and later asynchronously updating `DriverState`; a crash between the two creates ambiguity exactly where the system needs certainty.
 
-For cross-record storage, colocate driver claim and active trip mapping by a dispatch partition, or use a strongly consistent transactional database with multi-row transactions and secondary indexes. Do not use an asynchronous event alone to enforce exclusivity, and do not let an eventually consistent cache become the source of truth.
+Timeouts are also state transitions. A scheduler or dispatch worker marks a pending offer expired only if it is still pending and the epoch matches. If an accept races with expiry, one conditional write wins. If expiry wins first, accept returns `OFFER_EXPIRED` and the driver is released or moved back to `AVAILABLE` if no newer offer exists. If accept wins first, the timeout sees `ACCEPTED` and does nothing. This is the same compare-and-swap pattern, not a separate best-effort cleanup.
 
-## 11. Trip state machine
+Cancellation races are similar. If the rider cancels while an offer is pending, the trip moves to `CANCELLED`, pending offers are cancelled by conditional updates, and later accepts fail because the trip is no longer claimable. If the rider cancels just after assignment, product rules decide whether cancellation is allowed and what event is emitted, but the driver was still assigned exactly once. The invariant is not "no races happen"; it is "every race has one authoritative winner and all losers observe a terminal state."
 
-```text
-REQUESTED -> SEARCHING -> DRIVER_ASSIGNED -> DRIVER_ARRIVING
--> IN_PROGRESS -> COMPLETED
+Small offer batches add one more edge. Suppose three drivers receive offers and two accept within milliseconds. Both acceptance requests may validate their own offer tokens, but they contend on the same `Trip` row and perhaps the same trip assignment unique constraint. The first transaction commits `DRIVER_ASSIGNED`; the second fails the `Trip.status` condition and marks its attempt `LOST_RACE` or leaves it to be updated after reading the committed state. The losing driver must be moved out of `OFFERED` only if their `current_offer_id` still matches the lost offer, because they might already have received another offer.
 
-SEARCHING/DRIVER_ASSIGNED/DRIVER_ARRIVING -> CANCELLED
+```mermaid
+sequenceDiagram
+    participant D as Driver app
+    participant O as Offer service
+    participant S as Strong store
+    participant T as Trip service
+    O->>S: create DispatchAttempt PENDING
+    O-->>D: push offer token
+    D->>T: accept offer token and expected driver version
+    T->>S: transaction verifies offer, trip, driver, epoch
+    alt commit wins
+        S-->>T: committed assigned state and outbox event
+        T-->>D: 200 DRIVER_ASSIGNED
+    else another transition won
+        S-->>T: condition failed with current terminal state
+        T-->>D: 409 OFFER_NO_LONGER_AVAILABLE
+    end
 ```
 
-Commands include expected versions and idempotency keys. Each accepted transition appends an ordered trip event through a transactional outbox. Clients reconcile from `GET /trips/{id}` after reconnect; push is only a latency optimization.
+Signals worth watching: assignment CAS conflict rate, offers accepted after expiry, drivers stuck in `OFFERED`, duplicate active assignment invariant violations, dispatch lease steal count, and time from trip creation to first valid assignment.
 
-## 12. Partitioning and storage
+> **Strong-answer criteria.** A strong answer names the invariant, identifies push as non-authoritative, uses fencing and conditional state transitions, and covers timeout, cancellation, retry, and batched-offer races.
 
-- Geo index partitions by `(city_id, cell_prefix)` and lives in memory with replicas.
-- Driver authoritative state partitions by `driver_id`, but assignment writes also update a strongly consistent active-driver-to-trip index.
-- Trip state partitions by `trip_id`; the active assignment index maps driver to trip and must be updated atomically with the trip transition.
-- Dispatch ownership partitions by city/market and subzone.
-- Trip events use durable log/object storage; recent state uses a strongly consistent KV/relational database.
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Send a push to the nearest driver and mark the trip assigned when the driver replies. | It trusts unreliable delivery and has no atomic protection against concurrent replies. |
+| Good | Store offers and use a transaction to update driver and trip on accept. | It protects the core invariant but may miss epochs, timeout races, or active assignment indexes. |
+| Great | Use trip leases with epochs, offer tokens, expected driver versions, transactional driver/trip/attempt/active-index updates, and outbox events. | It makes every race resolve to one committed state and gives clients a recoverable protocol. |
 
-Hot cells can split into child cells and be replicated for reads. Writes for one driver retain a single owner. Large city dispatch partitions subdivide, but cross-boundary queries inspect adjacent owners.
+## 7. Variants
 
-## 13. ETA computation and caching
+**10x scale.** If online drivers and update rates grow by `10x`, the location stream becomes the first bottleneck, not the assignment store. The design would add more regional ingestion partitions, stronger on-device adaptive sampling, per-driver update coalescing at gateways, and more aggressive cell-level display summaries. The assignment transaction remains narrow because trip requests do not grow at the same multiplier as location pings, and each trip still needs only one winning driver.
 
-Straight-line distance filters candidates cheaply. A routing service then performs a batched many-to-one ETA query using live traffic, road restrictions, map matching, and ML corrections over graph estimates. Cache travel times by coarse origin/destination cell and time bucket for seconds to minutes. Invalidate or lower TTL during incidents.
+**Active-active regions.** Most cities should have a home region because dispatch is local and latency-sensitive. A paired region can receive replicated trip logs and driver snapshots asynchronously. During failover, the system must fence the old dispatch epoch before the secondary accepts new assignments. It is better to pause matching in an uncertain city for seconds than to let two regions assign the same driver. Location ingestion can resume from clients quickly, but driver assignment truth needs explicit ownership transfer.
 
-If routing is unavailable, return confidence-labeled heuristic ETAs for nearby display, but dispatch should either use conservative estimates or degrade to distance ranking with explicit monitoring.
+**Large event surge.** A stadium release creates adjacent hot cells, synchronized rider requests, and unreliable cellular networks. The geo index should split cells or use precomputed samples, nearby display should degrade to density or fewer vehicles, dispatch should cap candidate budgets per ring, and offer rounds may batch slightly more aggressively. Strong assignment semantics do not change; the system sheds visualization precision and search breadth before it weakens correctness.
 
-## 14. Reliability and failure handling
+**Complex pickup products.** Airports, gated communities, campuses, and autonomous-vehicle pickup points make `pickup = lat/lng` inadequate. The data model adds normalized pickup entities, access instructions, pickup zones, and eligibility rules. Candidate search must filter drivers by product and access constraints before ETA ranking. Lyft's gated-community example fits this variant: routing through the right gate or suggesting an outside-gate pickup can matter more than finding the geometrically nearest driver.
 
-| Failure | Handling |
-|---|---|
-| Driver app sends duplicate/out-of-order updates | Sequence check ignores older updates |
-| Driver disconnects | Presence lease expires; remove from availability |
-| Geo index node fails | Replica serves; rebuild from stream snapshot and replay |
-| Offer push is lost | Driver reconnects/polls outstanding offers; timeout safely |
-| Two offers accepted concurrently | Transactional driver/trip claim allows one winner |
-| Dispatch worker dies | Lease/epoch expires; new owner resumes from trip state |
-| Trip write succeeds but push fails | Outbox retries; clients reconcile via API |
-| ETA service overloads | Batch/cache, shed display precision, preserve assignment path |
-| Client polling spike | Move hot trip/nearby updates to push streams and use backoff/admission control |
-| City surge overloads | Admission control, cell splitting, controlled search rounds |
-| Rider retries trip creation | Idempotency key returns existing trip |
+## 8. The transferable pattern
 
-## 15. Multi-region design
+The reusable pattern is a split between high-volume soft state and low-volume hard state. Soft state is current enough, partitioned by geography or interest, rebuilt from streams, and allowed to be stale. Hard state is versioned, fenced, and updated through atomic transitions. The same pattern appears in presence systems, live cursors, inventory reservations, food delivery dispatch, and collaborative systems where a fast approximate view feeds a correctness-critical claim.
 
-Each city/market has a home region because location and dispatch are latency-sensitive and geographically local. Replicate across availability zones synchronously. A paired region receives trip logs and driver state asynchronously.
+This design is closest to systems that reserve scarce resources after a broad search. A ticketing system such as [Ticketmaster](./ticketmaster-system-design.md) can show eventually consistent seat availability, but checkout must atomically reserve a seat. A delivery marketplace can show nearby couriers, but order assignment must claim one courier. The interview trick is not to say "use strong consistency" everywhere; it is to spend strong consistency only on the small invariant that would be user-visible and expensive to repair.
 
-Failover requires fencing the old dispatch epoch before accepting assignments in the secondary. During uncertain ownership, pause new matching briefly rather than risk double assignment. Active clients reconnect through global routing and resend their latest state. Cross-border trips transfer a trip's event ownership explicitly while location processing follows the current region.
+## Review
 
-## 16. Security and privacy
+The architecture follows from one tension: driver locations are massive, ephemeral, and loss-tolerant, while driver assignment is scarce, durable, and must be exclusive. The design therefore ingests locations through realtime gateways and streams into sharded in-memory hierarchical cells, uses H3/S2 or road-network search only to produce candidates, ranks a bounded finalist set with ETA, pickup policy, acceptance, fairness, and marketplace signals, and then crosses into a strongly consistent driver/trip store for offer acceptance. Push channels provide speed, but idempotency keys, versions, offer tokens, dispatch epochs, conditional transitions, unique active-assignment indexes, and outbox events provide correctness and recovery.
 
-- Short-lived device-bound tokens and mTLS for internal services.
-- Encrypt coordinates in transit and at rest; tightly restrict raw-location access.
-- Retain precise history only as required; aggregate or delete it afterward.
-- Detect GPS spoofing using impossible speed, sensor, route, and device signals.
-- Rate-limit nearby queries and prevent systematic location scraping.
-- Jitter displayed vehicles and rotate identifiers.
-- Audit employee access; implement emergency-access workflows.
-- Validate that drivers can transition only their own state and riders only their trips.
+### Check your understanding
 
-## 17. Observability
+1. Why is it wrong to put every driver location update into the same strongly consistent database used for trip assignment?
+   <details><summary>Answer</summary>
 
-Track location ingest lag, updates/driver, stale-driver ratio, geo-index divergence, nearby p50/p99, candidate count by ring, ETA latency/error, time-to-match, offer acceptance/expiry, assignment CAS conflicts, double-assignment invariant violations, cancellation rate, dispatch rounds, reconnects, and region replication lag.
+   Location updates arrive at millions per second, expire within seconds, and tolerate loss or replacement by newer updates. Forcing them through the assignment database would waste durable write capacity and create hotspots. Trip assignment needs strong consistency only for the narrow driver/trip ownership transition.
 
-Key SLOs:
+   </details>
 
-- 99% of valid location updates searchable within 2 seconds.
-- 99% of nearby queries complete within 300 ms.
-- Zero successful assignments linking one driver to two active trips.
+2. Why can the nearby rider map show a car that dispatch later refuses to offer?
+   <details><summary>Answer</summary>
 
-## 18. Major trade-offs
+   The map is served from cached soft state that may be stale, jittered, sampled, or privacy-filtered. Dispatch performs fresh candidate search and authoritative driver-state checks, so a displayed driver may already be busy, stale, incompatible, or a poor ETA choice.
 
-- **Freshness versus battery:** faster updates improve ETA but consume device power and bandwidth; adapt interval by motion and trip state.
-- **Push versus reconciliation:** push is fast; authoritative versioned state heals missed messages.
-- **One-at-a-time versus batched offers:** serial offers reduce contention but increase match time; small controlled batches help sparse markets.
-- **In-memory geo index versus durable database:** memory serves low latency; stream replay and authoritative state provide recovery.
-- **Strong versus eventual consistency:** reserve strong consistency for assignment and trip transitions, not visualization dots.
+   </details>
 
-## 19. Lessons from production systems
+3. What problem does a dispatch epoch solve?
+   <details><summary>Answer</summary>
 
-### Uber H3: use hierarchy for both search and marketplace rollups
+   It fences old workers. If a dispatch worker loses its lease and later resumes, its writes carry an old epoch and cannot expire offers or assign drivers for a trip now owned by a newer worker.
 
-Uber built H3 as a hexagonal hierarchical spatial index for marketplace analysis, dispatch, and pricing. The design should use H3/S2 cells not just as a lookup shard key, but also as a rollup unit for supply-demand balance, surge controls, and hot-cell detection. Do not confuse cell proximity with road proximity: cells produce candidates; road ETA produces ranking.
+   </details>
 
-### Uber Ringpop: ephemeral location state belongs in cooperative in-memory workers
+4. Why does road-network ETA not replace the cell index entirely in every market?
+   <details><summary>Answer</summary>
 
-Uber described Ringpop's first use case as its Geospatial service: continuously pinged driver locations are too fleeting for database-centric serving, so workers distribute load and carry ephemeral state. That maps directly to this design's in-memory geo index, stream replay, and TTL expiry. The correction is to keep Ringpop-like membership/routing away from the source-of-truth assignment path.
+   Road-network search is more expensive and depends on map matching, traffic, and graph data. Cells are cheap for sharding, freshness, and first-pass candidate generation. Road-network KNN is worth moving earlier in markets where straight-line geometry is consistently misleading.
 
-### Uber fulfillment rearchitecture: transactions for trip and supply truth
+   </details>
 
-Uber's fulfillment platform moved to a NewSQL/Spanner-backed model for strong consistency, multi-row transactions, secondary indexes, and statecharts, serving billions of database transactions per day. For this design, accepting an offer must atomically update driver, trip, and active assignment index; caches and streams are observers, not arbiters.
+5. In a small batched offer round, two drivers accept the same trip. What should the losing driver observe?
+   <details><summary>Answer</summary>
 
-### Uber real-time push: streaming beats mobile polling at marketplace scale
+   The first acceptance transaction commits the trip assignment. The second fails the trip-state condition and returns a terminal response such as `OFFER_NO_LONGER_AVAILABLE`; cleanup releases that driver from `OFFERED` only if their current offer still matches the lost offer.
 
-Uber's push platform replaced frequent mobile polling with bidirectional streaming after polling dominated API gateway traffic. Nearby dots, trip state, and offers should be pushed on stateful channels with reconnect reconciliation, while durable `GET /trips/{id}` and offer tokens remain the recovery mechanism.
+   </details>
 
-### Uber DeepETA: graph routing needs real-time and ML correction
-
-Uber's DeepETA work explains why road-graph shortest paths alone are insufficient: historical data, real-time signals, and low-latency ML refinements improve arrival-time predictions. Candidate selection can use cheap distance, but dispatch ranking should batch ETA requests and track ETA error because ETA quality directly changes acceptance and cancellation.
-
-### Uber geofence service: CPU-heavy geo lookups need specialized low-latency serving
-
-Uber's geofence service became a very high-QPS service because every mobile request needed fast point-in-polygon checks for products, airports, and dynamic pricing. This design should keep product availability, airport rules, and pricing-zone checks close to dispatch filtering, ideally in memory with safe background refresh, instead of issuing slow per-candidate policy calls.
-
-### Uber marketplace balance: matching is a sequential decision, not nearest-driver only
-
-Uber's reinforcement-learning marketplace work frames matching as a sequential balance problem: a greedy nearest-driver match can create future imbalance and longer waits elsewhere. The ranker should include marketplace penalty, idle/fairness, and repositioning signals, with guardrails so long-term optimization does not violate pickup-time or fairness constraints.
-
-### Grab Pharos: road-network KNN can replace haversine in complex cities
-
-Grab's Pharos stores driver positions in memory, maps them onto road-network graph nodes, and searches by driving distance or ETA using incremental network expansion. This is the production version of the doc's two-stage candidate flow: haversine is cheap, but road barriers, one-way streets, and gates can make road-network KNN the better first-rank source in dense markets.
-
-### Lyft gated pickups: pickup points are product and map-data problems
-
-Lyft found gated-community pickups could be 25-30% of rides in selected markets, then generated gate-area shapes, offered outside-gate pickup choices, and routed drivers through the correct gate as an intermediate stop. Nearby-driver systems should treat pickup normalization and access constraints as first-class dispatch inputs, not after-the-fact chat messages.
-
-## 20. Recommended interview presentation
-
-1. Separate nearby visualization from correctness-critical dispatch.
-2. Estimate location update and ride-request load.
-3. Draw realtime ingestion, geo index, dispatch, ETA, and strong state.
-4. Deep-dive into hierarchical cell search and stale entry expiry.
-5. Walk through candidate ranking and offer rounds.
-6. Prove the atomic assignment invariant.
-7. Cover hot cities, failover fencing, privacy, and degraded ETA.
-8. Finish with freshness/battery and batching trade-offs.
-
-The central design insight is:
-
-> Keep driver location as rapidly expiring soft state for search, but make driver availability and trip assignment versioned, fenced, and strongly consistent so a fast approximate geo system never creates two authoritative rides.
-
-## Further reading: curated engineering blogs
+## Sources and further reading
 
 | Source | Article | Why it matters |
 |---|---|---|
@@ -324,4 +449,3 @@ The central design insight is:
 | Uber | [Reinforcement Learning for Modeling Marketplace Balance](https://www.uber.com/us/en/blog/reinforcement-learning-for-modeling-marketplace-balance/) | Dispatch ranking should consider future supply-demand balance, not only nearest ETA. |
 | Grab | [Pharos - Searching Nearby Drivers on Road Network at Scale](https://engineering.grab.com/pharos-searching-nearby-drivers-on-road-network-at-scale) | Road-network KNN, map matching, in-memory replicas, and ETA-based search for driver allocation. |
 | Lyft | [How We Built a Smarter Pickup Experience for Gated Communities](https://eng.lyft.com/how-we-built-a-smarter-pickup-experience-for-gated-communities-47416e9df029) | Pickup normalization, gate-aware routing, and access instructions reduce cancellations and bad ETAs. |
-

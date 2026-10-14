@@ -1,258 +1,214 @@
-# Local Delivery System: Gopuff-like Instant Commerce
+# Local Delivery System Design
+
+This design covers a Gopuff-like quick-commerce service that sells a curated catalog from owned micro-fulfillment centers and delivers in minutes. It includes browse availability, checkout reservation, MFC assignment, picking, dispatch, ETA, tracking, substitutions, and payment state; it excludes procurement planning, marketplace restaurants, and long-haul parcel logistics.
 
 ## 1. Requirements
+### 1.1 Functional requirements
+- Show a serviceable catalog for a delivery address, with prices, delivery estimate, and advisory item availability.
+- Let a customer build a cart, choose substitution preferences, apply eligible promotions, and check out safely on retry.
+- Reserve every requested item from one authoritative micro-fulfillment center before confirming the order.
+- Route confirmed orders through picking, packing, substitutions, handoff, courier dispatch, tracking, cancellation, and refund flows.
+- Let operators manage MFC hours, capacity, zones, stock adjustments, pick queues, and courier supply.
+- Notify customers and support agents from an auditable order timeline rather than from transient worker state.
 
-### Functional requirements
+### 1.2 Non-functional requirements
+- **No oversell at checkout.** Browse can be stale, but a confirmed order must correspond to real reserved units at one MFC.
+- **Low-latency browsing.** Catalog and search should usually render under 200 ms at `p95`, because users abandon if every scroll requires an inventory transaction.
+- **Fast but honest promises.** A 15-30 minute promise only helps if it accounts for pick queue, courier supply, batching delay, and uncertainty, not just map distance.
+- **Retry-safe money and orders.** Mobile clients, payment providers, and warehouse devices all retry across timeouts, so mutations need idempotency keys, version guards, and reconciliation.
+- **Local failure isolation.** A hot, closed, or disconnected MFC should degrade its own zone without taking down browse, checkout, or dispatch elsewhere.
+- **Fresh tracking without hot order writes.** Courier locations update every few seconds and must not turn the order database into a time-series store.
 
-1. Show a serviceable catalog and accurate price/availability for a delivery address.
-2. Support cart, promotions, checkout, payment, substitution preferences, and cancellation.
-3. Reserve inventory from a specific micro-fulfillment center (MFC).
-4. Route orders to picking and packing workflows.
-5. Assign a courier and provide live ETA and tracking.
-6. Handle out-of-stock items, substitutions, refunds, tips, and age-restricted goods.
-7. Let operators manage inventory, batches, hours, delivery zones, and courier capacity.
-8. Notify customers throughout the order lifecycle.
+### 1.3 The binding constraint
+The system looks like a normal ecommerce site until checkout. During browsing, availability is an estimate derived from cached MFC projections, search indexes, partner feeds, picker reports, and recent sales. That estimate must be cheap, local, and fast enough to power search and ranking. At checkout, however, the customer is asking for a promise: this exact cart can be picked from one MFC and delivered by a deadline. That promise cannot be made from the browse cache because two customers can race for the last unit, a picker can mark an item damaged, or the nearest MFC can become overloaded between add-to-cart and payment.
 
-Out of scope: marketplace restaurants, scheduled parcel shipping, and warehouse procurement optimization.
+The design is therefore shaped by a deliberate split. Browse returns advisory availability and candidate MFCs; checkout performs an authoritative all-or-nothing reservation against the selected MFC; ETA is computed from the nearest MFC that has every item and enough operational capacity; dispatch optimizes within a bounded window but always has a safe greedy fallback. The main mechanisms forced by this constraint are conditional inventory updates, reservation records with expirations, idempotent order creation, MFC-scoped authority, probabilistic ETA promises, and bounded dispatch optimization.
 
-### Non-functional requirements
+## 2. Back-of-the-envelope estimation
+Assume, illustratively, `20M` registered users, `3M` daily active users, `1,000` MFCs, and `2M` orders per day. The average order rate is `2,000,000 / 86,400 = 23.1` orders per second. A busy hour with `100,000` orders is `100,000 / 3,600 = 27.8` orders per second globally, so the global write rate is not frightening. The consequence is easy to miss: the hard part is not aggregate throughput, it is locality. A rainstorm, sporting event, or promotion can push hundreds of concurrent checkouts into a single MFC, and those checkouts contend for the same few low-stock SKUs.
 
-- Checkout availability of `99.99%`.
-- Catalog reads below 200 ms at `p95`; order creation below 1 second excluding payment challenge.
-- Prevent overselling while keeping browse availability responsive.
-- Typical order delivered in 15-30 minutes.
-- Durable financial and order state with complete audit history.
-- Live tracking updates every few seconds without overloading transactional storage.
+If each order has `25` lines, the system processes `2,000,000 × 25 = 50,000,000` order lines per day. The peak-hour line rate is `100,000 × 25 / 3,600 = 694.4` attempted reserved lines per second globally. This is small enough for transactional storage if partitioned by MFC and SKU, but a single hot SKU cannot be protected by cache invalidation. It needs an atomic predicate such as `available >= requested` at the write authority.
 
-## 2. Scale assumptions and capacity
+Inventory cardinality is also moderate. With `5,000` active SKUs per MFC and `1,000` MFCs, the authoritative inventory table has `5,000 × 1,000 = 5,000,000` MFC-SKU rows. That is not a big-data problem. It is a correctness problem around concurrent decrements, safety stock, adjustments, and expiring holds. The read side is larger: if browse traffic is roughly `100×` order traffic, peak browse is about `2,800` to `5,000` requests per second before CDN, app cache, and search cache hits. That justifies precomputed projections for browsing but not for confirming stock.
 
-- 20 million registered users; 3 million daily active users.
-- 1,000 MFCs across several countries.
-- 2 million orders/day, averaging about 23 orders/second.
-- 100,000 orders in the peak hour, or about 28 orders/second globally; use 30-50 orders/second for headroom, with strong local spikes.
-- 25 items/order; 50 million order lines/day, averaging about 579 lines/second and about 694 lines/second in the 100,000-order peak hour.
-- 50,000 active couriers at peak, emitting location every 5 seconds: 10,000 updates/second.
-- 5,000 SKUs per MFC; about 5 million MFC-SKU inventory rows.
-- Browse traffic is roughly 100 times order-write traffic, or about 3,000-5,000 reads/second at peak before CDN and app cache hits.
+Courier telemetry is a different shape. If `50,000` active couriers send a location every `5` seconds, ingestion is `50,000 / 5 = 10,000` updates per second. Those writes are append-heavy, lossy within limits, and TTL-bound. They belong in a geospatial/time-series path, while order state receives only coarse delivery transitions such as `PICKED_UP` and `DELIVERED`.
 
-The global throughput is manageable, but locality creates hot partitions: a single MFC can receive hundreds of simultaneous checkouts during a promotion or weather event.
+> **Key idea.** The numbers say to spend complexity on local correctness, not global throughput. Cache and precompute the browse side, but keep checkout reservation single-authoritative per MFC-SKU and keep high-frequency location updates out of transactional order storage.
 
-## 3. High-level architecture
+## 3. API design
+**Question.** If mobile clients retry checkout after a timeout, how do we avoid creating two orders, two payment authorizations, or two inventory holds?
+<details><summary>Answer</summary>
 
-```mermaid
-flowchart LR
-    U[Customer Apps] --> EDGE[API Gateway]
-    D[Courier App] --> EDGE
-    W[Warehouse App] --> EDGE
-    EDGE --> GEO[Serviceability / Location]
-    EDGE --> CAT[Catalog Service]
-    EDGE --> CART[Cart / Pricing]
-    EDGE --> ORDER[Order Orchestrator]
-    EDGE --> TRACK[Tracking Service]
+The checkout API uses an idempotency key scoped to the customer and cart intent. The order service first records or finds the operation, then drives a state machine with stable downstream operation IDs for inventory and payment. A retry returns the existing order or pending status instead of repeating business effects.
 
-    CAT --> INVREAD[(Inventory Read Cache)]
-    CAT --> CATALOG[(Catalog DB)]
-    ORDER --> INV[Inventory Service]
-    ORDER --> PAY[Payment Service]
-    ORDER --> FULFILL[Fulfillment Service]
-    INV --> INVDB[(Inventory DB)]
-    ORDER --> ORDERDB[(Order DB)]
-    FULFILL --> DISPATCH[Dispatch Service]
-    DISPATCH --> GEOIDX[(Courier Geo Index)]
-    D --> LOC[Location Ingestion] --> GEOIDX
-    ORDER --> OUTBOX[(Outbox)]
-    OUTBOX --> BUS[Event Stream]
-    BUS --> NOTIFY[Notification Service]
-    BUS --> TRACK
-    BUS --> ANALYTICS[Operations / Analytics]
+</details>
+
+```http
+GET /v1/serviceability?lat=37.78&lng=-122.41
+  -> 200 {"candidate_mfcs":[{"mfc_id":"mfc-17","eta_minutes":{"p50":18,"p90":29}}]}
+
+GET /v1/catalog?mfc_id=mfc-17&catalog_version=2026-10-13T18:30Z
+  -> 200 {"items":[{"sku_id":"sku-42","price":"4.99","availability":"LOW","availability_version":8123}]}
+
+POST /v1/carts/{cart_id}/validate
+  {"address_id":"addr-3","items":[{"sku_id":"sku-42","quantity":2}],"substitution_policy":"BEST_MATCH"}
+  -> 200 {"candidate_mfc_id":"mfc-17","price_version":556,"advisory_unavailable":[]}
+
+POST /v1/orders
+Idempotency-Key: 6d944b4c
+  {"cart_id":"cart-9","candidate_mfc_id":"mfc-17","price_version":556,"payment_method_id":"pm-8"}
+  -> 202 {"order_id":"ord-91","status_url":"/v1/orders/ord-91"}
+
+GET /v1/orders/{order_id}
+  -> 200 {"state":"CONFIRMED","promised_delivery_at":"2026-10-14T03:05:00Z"}
+
+POST /v1/orders/{order_id}/cancel
+If-Match: order-version-7
+  -> 202 {"state":"CANCEL_REQUESTED"}
+
+POST /v1/couriers/{courier_id}/locations
+  {"lat":37.78,"lng":-122.41,"observed_at":"2026-10-14T02:49:02Z","accuracy_meters":8}
+
+POST /v1/deliveries/{delivery_id}/accept
+Idempotency-Key: courier-accept-123
+  -> 200 {"state":"ACCEPTED"}
 ```
 
-The ordering path is an orchestrated saga across inventory, payment, fulfillment, and dispatch. Each domain owns its database; changes propagate through durable events rather than distributed transactions.
+The catalog endpoint deliberately says `availability` rather than `available_quantity`. Exposing precise counts from a stale projection invites customers and clients to treat advisory data as a contract. `LOW`, `IN_STOCK`, `LIKELY_OUT`, and an `availability_version` communicate enough for ranking and UI warnings while preserving the invariant that checkout must revalidate. Cart validation is still not a reservation; it gives the user an early warning and helps choose the best candidate MFC before payment.
+
+`POST /v1/orders` returns `202` when the orchestration may still be settling inventory, payment, fraud checks, or a 3DS challenge. The status resource lets clients poll safely, and push notifications or SSE can reduce polling later. Every mutation has either an idempotency key or an `If-Match` version precondition. Cancellation is asynchronous because it races with picking and handoff: a cancel request can release inventory before picking, refund after packing, or be rejected after delivery.
+
+Money uses decimal strings in API payloads and persisted snapshots. Floating point is not acceptable for authorizations, tax, tips, or refunds. The external payment provider sees stable operation IDs derived from the order state machine, so a timeout is resolved by querying the provider before retrying rather than by creating a second authorization.
 
 ## 4. Data model
+Start with the obvious entity: an `Order` has customer, address, items, total, and status. That works for digital goods, but it cannot answer the quick-commerce question: which MFC owns the promise? The same SKU can be abundant in one MFC and unavailable in another a mile away. Therefore the order stores an `mfc_id`, address snapshot, price snapshot, and promised delivery time. Historical orders must not change when catalog titles, prices, zones, or taxes are updated.
+
+Next, add `Inventory(mfc_id, sku_id, on_hand)`. That is still insufficient because physical stock and sellable stock are not the same. Units can be reserved by unpicked orders, damaged, held as safety stock, or found missing by a picker. The row needs `reserved`, `damaged`, `safety_stock`, and `version`, with the invariant `on_hand - reserved - damaged - safety_stock >= 0`. Versioning supports conditional updates and lets read projections know what they have seen.
+
+A bare decrement also fails on abandoned checkouts. If checkout reserves stock and the payment challenge is never completed, those units cannot be stuck forever. If a sweeper blindly subtracts from `reserved`, it can release stock that was already consumed by picking. The fix is an `InventoryReservation` per order line with `HELD`, `CONSUMED`, `RELEASED`, and `EXPIRED` states, each transition guarded by the current state. The inventory row is the aggregate counter; the reservation row is the audit trail and compensation handle.
+
+Fulfillment introduces another failure. An order can be confirmed while the warehouse device is offline, a picker can claim then disappear, or scans can retry. A `FulfillmentTask` with a claim lease and scan event IDs separates order truth from warehouse execution. Similarly, a `Delivery` entity separates courier assignment from the order because dispatch may reassign several times without rewriting the whole order.
 
 ```text
 FulfillmentCenter
-- mfc_id
-- region_id
-- location
-- service_polygon
-- operating_hours
-- status
+- mfc_id, region_id, location, service_polygon, operating_hours, status
+- capacity_state: OPEN | DEGRADED | CLOSED
 
-SKU
-- sku_id
-- product_id
-- title
-- unit_size
-- age_restriction
-- substitution_group_id
-
-Inventory
-- mfc_id
-- sku_id
-- on_hand
-- reserved
-- damaged
-- safety_stock
-- version
-- updated_at
+MfcSkuInventory
+- mfc_id, sku_id
+- on_hand, reserved, damaged, safety_stock
+- version, updated_at
 
 InventoryReservation
-- reservation_id
-- order_id
-- mfc_id
-- sku_id
-- quantity
-- expires_at
+- reservation_id, order_id, mfc_id, sku_id, quantity
 - state: HELD | CONSUMED | RELEASED | EXPIRED
+- expires_at, operation_id, created_at
 
 Order
-- order_id
-- customer_id
-- mfc_id
-- delivery_address_snapshot
-- status
-- pricing_snapshot
-- payment_intent_id
-- idempotency_key
-- version
-- created_at
+- order_id, customer_id, mfc_id, idempotency_key
+- delivery_address_snapshot, pricing_snapshot, payment_intent_id
+- state: PENDING | RESERVING | PAYMENT_AUTHORIZING | CONFIRMED | PICKING | PACKED | OUT_FOR_DELIVERY | DELIVERED | CANCELLED | FAILED
+- promised_delivery_at, version, created_at
 
 OrderItem
-- order_id
-- line_id
-- requested_sku_id
-- fulfilled_sku_id
-- requested_quantity
-- fulfilled_quantity
-- unit_price_snapshot
-- substitution_policy
+- order_id, line_id, requested_sku_id, fulfilled_sku_id
+- requested_quantity, fulfilled_quantity, unit_price_snapshot
+- substitution_policy, reservation_id
 
 FulfillmentTask
-- task_id
-- order_id
-- state: QUEUED | PICKING | PACKED | HANDED_OFF
-- picker_id
-- promised_ready_at
+- task_id, order_id, mfc_id
+- state: QUEUED | CLAIMED | PICKING | PACKED | HANDED_OFF
+- picker_id, claim_lease_until, promised_ready_at
 
 Delivery
-- delivery_id
-- order_id
-- courier_id
-- state
-- pickup_at
-- delivered_at
-- proof_of_delivery
+- delivery_id, order_id, mfc_id, courier_id
+- state: OFFERED | ACCEPTED | AT_PICKUP | PICKED_UP | AT_CUSTOMER | DELIVERED | CANCELLED
+- assignment_version, pickup_at, delivered_at
+
+OrderEvent
+- order_id, sequence, event_type, payload, created_at, producer_operation_id
 ```
 
-Maintain an append-only `OrderEvent` timeline for support and audit. Prices, taxes, address, and item descriptions are snapshots so historical orders do not change when catalog data changes.
+Orders, reservations, inventory, and fulfillment tasks live in the MFC home region. Inventory is partitioned by `mfc_id` and then `sku_id` so all lines for one cart can be reserved in a local transaction. Orders can be sharded by `order_id`, but secondary indexes by customer and MFC are needed for support and operations. Courier locations live in a TTL geospatial store keyed by courier and region. Catalog data is centrally managed, but published MFC assortments and availability projections are materialized into read stores and search indexes. Raw location trails, catalog search documents, and analytics aggregates deliberately do not go in the transactional inventory store.
 
-The inventory invariant is:
+> **Key idea.** The data model separates promises from hints. Advisory projections can be rebuilt, but order, reservation, payment, fulfillment, and delivery transitions need durable state machines with operation IDs.
 
-```text
-sellable = on_hand - reserved - damaged - safety_stock
-sellable >= 0
+## 5. High-level design
+The simplest design has the app call a catalog service, pick the nearest MFC, create an order, decrement inventory, charge the card, and ask dispatch for the nearest courier.
+
+```mermaid
+flowchart LR
+    App["Customer app"] --> Catalog["Catalog and availability"]
+    App --> Order["Order service"]
+    Order --> Inventory["Inventory rows"]
+    Order --> Payment["Payment provider"]
+    Order --> Dispatch["Nearest courier dispatch"]
 ```
 
-## 5. Core APIs
+This design breaks in five concrete ways. First, browse availability is stale, so two checkouts can sell the last unit if inventory is decremented outside an atomic predicate. Second, nearest-MFC selection can be wrong when the nearest MFC is missing one item or has a long pick queue. Third, charging before a durable reservation creates refunds for unavailable carts, while reserving without expiration leaks stock. Fourth, nearest-courier dispatch misses batching, predicted ready time, courier acceptance, and bounded optimization. Fifth, frequent courier locations and warehouse scans can overload the order database if treated as ordinary order updates.
 
-### Browse a serviceable catalog
+### Fix 1: Split advisory availability from authoritative reservation
+Browse uses a materialized availability projection per MFC-SKU, fed by inventory versions, catalog publishing, picker reports, cycle counts, and sales events. It can be stale by seconds and still be useful for ranking, hiding risky low-stock items, and warning customers. Checkout does not trust it. The inventory service runs a transaction over sorted SKU rows and applies `reserved = reserved + quantity` only when `on_hand - reserved - damaged - safety_stock >= quantity`. If any line fails, the reservation transaction rolls back and checkout returns the unavailable lines.
 
-```http
-GET /v1/catalog?latitude=37.78&longitude=-122.41
+DoorDash and Instacart evidence points in the same direction. Their grocery availability systems combine retailer feeds, shopper or Dasher reports, photos, purchase history, and confidence ranking, yet still rely on substitutions and final validation. That is exactly the role of this projection: improve browse quality without becoming the source of truth for order confirmation.
+
+### Fix 2: Make MFC assignment cart-aware and capacity-aware
+The app can start with the closest serviceable MFC, but order creation must choose the nearest MFC that can satisfy the whole cart and the delivery promise. The assignment service scores candidate MFCs by service polygon, travel time, item coverage, inventory confidence, pick queue, courier supply, hours, age-restricted handling, and capacity health. If the nearest MFC lacks one item, the system can either choose a slightly farther MFC with the full cart, ask the customer to accept a substitution, or split only if the product explicitly supports multiple deliveries. For instant commerce, the default should be one MFC, because split deliveries double dispatch complexity and confuse the promise.
+
+### Fix 3: Orchestrate checkout as an idempotent saga
+There is no safe distributed transaction across inventory, payment provider, fraud checks, and fulfillment queues. The order service records a `PENDING` order under the idempotency key, reserves inventory with a stable reservation operation ID, authorizes payment with a stable provider operation ID, confirms the order, creates the fulfillment task, and publishes through a transactional outbox. Compensations are explicit: payment failure releases reservations; reservation failure avoids payment; cancellation before picking releases holds; partial fulfillment adjusts capture and inventory after packing.
+
+### Fix 4: Dispatch with a bounded optimizer and a greedy fallback
+Nearest available courier is a baseline, not a design. Dispatch should consider predicted pick completion, courier location, acceptance probability, vehicle type, batch compatibility, promised deadline, pickup wait, and route detour cost. DoorDash describes dispatch evolving from simpler matching to MIP-style optimization for multi-delivery routes, while its routing work uses bounded heuristics and greedy fallbacks because last-mile routing is NP-hard. This system should solve in short windows, keep the best feasible solution found so far, and fall back to greedy assignment when the optimizer times out.
+
+### Fix 5: Separate high-rate signals from order truth
+Courier locations go to a TTL geo store and event stream. Warehouse scans go to fulfillment task state and append-only scan events. The order timeline receives durable milestones, not every GPS point or aisle scan. Tracking reads combine order state, delivery state, latest courier point, and ETA projection. This keeps the order database small, auditable, and strongly guarded while still giving customers live updates.
+
+### Putting it together
+```mermaid
+flowchart TD
+    App["Customer app"] --> Gateway["API gateway"]
+    Gateway --> Serviceability["Serviceability and candidate MFCs"]
+    Gateway --> Catalog["Catalog read API"]
+    Catalog --> Projection["MFC availability projection"]
+    Catalog --> Search["Search index"]
+    Gateway --> Order["Order orchestrator with idempotency"]
+    Order --> Assign["Cart and MFC assignment"]
+    Assign --> Eta["ETA promise service"]
+    Order --> Inventory["Inventory reservation service"]
+    Inventory --> InvDb[("MFC inventory database")]
+    Order --> Payment["Payment service"]
+    Order --> Fulfillment["Fulfillment service"]
+    Fulfillment --> PickQueue[("MFC pick queue")]
+    Fulfillment --> Dispatch["Dispatch service"]
+    Dispatch --> Optimizer["Bounded optimizer"]
+    Dispatch --> Geo[("Courier geo store")]
+    Courier["Courier app"] --> Location["Location ingestion"]
+    Location --> Geo
+    Order --> Outbox[("Transactional outbox")]
+    Outbox --> Events["Event stream"]
+    Events --> Notify["Notification and tracking"]
 ```
 
-The response includes an `mfc_id`, catalog version, estimated availability, prices, and delivery estimate. Browse availability is advisory; checkout performs authoritative reservation. For grocery and quick commerce, search and browse should resolve against the customer's candidate MFCs, then revalidate authoritative price and stock before checkout because hub inventory can change between keystrokes and payment.
+A typical request starts with serviceability finding candidate MFCs for the address. Catalog reads a materialized assortment and advisory availability projection for those MFCs. At checkout, the order orchestrator uses the idempotency key to create or resume the order attempt, asks assignment for the best MFC for the exact cart, obtains a probabilistic ETA, reserves inventory transactionally, authorizes payment, persists the confirmed order, and emits an outbox event. Fulfillment consumes the event into the MFC pick queue, while dispatch observes predicted ready time and courier supply to assign a courier. The order database owns customer-visible lifecycle state, the inventory database owns sellable units, the geo store owns current courier position, and projections can be rebuilt from authoritative events.
 
-### Create an order
+> **Key idea.** Each component traces back to a specific failure of the naive design.
 
-```http
-POST /v1/orders
-Idempotency-Key: 6d944...
+## 6. Deep dives
+### 6.1 Advisory availability versus authoritative reservation
+**Question.** Two customers see one low-stock item as available, add it to cart, and check out at the same time. Which one gets the unit, and what exactly prevents both from being confirmed?
+<details><summary>Answer</summary>
 
-{
-  "mfc_id": "mfc-17",
-  "cart_version": 12,
-  "address_id": "addr-3",
-  "payment_method_id": "pm-8",
-  "items": [
-    {"sku_id": "sku-42", "quantity": 2, "substitution": "BEST_MATCH"}
-  ],
-  "tip": 5.00
-}
-```
+Browse availability is only a hint. Checkout runs a single MFC-scoped transaction that conditionally increments `reserved` for each SKU only when sellable stock is sufficient. One transaction commits first; the other observes insufficient sellable stock and fails or requests substitution.
 
-```json
-{
-  "order_id": "ord-91",
-  "status": "CONFIRMED",
-  "amount_authorized": 34.18,
-  "promised_delivery_at": "2026-10-13T08:05:00Z"
-}
-```
+</details>
 
-### Tracking and courier APIs
+A tempting answer is to make the browse cache fresher. That helps conversion, but it does not solve the race. Even if the cache updates every second, two checkouts can arrive within the same second. Even if it updates every 100 ms, a picker can mark a unit damaged after the customer opens the cart. The invariant belongs at the write authority: a confirmed order must have corresponding reserved units, and the sum of reserved, damaged, and safety stock must never exceed on-hand.
 
-```http
-GET  /v1/orders/{order_id}
-GET  /v1/orders/{order_id}/tracking
-POST /v1/orders/{order_id}/cancel
-POST /v1/couriers/{courier_id}/locations
-POST /v1/deliveries/{delivery_id}/accept
-POST /v1/deliveries/{delivery_id}/complete
-```
-
-All mutation APIs require an idempotency key or a version precondition. Mobile clients retry frequently across poor networks.
-
-## 6. Serviceability, catalog, and ETA
-
-1. Geocode the address and validate deliverability.
-2. Query a spatial index for MFC service polygons containing the point.
-3. Exclude closed, unhealthy, overloaded, or capacity-constrained centers.
-4. Select an MFC using distance, inventory coverage, queue depth, courier supply, and promised SLA.
-5. Return that MFC's assortment and prices.
-
-ETA combines:
-
-```text
-ETA = order_queue_delay
-    + pick_and_pack_time
-    + courier_assignment_delay
-    + pickup_wait
-    + route_travel_time
-```
-
-Use percentile or probabilistic estimates rather than averages and recalibrate continuously. The displayed ETA should include capacity and uncertainty; optimistic straight-line distance alone causes missed promises. Keep an ML fallback path with clipped inputs/outputs or conservative heuristics so upstream feature-unit bugs do not produce unsafe promises.
-
-## 7. Checkout and order saga
-
-One practical ordering sequence is:
-
-1. Validate cart, MFC, address, age restrictions, price version, and limits.
-2. Create `PENDING` order idempotently.
-3. Atomically reserve all inventory lines at the selected MFC.
-4. Authorize the estimated payment amount.
-5. Commit the order as `CONFIRMED` and create the fulfillment task.
-6. Publish the order event through a transactional outbox.
-7. Begin picking; later capture the final amount after substitutions and weighed items.
-
-Compensations:
-
-- Inventory reservation fails: reject with unavailable items; no payment authorization.
-- Payment authorization fails: release reservations.
-- Fulfillment creation fails after confirmation: retry from outbox; operator queue if prolonged.
-- Order is cancelled before picking: release inventory and void authorization.
-- Partial fulfillment: adjust inventory, total, tax, and captured amount.
-
-There is no cross-service exactly-once transaction. The goal is exactly-once business effect through stable operation IDs, idempotent handlers, state-machine guards, and reconciliation.
-
-## 8. Inventory consistency and concurrency
-
-Inventory reservation is the central correctness problem. Execute all lines for one MFC in a database transaction:
+The reservation transaction sorts line items by `sku_id` to reduce deadlocks, then updates each row with a predicate:
 
 ```sql
-UPDATE inventory
+UPDATE mfc_sku_inventory
 SET reserved = reserved + :quantity,
     version = version + 1
 WHERE mfc_id = :mfc_id
@@ -260,227 +216,180 @@ WHERE mfc_id = :mfc_id
   AND on_hand - reserved - damaged - safety_stock >= :quantity;
 ```
 
-Lock rows in sorted `sku_id` order to reduce deadlocks. If any line fails, roll back the entire reservation unless the product explicitly supports partial checkout.
+If any update affects zero rows, the transaction rolls back all earlier lines. This is important for quick commerce because the delivery promise depends on one MFC having every item. Partial reservation would create a stranded order unless the customer already opted into substitutions or partial fulfillment. The reservation service also writes `InventoryReservation` records in the same transaction. Those records are not a substitute for the counter predicate; they are the audit trail, expiration handle, and reconciliation source.
 
-Browse reads use an eventually consistent cache. Checkout uses the primary inventory store. Reservation records have expirations; a sweeper releases abandoned holds, but it must transition reservation state conditionally so it cannot release a consumed hold.
-
-Physical stock can still differ because of shrinkage, damage, or mis-picks. Cycle counts and picker reports produce adjustments. Safety stock and conservative low-stock thresholds trade sales for fewer substitutions. For browse/search ranking, feed inventory confidence into retrieval or ranking, but keep a final real-time inventory check in the order path; stale projections should hide or down-rank risky items, not become the source of truth.
-
-## 9. Picking, substitution, and handoff
-
-Fulfillment queues are partitioned by MFC. Within a center, prioritize by promised time, temperature requirements, and route batching.
-
-1. A picker claims a task with a lease.
-2. The app gives a route optimized for aisle/bin locations.
-3. Each scan validates barcode and quantity.
-4. Missing items trigger the customer's substitution policy and a ranked replacement list based on historical substitutions, product attributes, and current MFC availability.
-5. Material price changes may request customer approval with a deadline.
-6. Packing records bags, temperature zones, restricted items, and final total.
-7. A handoff scan transfers custody to the assigned courier.
-
-Picker leases expire and can be reclaimed. Every scan uses a unique event ID; retries must not decrement inventory twice.
-
-## 10. Dispatch and live tracking
-
-Dispatch continuously matches ready-soon orders to couriers using:
-
-- Predicted pick completion.
-- Courier position and vehicle type.
-- Delivery route and promised SLA.
-- Batch compatibility and detour cost.
-- Courier capacity, breaks, and fairness.
-
-Start with greedy constrained matching every few seconds; introduce optimization windows, MIP/min-cost matching, or vehicle-routing heuristics when batching value justifies complexity. Keep the optimization window bounded by the promise and use a greedy fallback if the solver times out.
-
-Courier locations enter a high-write, TTL-based geo store, not the order database. Keep the latest point for dispatch and a sampled, retention-limited trail for support. Customers receive throttled updates over WebSocket/SSE; raw courier coordinates should stop after delivery.
-
-Delivery state changes use compare-and-swap:
-
-```text
-ASSIGNED -> ACCEPTED -> AT_PICKUP -> PICKED_UP -> AT_CUSTOMER -> DELIVERED
+```mermaid
+sequenceDiagram
+    participant C as Customer
+    participant O as Order service
+    participant I as Inventory service
+    participant DB as Inventory database
+    C->>O: POST order with idempotency key
+    O->>I: Reserve cart for MFC
+    I->>DB: BEGIN and update SKU rows with sellable predicate
+    alt all rows updated
+        I->>DB: Insert HELD reservations and COMMIT
+        I-->>O: Reserved
+    else any row unavailable
+        I->>DB: ROLLBACK
+        I-->>O: Unavailable lines
+    end
+    O-->>C: Confirm or ask for substitution
 ```
 
-Proof can include a photo, PIN, signature, or age verification depending on order policy.
+Reservation expiration is a subtle source of bugs. A sweeper can release abandoned holds, but it must transition `HELD -> EXPIRED` conditionally and decrement `reserved` in the same transaction. It must not release a hold that has already become `CONSUMED` by picking. Similarly, payment failure releases `HELD -> RELEASED`; cancellation before picking does the same; packing consumes the reservation or converts it to a substitution adjustment. Reconciliation periodically compares order state and reservation state: a `FAILED` order with `HELD` reservations should release, while a `CONFIRMED` order with no active reservation is a page-worthy defect.
 
-## 11. Payments, refunds, and tips
+Precomputed projections still matter. DoorDash's grocery inventory work describes combining disparate sources and confidence ranking for digital inventory, and Instacart's availability systems predict hundreds of millions of listings on a schedule while still supporting replacements. For an owned MFC, the projection can be stronger than a marketplace feed because the operator controls receipts, scans, and cycle counts, but it is still not linearizable. Its job is to reduce bad carts before checkout: hide items below a low-stock threshold, down-rank low-confidence SKUs, refresh popular SKU projections more often, and display substitution prompts early.
 
-- Authorize estimated total at checkout, including a bounded substitution buffer where lawful.
-- Capture the final fulfilled total after packing or delivery.
-- Void unused authorization and issue line-level refunds when needed.
-- Keep tips separately adjustable within a policy window.
-- Store provider tokens, never raw card data.
-- Use an internal payment ledger so provider webhooks and order state can be reconciled.
+The trade-off is sales versus disappointment. Higher safety stock and conservative projections reduce substitutions and support contacts but hide sellable units. Aggressive projections increase conversion but push failures into checkout or picking. The right setting is per SKU and MFC: a high-value item with frequent shrinkage deserves a larger buffer than canned seltzer with stable replenishment. Signals worth watching: checkout stock-failure rate by MFC-SKU, browse-to-checkout stale availability, reservation deadlocks, expired holds, adjustment rate, and substitution rate.
 
-Payment provider timeouts are ambiguous. Query by the stable payment operation ID before retrying; never create a new charge merely because the response was lost.
+> **Strong-answer criteria.** A senior answer distinguishes advisory reads from authoritative writes and names the actual concurrency control. It also covers expiration, compensation, and physical-stock drift rather than pretending the database row always matches the shelf.
 
-## 12. Partitioning and storage
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Trust the catalog cache and decrement asynchronously after payment | Two checkouts can confirm the last unit, and refunds become the normal path. |
+| Good | Use a transactional inventory update at checkout | Prevents oversell but may still leak stock without reservation state and expiration guards. |
+| Great | Use MFC-scoped conditional reservation, reservation state transitions, safety stock, projections, and reconciliation | Preserves correctness while keeping browse fast and giving operations levers for shrinkage and stale signals. |
 
-- Partition inventory and fulfillment by `mfc_id`; this preserves local transactions and isolates hot centers.
-- Partition orders primarily by `order_id`, with secondary customer and MFC indexes.
-- Partition the event stream by `order_id` for ordered lifecycle events; use separate MFC topics for warehouse scheduling.
-- Store catalog product data centrally but materialize MFC-specific assortment, price, and availability views. Split ingestion, publishing, and search indexing so sparse retailer or MFC feeds can be enriched, validated, versioned, and rolled back before customer exposure.
-- Store location points in a geospatial/time-series system with TTL.
-- Store receipts and proof images in object storage with signed access.
+### 6.2 MFC assignment and the ETA promise
+**Question.** The closest MFC can deliver in 14 minutes but lacks one cart item; a farther MFC has every item but likely delivers in 28 minutes. What does checkout promise?
+<details><summary>Answer</summary>
 
-For a hot MFC, scale reads through caches and replicas, but keep each SKU's reservation authority single-writer. Splitting by `sku_id` increases write capacity but makes multi-line atomic reservation harder; only do so after measuring contention.
+Checkout should promise from the best MFC that can satisfy the complete accepted cart and capacity constraints. If the closest MFC cannot reserve every item, the system either asks for a substitution, uses the farther MFC with an honest ETA, or rejects the cart; it should not promise from the closest MFC and hope picking fixes it.
 
-## 13. Reliability and important failures
+</details>
 
-| Failure | Handling |
-|---|---|
-| Client retries checkout | Return original order by idempotency key and customer |
-| Reservation succeeds, payment fails | Saga releases reservation |
-| Payment times out | Query provider by operation ID before retry |
-| Reservation expires during commit | State transition and transaction prevent release of consumed hold |
-| Picker app disconnects | Durable task state and expiring claim lease |
-| Item physically missing | Substitute/refund and inventory adjustment |
-| Courier rejects or disappears | Lease timeout and redispatch |
-| Location updates stop | Show stale indicator and use last ETA |
-| Event delivered twice | Idempotent consumer inbox/state guard |
-| MFC loses connectivity | Stop new promises; local operational fallback and later reconciliation |
-| Region fails | Route unaffected MFCs normally; fenced failover for impacted partitions |
+The naive serviceability algorithm draws a radius around the address and chooses the nearest open MFC. That is enough to show a landing page, but it is not enough to confirm an order. Quick commerce sells a bundle of items plus a time promise. The bundle is feasible only if one MFC can reserve all accepted items. The time promise is feasible only if that MFC's pick queue, staffing, courier supply, travel time, and uncertainty fit the service level.
 
-Run reconcilers for inventory reservations versus order state, payment ledger versus provider settlement, packed items versus captured amount, and delivered orders versus courier payout.
+The assignment service therefore works in two stages. During browse, it finds a small set of candidate MFCs whose polygons contain the address or whose drive time is below a threshold. It annotates each with advisory catalog coverage and an ETA distribution. During checkout, it re-scores candidates for the exact cart and asks inventory to reserve at the selected MFC. If reservation fails because the projection was stale, assignment can try the next candidate only if the user experience allows it and payment has not been committed. Usually the cleaner path is to return unavailable lines and substitutions, because silent MFC switching can change price, fees, taxes, delivery time, alcohol eligibility, or item assortment.
 
-## 14. Multi-region design
+ETA should be a distribution, not a single average. A practical model decomposes the promise into `queue_delay + pick_pack_time + courier_assignment_delay + pickup_wait + route_travel_time`. Each component can be predicted from local features: current MFC queue depth, pickers clocked in, item count, temperature zones, historical pick duration, courier density, weather, traffic, batching window, and acceptance rates. DoorDash's ETA writing is useful evidence here because it separates an accuracy-focused probabilistic base layer from decision layers that turn forecasts into customer-facing promises. This design should do the same: predict `p50`, `p75`, and `p90`, then choose a promise policy such as showing a range or promising near `p80` when capacity is tight.
 
-MFCs are naturally regional:
-
-- Assign each MFC a home region for inventory, order orchestration, and fulfillment writes.
-- Replicate within three availability zones synchronously.
-- Route catalog and tracking reads to nearby replicas.
-- Replicate order history asynchronously to a disaster-recovery region.
-- Keep courier and customer traffic pinned to the active region for the delivery.
-
-During regional failure, do not accept inventory writes in two regions. Fence the former primary, promote a sufficiently current replica, and temporarily mark uncertain centers unavailable. A few minutes of order unavailability is preferable to overselling and duplicate dispatch.
-
-## 15. Security, safety, and compliance
-
-- TLS, encryption at rest, managed secrets, and least-privilege service identities.
-- Tokenize payment instruments and minimize PCI scope.
-- Encrypt precise addresses and courier locations; use strict retention and access auditing.
-- Require step-up checks for account changes, refunds, and high-risk orders.
-- Detect promotion abuse, account takeover, chargeback patterns, and courier GPS spoofing.
-- Verify age and identity for alcohol or regulated products; record required evidence.
-- Separate customer and courier contact details using masked communication.
-- Restrict warehouse devices by role and MFC.
-- Apply rate limits and signed requests to courier location ingestion.
-- Support deletion, residency, tax, receipt, and labor-policy obligations by market.
-
-## 16. Observability and SLOs
-
-Track:
-
-- Catalog latency, error rate, and stale-availability rate.
-- Checkout conversion and failure by inventory, payment, or validation reason.
-- Reservation conflicts, expirations, and inventory adjustment rate.
-- Order acceptance-to-pick, pick duration, pack duration, and handoff wait.
-- Courier assignment time, rejection rate, location freshness, and batch utilization.
-- Promised versus actual delivery time by MFC and time of day.
-- Substitution, cancellation, refund, chargeback, and support-contact rates.
-- Saga age, outbox lag, dead-letter events, and reconciliation discrepancies.
-- MFC queue depth, picker capacity, courier supply, and system health.
-
-The customer-facing north-star SLI is:
-
-```text
-percentage of confirmed orders delivered complete and within promised window
+```mermaid
+flowchart LR
+    Cart["Exact cart"] --> Candidates["Candidate MFCs"]
+    Address["Delivery address"] --> Candidates
+    Candidates --> Coverage["Inventory coverage and confidence"]
+    Candidates --> Queue["Pick queue and staffing"]
+    Candidates --> Supply["Courier supply"]
+    Coverage --> Score["Promise scorer"]
+    Queue --> Score
+    Supply --> Score
+    Score --> Reserve["Reserve at chosen MFC"]
+    Reserve --> Promise["Confirmed ETA promise"]
 ```
 
-Operational dashboards must be scoped per MFC; global averages hide local failures.
+This is where ML reliability becomes product reliability. Swiggy's ML reliability discussion gives a concrete class of failure: a feature unit changes upstream and corrupts ETA predictions unless the serving layer clips inputs and outputs, exposes error codes, and has fallback heuristics. A quick-commerce ETA service should reject impossible predictions such as negative pick time, cap travel speed, monitor feature drift, shadow new models, and fall back to conservative rules when features are missing. A bad ETA is not just a ranking bug; it can cause late orders, refunds, and overloaded MFCs.
 
-## 17. Major trade-offs
+There is also a fairness and stability problem. If the assignment service always picks the MFC with the shortest current ETA, traffic can oscillate between neighboring centers as queues fluctuate. Use hysteresis and capacity buckets: prefer the user's default MFC unless another candidate is materially better, and stop promising a center before it is fully saturated. Operators need a manual drain mode for freezer failures, staffing shortages, or local events. In drain mode, browse projections can still show items, but checkout assignment treats the MFC as unavailable or capacity constrained.
 
-### Strong inventory versus available browsing
+The key trade-off is whether to split an order across MFCs. Splitting can recover revenue when no single MFC has all items, but it creates two picks, two courier routes, two handoffs, two tracking experiences, and ambiguous substitutions. For a 15-30 minute owned-inventory service, the default should be no split. Consider splitting only for high-value baskets, scheduled deliveries, or enterprise customers, and present it explicitly as two deliveries. Signals worth watching: promised-versus-actual delivery by MFC and percentile, assignment retry rate, MFC switching at checkout, ETA model fallback rate, late orders caused by pick queue versus courier delay, and manual drain duration.
 
-- Strong checkout reservation prevents overselling.
-- Eventually consistent browse availability is faster and cheaper.
-- Clearly treat the cart as advisory until checkout.
+> **Strong-answer criteria.** A strong design treats MFC choice as a feasibility and promise problem, not just geospatial lookup. It includes probabilistic ETA, capacity health, model fallbacks, and user-visible handling when no single MFC can satisfy the cart.
 
-### Reserve before or after payment
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Always choose the nearest MFC and show a fixed 20-minute ETA | It ignores cart completeness, queue depth, courier supply, and uncertainty. |
+| Good | Score MFCs by inventory coverage and distance | Better feasibility, but still misses operational capacity and promise calibration. |
+| Great | Choose the best full-cart MFC using reservation, probabilistic multi-stage ETA, capacity controls, fallbacks, and explicit substitution or rejection flows | Aligns the customer promise with physical stock and local delivery reality. |
 
-- Reserving first prevents charging for unavailable items but briefly holds stock for failed payments.
-- Authorizing first increases charge reversals and can charge when stock disappears.
-- Use short inventory holds, then authorize.
+### 6.3 Dispatch, batching, and bounded optimization
+**Question.** Five orders will be packed within six minutes and eight couriers are nearby. Do we assign each order immediately to the nearest courier or wait to batch?
+<details><summary>Answer</summary>
 
-### Central versus MFC-local authority
+Use a bounded dispatch window. Optimize assignments and compatible batches against promised deadlines, predicted ready times, detour cost, and courier state, but keep a greedy feasible assignment as fallback if the optimizer times out or the batching window would risk a promise.
 
-- Central systems simplify operations and analytics.
-- MFC-local writes reduce latency and isolate failures.
-- Use regional authority per MFC with centralized aggregated views.
+</details>
 
-### Immediate versus batched dispatch
+Instant commerce dispatch is hard because the system controls both the warehouse queue and the courier handoff. If dispatch assigns too early, couriers wait at the MFC while items are still being picked. If it assigns too late, packed orders sit on a shelf and miss the promise. If it greedily picks the nearest courier for each order, it misses two-order routes that reduce cost with a tiny detour. If it waits too long for the perfect batch, it sacrifices the very speed customers bought.
 
-- Immediate dispatch minimizes assignment delay.
-- Short batching windows improve courier utilization and route economics.
-- Bound optimization by the delivery promise.
+The dispatch service should maintain a rolling view of ready-now and ready-soon orders. Fulfillment publishes predicted ready time as the picker claims and scans items; ETA publishes the latest customer deadline; location ingestion maintains each courier's latest position and freshness; courier service provides capacity, vehicle type, break state, and acceptance history. Every few seconds, dispatch builds a bounded optimization problem for one region or MFC cluster. The objective can minimize weighted lateness, pickup wait, travel time, detour, and unfairness while respecting hard constraints such as age-restricted eligibility, vehicle capacity, temperature handling, and maximum batch size.
 
-### Accuracy versus sales
+DoorDash's dispatch and routing posts are directly relevant. They describe moving beyond simple bipartite matching toward MIP-style formulations for multi-delivery routes, and using ruin-and-recreate heuristics with time limits and greedy benchmarks because routing is NP-hard. The lesson is not to copy a specific algorithm; it is to put a latency budget around the optimizer. A solver that returns an ideal plan after 45 seconds is useless for a 20-minute promise. A solver that returns the best current feasible plan after 300 ms, plus a greedy fallback, is production-shaped.
 
-- Safety stock reduces substitutions and overselling.
-- Aggressive sellable counts improve conversion but worsen customer experience.
+```mermaid
+sequenceDiagram
+    participant F as Fulfillment
+    participant D as Dispatch
+    participant G as Geo store
+    participant S as Solver
+    participant C as Courier app
+    F->>D: Ready-soon orders with predicted ready time
+    D->>G: Read fresh courier positions and states
+    D->>S: Optimize within time budget
+    alt solver returns feasible plan
+        S-->>D: Assignments and batches
+    else timeout or infeasible
+        D->>D: Greedy deadline-safe assignment
+    end
+    D->>C: Offer delivery or batch
+    C-->>D: Accept or reject
+```
 
-## 18. Lessons from production systems
+Courier acceptance makes assignment a lease, not a fact. An offer should expire quickly. If the courier rejects or does not respond, dispatch increments an assignment version and offers the order elsewhere. Delivery transitions use compare-and-swap so a stale courier cannot accept an old assignment after redispatch. For batched routes, each stop has its own promised deadline and proof requirements; the route can be partially unwound if one order is cancelled before pickup, but after pickup the system usually finishes the route and handles refunds separately.
 
-### DoorDash: dispatch is ML plus optimization, not nearest courier
+Batching must be conservative near deadlines. A simple policy is to allow batching only if the predicted `p90` delivery time for every order remains before its promise plus a small grace threshold, and to cap detour per order. The optimization can be more aggressive when demand is high and courier supply is low, but the customer-facing promise should already account for that. If the ETA service knows dispatch is using a 90-second batching window, the original promise must include that potential wait; otherwise dispatch invisibly steals slack.
 
-DoorDash's dispatch writing frames matching as a real-time optimization problem over predicted ready times, travel times, Dasher states, quality, and efficiency. Their move from bipartite matching/Hungarian-style assignment to MIP-style formulations unlocked multi-delivery routes and larger regional solve windows. In this design, Dispatch should treat greedy nearest-courier matching as a fallback, not the target architecture, and should log solver alternatives for safe rollout.
+Tracking should not expose every internal assignment churn. Customers care that the order is being prepared, picked up, nearby, or delivered. Courier location should be throttled and blurred according to policy, then stopped after delivery. The order database stores `ASSIGNED`, `PICKED_UP`, and `DELIVERED`; the geo store stores fresh points with TTL. Signals worth watching: solver latency, fallback rate, batch utilization, courier wait at MFC, packed-to-pickup time, rejection rate, stale location rate, lateness by dispatch cause, and customer contacts about confusing tracking.
 
-### DoorDash: route optimization needs bounded heuristics and fallbacks
+> **Strong-answer criteria.** A senior answer does not stop at nearest courier. It describes the bounded optimization problem, deadline-safe fallback, assignment leases, and how dispatch slack is included in the ETA promise.
 
-DoorDash's routing post describes last-mile routing as NP-hard and uses ruin-and-recreate with termination criteria such as time limits or iteration caps; it also keeps a trivial greedy route as a fallback and benchmark. For instant commerce, batching/pickup routing must run inside seconds, so every optimizer needs a latency budget, a partial-solution strategy, and an operational fallback that preserves delivery correctness even if economics degrade.
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Assign every order to the nearest courier immediately | Causes courier wait, poor batching, and missed deadlines when ready times differ. |
+| Good | Run periodic matching using courier distance and order deadlines | Handles some contention but may fail under solver timeout, rejection, and batching constraints. |
+| Great | Maintain ready-soon state, solve bounded batch assignments, use greedy fallback, lease offers, CAS delivery transitions, and feed batching delay into ETA | Improves economics without making the delivery promise depend on an unbounded optimizer. |
 
-### DoorDash: ETA should be probabilistic and multi-stage
+## 7. Variants
+**10x scale.** At `20M` orders per day, the global average becomes `20,000,000 / 86,400 = 231.5` orders per second and peak-hour traffic might exceed `278` orders per second before local bursts. The architecture remains MFC-scoped, but hot MFCs need stricter admission control, per-SKU contention monitoring, read projection fanout, and possibly SKU-bucketed inventory writers. Do not split a single hot SKU across active writers unless the product accepts weaker multi-line atomicity or introduces a reservation coordinator.
 
-DoorDash's NextGen ETA system separates an accuracy-first probabilistic base layer from a decision layer and uses multi-task modeling across homepage, store, checkout, food, grocery, pickup, and delivery ETA use cases. This maps directly to the ETA formula here: queue delay, pick time, assignment delay, pickup wait, and travel time should be modeled as distributions and then transformed into customer promises by a business decision layer.
+**Active-active regions.** MFCs are naturally regional, so each MFC should have one write home for inventory, fulfillment, and order orchestration. Catalog and order history can replicate broadly, but inventory writes should not be accepted in two regions at once. During failover, fence the old primary, promote a sufficiently current replica, and mark uncertain MFCs unavailable until reservation state is reconciled. A few minutes of checkout unavailability is better than duplicate dispatch or oversell.
 
-### DoorDash: inventory availability is a confidence problem
+**Regulated items.** Alcohol, tobacco, pharmacy, or age-restricted goods add constraints to assignment and dispatch. The chosen MFC must be licensed for the address, the courier must be eligible, the customer may need identity verification, and proof must be retained according to market rules. The inventory reservation mechanism stays the same, but ETA and dispatch must include compliance checks as hard constraints, not post-processing.
 
-DoorDash's grocery inventory work combines merchant feeds, operator updates, Dasher reports, photos, historical order data, and source-confidence ranking, then precomputes projections that feed search ranking. It reports nearly 90% exact-item fulfillment after cleaning and prediction, but still relies on substitutions for the rest. This design should therefore expose availability confidence in browse/search while preserving authoritative reservation at checkout.
+**Marketplace or partner inventory.** If the service stops owning all MFC stock and adds partner stores, availability becomes less trustworthy. Browse projections need source-confidence scoring, checkout may need partner-side reservation APIs, and substitution flows become more prominent. The transferable invariant still holds: do not confirm a promise until one fulfillment node has reserved or contractually accepted every item.
 
-### Instacart: availability and substitutions belong in the shopping flow
+## 8. The transferable pattern
+The reusable pattern is a fast advisory read path paired with a slower authoritative commit path. Search, browsing, recommendations, and ETA previews use projections because they must be low-latency and high-fanout. The moment the user asks for a scarce resource, the system switches to a write authority that uses conditional updates, leases, fencing, or state-machine guards. Ticket sales, hotel booking, restaurant reservations, and flash-sale ecommerce all share this shape; see [Ticketmaster](./ticketmaster-system-design.md) for another version where stale discovery gives way to authoritative seat holds.
 
-Instacart predicts over 500 million listings every 60 minutes across nearly 25,000 stores using retailer data, store location, purchase history, shopper input, and time-of-day/day-of-week features. It pairs that item availability model with replacement recommendations because customers shopping for themselves commonly replace items and many customers leave replacement choice to the shopper. For MFC commerce, this means the app should request substitution preferences before checkout, not after a picker reports an outage.
+The second pattern is promise composition across physical and external systems. The customer sees one order, but the promise depends on inventory, payment, picking, courier acceptance, routing, and sometimes regulation. There is no global exactly-once transaction across those systems. Production-grade designs make each local transition idempotent, record an audit event, publish through an outbox, and run reconcilers for the gaps between physical reality and software state.
 
-### Instacart: cart pricing is contextual and must be confirmed at order creation
+## Review
+The design starts from the binding constraint that browse availability is advisory while checkout must reserve real inventory at one MFC. That forces an MFC-scoped inventory authority with conditional updates, reservation records, expiration guards, and reconciliation. It also forces cart-aware MFC assignment because the delivery promise depends on the nearest center that can satisfy the whole cart and has enough operational capacity. ETA is treated as a probabilistic, multi-stage promise rather than a distance calculation. Dispatch uses bounded optimization for batching and route economics, but preserves correctness with greedy fallback, assignment leases, and compare-and-swap delivery transitions. High-rate signals such as courier location and search projections stay outside transactional order storage, while the order timeline, reservation state, payment operations, fulfillment tasks, and delivery milestones remain durable and auditable.
 
-Instacart describes search over 500 million item listings across 20,000 locations and basket pricing with more than 10 million active deals or discounts. It confirms totals and creates payment authorization at order creation after applying customer, retailer, CPG, loyalty, bundle, delivery, and credit rules. This supports the design's pricing snapshots and price-version validation: browse totals are provisional; checkout must persist the exact pricing inputs used for authorization and later reconciliation.
+### Check your understanding
+1. Why is it acceptable for browse availability to be stale but not checkout availability?
+   <details><summary>Answer</summary>
 
-### Uber Eats: retail catalog needs enrichment, versioning, and rollback
+   Browse is a hint used for ranking and user guidance; it can be corrected before the customer is charged or promised delivery. Checkout creates a business commitment, so it must use the authoritative inventory predicate and reserve real units before confirmation.
 
-Uber's INCA system was built when Uber Eats expanded from restaurant menus to grocery, pharmacy, and retail catalogs with hundreds of thousands of SKUs per retailer. It splits ingestion, storage, publishing, and indexing; processes billions of changes daily; targets under-one-minute critical price/availability updates; merges/enriches sparse feeds; and snapshots published catalogs for instant rollback. The catalog service here should similarly version published MFC assortments and keep bad feed rollbacks separate from inventory reservation correctness.
+   </details>
+2. Why does the design prefer one MFC per order?
+   <details><summary>Answer</summary>
 
-### Zepto: hyperlocal search must revalidate inventory downstream
+   One MFC keeps reservation, picking, dispatch, tracking, pricing, and customer expectations coherent. Splitting can recover revenue but doubles fulfillment and delivery complexity, so it should be explicit and limited to variants that justify it.
 
-Zepto's search architecture resolves query understanding, fulfillment zone, retrieval, live ranking, ads, and filters within tight latency budgets while serving over a million search-platform requests per minute. Because inventory, personalization, session state, experiments, and store configuration make full page caching invalid, Zepto keeps retrieval/ranking live and uses Product Assortment/Product Service for authoritative inventory and price resolution. This maps to using cached candidate lists only as hints and doing final stock/price validation before cart and checkout.
+   </details>
+3. What bug can an inventory expiration sweeper introduce?
+   <details><summary>Answer</summary>
 
-### Zepto: prioritize freshness signals to avoid indexing backpressure
+   If it blindly releases expired reservations, it can decrement `reserved` for a hold already consumed by picking or released by cancellation. It must conditionally transition only `HELD` reservations and update inventory in the same transaction.
 
-The AWS/Zepto OpenSearch write-up separates high-priority inventory/catalog/pricing updates from lower-priority enrichment updates with Kafka/MSK topics and Flink indexing jobs. It also shows a practical trade-off: a 10-second search-index refresh was acceptable because real-time inventory service validation happened after retrieval, enabling 2x indexing throughput and 30% cost savings. For this design, search-index freshness can lag slightly if checkout and product-enrichment reads hit the real-time inventory authority.
+   </details>
+4. Why is ETA modeled as a distribution?
+   <details><summary>Answer</summary>
 
-### Swiggy: ML reliability is part of the product SLA
+   Pick time, courier assignment, pickup wait, and travel time vary by local conditions. A distribution lets the business choose an honest promise percentile and manage uncertainty, while averages create systematically late orders during volatile periods.
 
-Swiggy's ML reliability post calls out ETA and Instamart recommendations as business-critical and gives a concrete failure mode: an upstream service changing time units from microseconds to milliseconds could corrupt ETA predictions without clipping and observability. For local delivery, ML serving should expose error codes, shadow-mode validation, input/output clipping, fallback heuristics, and data-drift monitoring as first-class reliability features.
+   </details>
+5. Why does dispatch need a greedy fallback if it has an optimizer?
+   <details><summary>Answer</summary>
 
-## 19. Recommended interview presentation
+   Routing and batching are time-constrained optimization problems. If the solver times out or cannot find an improved plan quickly, the system still needs a feasible deadline-safe assignment so correctness and customer promises do not depend on an unbounded computation.
 
-A clear 45-minute sequence is:
+   </details>
 
-1. Clarify delivery promise, MFC model, substitutions, and regulated goods.
-2. Estimate orders, browse QPS, inventory rows, and courier updates.
-3. Draw catalog, order saga, inventory, fulfillment, dispatch, and tracking.
-4. Deep-dive into atomic inventory reservation and idempotent checkout.
-5. Walk through picking, substitution, payment capture, and courier handoff.
-6. Explain dispatch/ETA and high-volume location ingestion.
-7. Cover MFC partitioning, failure reconciliation, and regional failover.
-8. Finish with overselling, batching, and availability trade-offs.
-
-The central design insight is:
-
-> Keep inventory authority and fulfillment local to a specific MFC, coordinate checkout as an idempotent saga, and make every physical or financial transition auditable because real-world stock, payments, and courier state will inevitably diverge and require reconciliation.
-
-## Further reading: curated engineering blogs
-
+## Sources and further reading
 | Source | Article | Why it matters |
 |---|---|---|
 | DoorDash | [Next-Generation Optimization for Dasher Dispatch at DoorDash](https://careersatdoordash.com/blog/next-generation-optimization-for-dasher-dispatch-at-doordash/) | Shows why dispatch evolves from simple matching to MIP-style optimization with predictions, constraints, rollout safety, and multi-delivery routes. |
@@ -493,4 +402,3 @@ The central design insight is:
 | Zepto | [Building Search for a 10-Minute World](https://blog.zepto.com/building-search-for-a-10-minute-world-43b1992f5dca) | Explains hyperlocal quick-commerce search where query intent, fulfillment zone, inventory, price, and ranking are resolved live. |
 | Zepto / AWS | [How Zepto powers sub-second search using OpenSearch Service OR2 instances](https://aws.amazon.com/blogs/big-data/how-zepto-powers-sub-second-search-using-opensearch-service-or2-instances/) | Shows event-driven hub-level indexing, P0/P1 freshness pipelines, and the trade-off between search refresh latency and real-time inventory validation. |
 | Swiggy | [Building Rock-Solid ML Systems](https://medium.com/swiggy-bytes/building-rock-solid-ml-systems-d1d5ab544f0e) | Covers ML operational excellence for ETA and quick-delivery systems, including clipping, shadow mode, error codes, and fallbacks. |
-

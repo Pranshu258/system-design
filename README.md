@@ -1,8 +1,16 @@
 # Production System Design Collection
 
-Detailed, production-scale system design documents.
+Detailed, production-scale system design walkthroughs. Each design is built up as an argument: every component exists because a simpler design failed in a specific way.
 
-Each design includes a **Lessons from production systems** section distilled from official engineering blogs and papers, plus a curated reading list. See [Curated Engineering Blogs](./engineering-blogs.md) for the full index.
+## How each design is structured
+
+1. **Requirements**, ending with *the binding constraint*: the one property that actually shapes the architecture.
+2. **Back-of-the-envelope estimation**: only the numbers that drive design decisions.
+3. **API design** and **data model**, each built up from a failure of the simpler version.
+4. **High-level design**: start naive, then apply one fix per concrete failure.
+5. **Deep dives** (3–4): each opens with a probing question and closes with strong-answer criteria and a Bad / Good / Great rubric.
+6. **Variants**, **the transferable pattern**, and **review questions** with collapsible answers.
+7. **Sources and further reading**: official engineering blogs and papers whose lessons are woven into the design. See [Curated Engineering Blogs](./engineering-blogs.md) for the full index.
 
 ## Collaboration and storage
 

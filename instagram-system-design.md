@@ -1,599 +1,418 @@
-# Production-Scale Instagram-like Photo and Video Platform
+# Instagram System Design
+
+Instagram is a media-first social platform where people upload photos, carousels, short videos, and stories, then consume them through profiles, home feed, stories, search, and Explore. This design focuses on posts, stories, media processing, media delivery, metadata, privacy, and high-level feed integration; direct messaging and the full ranking science of a news feed are out of scope and are referenced through the sibling [News Feed](./news-feed-system-design.md) design.
 
 ## 1. Requirements
 
-### Functional requirements
+### 1.1 Functional requirements
 
-1. Create photo, carousel, and short-video posts with captions, tags, and locations.
-2. Follow public accounts and request access to private accounts.
-3. View a ranked home feed and a user's profile grid.
-4. Publish and view ephemeral stories that expire after 24 hours.
-5. Discover content through Explore, search, hashtags, and recommendations.
-6. Like, comment, save, share, mention, and report content.
-7. Deliver notifications for follows, requests, mentions, comments, and selected engagement.
-8. Process images and videos into device-appropriate renditions.
-9. Enforce blocks, private-account rules, content policy, age, and regional restrictions.
-10. Provide creator publishing status, drafts, archives, and basic insights.
+- Users can upload photos, carousels, and short videos, see processing status, and publish only media that is ready and policy-eligible.
+- Users can follow public accounts, request private accounts, block accounts, and have those relationships enforced on profiles, feeds, stories, search, and media URL issuance.
+- Users can view profile grids, home feed items, stories, Explore, hashtags, and search results with cursor-based pagination.
+- Users can like, save, comment, mention, report, delete, and edit metadata such as captions without mutating immutable media bytes.
+- Creators can publish ephemeral stories that expire after 24 hours and can inspect bounded story view information.
+- The system emits events for feed fan-out, Explore/search indexing, notifications, counters, moderation, deletion, and analytics.
 
-### Non-functional requirements
+### 1.2 Non-functional requirements
 
-- Fast media loading worldwide, with low feed and profile latency.
-- Very high durability for original uploads and published metadata.
-- High availability for reads and graceful degradation of ranking or counters.
-- Strong authorization for private accounts, blocks, close-friends stories, and deletion.
-- Eventual consistency for feed fan-out, engagement counts, search, Explore, and analytics.
-- Resumable uploads and asynchronous, idempotent media processing.
-- Protection against abuse, scraping, account takeover, and unsafe content.
-- Cost-efficient media storage and CDN delivery at multi-petabyte daily scale.
+- **Low media latency.** The product feels broken if thumbnails or videos start slowly, so media bytes must be served from layered caches and CDNs rather than application servers.
+- **Durable originals.** A successfully uploaded original is user-created content; losing it is worse than losing a derived thumbnail, so originals need stronger durability than regenerable renditions.
+- **Correct privacy.** Private accounts, blocks, deletion, story expiration, and policy takedowns must be enforced by canonical metadata checks even when feed inboxes, search indexes, or CDNs are stale.
+- **Read-heavy availability.** Viewing dominates posting, so profile, feed, story, and media reads should degrade to safe fallbacks when ranking, counters, or recommendation systems fail.
+- **Asynchronous completion.** Uploading bytes, transcoding video, safety checks, and fan-out cannot fit inside one synchronous request, so clients need idempotent mutation APIs and status resources.
+- **Cost-aware storage and bandwidth.** Media bytes dominate cost; the architecture must separate hot replicated media from cooled erasure-coded media and maximize cache hits before scaling origin storage.
 
-Direct messaging is a separate chat subsystem and is out of scope except for sharing a post by reference.
+### 1.3 The binding constraint
 
-## 2. Scale assumptions and capacity
+The binding constraint is that media bytes dominate cost and bandwidth while metadata and the social graph dominate correctness. A photo or video view mostly consumes CDN and storage resources, but whether that view is allowed depends on small, fast-changing records: follow state, blocks, deletion, policy, expiration, and account status. Treating media and metadata as one transactional object would make every byte path slow and expensive. Treating them as fully independent would leak private or deleted content.
 
-- 2 billion monthly active users and 500 million daily active users.
-- 100 million new feed posts/day.
-- 500 million stories/day.
-- 20 billion media views/day across feed, profiles, stories, and Explore.
-- Peak feed/API read traffic: approximately 1 million requests/second.
-- Average photo source: 3 MB; average short-video source: 20 MB.
-- Daily source ingest: roughly 2-6 PB before replicas and derived renditions, depending on video mix.
-- Derived images average 3-6 sizes/formats; videos use an adaptive bitrate ladder.
-- Average user follows 300 accounts; celebrity accounts exceed 100 million followers.
-- Average write rate is about 1.2k feed posts/s plus 5.8k stories/s; 20B media views/day averages about 231k views/s before peak amplification.
-- Most bytes are served by CDN, while metadata and authorization remain application concerns.
+That tension forces three mechanisms. First, uploads go directly to object storage through presigned sessions, then an asynchronous workflow publishes immutable renditions only after processing and safety checks. Second, media storage uses cache hierarchy and hot-to-warm tiering because most user-visible cost is repeated byte delivery. Third, metadata IDs and indexes are shard-aware, while feed and Explore receive references through events and always recheck canonical authorization before issuing media URLs.
 
-Photos, videos, feed ranking, and stories have different access and retention patterns. The design shares ingestion and media storage but uses separate indexes and serving policies.
+## 2. Back-of-the-envelope estimation
 
-## 3. High-level architecture
+Assumptions here are illustrative, not claims about the real Instagram. Suppose the service has 500 million daily active users and 100 million permanent posts per day. The average write rate is `100M / 86,400 = 1,157` posts/s. If daily activity peaks at 5x, publication sees about `1,157 × 5 = 5,785` posts/s before stories and engagement. That is large but not the hardest number; it is tractable with sharded metadata and append-only event logs.
 
-```mermaid
-flowchart LR
-    C[Mobile / Web Clients]
-    EDGE[Global Edge / API Gateway]
-    AUTH[Identity and Session Service]
-    USER[Profile and Graph Service]
-    POST[Post / Story Service]
-    UP[Media Upload Service]
-    SRC[(Source Object Storage)]
-    WF[(Media Workflow Queue)]
-    PROC[Image / Video Processing Fleet]
-    MEDIA[(Rendition Object Storage)]
-    CDN[CDN]
-    META[(Sharded Metadata Store)]
-    GRAPH[(Social Graph Store)]
-    EVENT[(Event Stream)]
-    FAN[Feed Fan-out Workers]
-    INBOX[(Home Feed Inboxes)]
-    FEED[Feed and Story Serving]
-    RANK[Ranking Service]
-    SEARCH[Search / Explore Service]
-    ENG[Engagement Service]
-    NOTIFY[Notification Service]
-    SAFE[Integrity / Moderation Pipeline]
+Stories add a different write shape. If users publish 500 million stories per day, the average is `500M / 86,400 = 5,787` stories/s and a 5x peak is about `28,935` stories/s. Stories are short-lived, so the design should avoid copying each story to every follower inbox. Per-author story indexes plus per-viewer tray projections are cheaper than materializing every story item to every follower.
 
-    C --> EDGE
-    EDGE --> AUTH
-    EDGE --> USER
-    EDGE --> POST
-    EDGE --> UP
-    EDGE --> FEED
-    EDGE --> SEARCH
-    EDGE --> ENG
-    USER --> GRAPH
-    POST --> META
-    POST --> EVENT
-    UP --> SRC
-    UP --> WF
-    WF --> PROC
-    PROC --> MEDIA
-    PROC --> SAFE
-    MEDIA --> CDN --> C
-    EVENT --> FAN
-    FAN --> INBOX
-    FEED --> INBOX
-    FEED --> META
-    FEED --> RANK
-    EVENT --> SEARCH
-    EVENT --> NOTIFY
-    EVENT --> SAFE
-```
+Media views dominate serving. With 20 billion media views per day, average view traffic is `20B / 86,400 = 231,481` views/s. At 5x peak that is roughly `1.16M` media views/s. If an average rendered view transfers only 500 KB after adaptation, CDN egress at peak is `1.16M × 500KB = 580GB/s`, far beyond what the app tier should ever proxy. The API should return metadata and short-lived media authorization; clients fetch bytes from CDN and origin caches.
 
-Media bytes flow directly between clients, object storage, processors, and CDN. API services coordinate uploads and authorize access without proxying large bodies.
+Storage is also byte-led. If permanent posts are 70% photos at 3 MB and 30% videos at 20 MB, daily source ingest is `70M × 3MB + 30M × 20MB = 810TB` before replicas. If derived renditions average 2x the source size across thumbnails, WebP/AVIF variants, posters, and video ladders, the system writes another `1.62PB` per day. This pushes originals and fresh renditions into hot replicated storage, then moves cooled immutable objects to erasure-coded warm storage.
 
-## 4. Data model
+Fan-out is the hidden multiplier. If an ordinary author has 300 followers, naive push fan-out for 100 million posts creates `100M × 300 = 30B` feed inbox inserts per day, or `347,222` inserts/s on average. That is plausible with batching and sharded inboxes, but a single account with 100 million followers would create 100 million inserts for one post. Celebrity posts must use pull-on-read or a hybrid strategy, not pure push.
 
-```text
-User
-- user_id
-- username
-- account_type: PUBLIC | PRIVATE
-- status
-- profile_media_id
-- follower_count_hint
-- following_count_hint
-- version
+> **Key idea.** The architecture is not primarily CPU-bound by post creation. It is byte-bound on media delivery, write-amplified by fan-out, and correctness-bound by small metadata decisions that must be rechecked after every stale projection.
 
-FollowEdge
-- follower_id
-- followee_id
-- state: REQUESTED | ACTIVE | MUTED
-- created_at
-- version
+## 3. API design
 
-BlockEdge
-- blocker_id
-- blocked_id
-- created_at
+**Question.** What makes upload and publish retries safe when the client is on an unreliable mobile network?
+<details><summary>Answer</summary>
 
-Post
-- post_id
-- author_id
-- type: PHOTO | CAROUSEL | VIDEO
-- caption
-- audience
-- location_id
-- moderation_state
-- created_at
-- edited_at
-- deleted_at
-- version
+The client gets an idempotent upload session, uploads parts directly to object storage, and publishes through a separate idempotent request that only accepts media in a ready, policy-eligible state. Retrying upload completion returns the same `media_id`; retrying publish with the same idempotency key returns the same `post_id` instead of creating duplicates.
 
-PostMedia
-- post_id
-- media_id
-- position
-
-Story
-- story_id
-- author_id
-- media_id
-- audience: FOLLOWERS | CLOSE_FRIENDS
-- created_at
-- expires_at
-- deleted_at
-
-MediaAsset
-- media_id
-- owner_id
-- source_object_key
-- processing_state
-- width
-- height
-- duration_ms
-- content_hash
-
-MediaRendition
-- rendition_id
-- media_id
-- format
-- width
-- height
-- bitrate
-- object_key
-- checksum
-
-FeedInboxEntry
-- viewer_id
-- time_bucket
-- post_id
-- author_id
-- published_at
-
-Engagement
-- user_id
-- target_id
-- type: LIKE | SAVE
-- created_at
-
-Comment
-- comment_id
-- post_id
-- parent_comment_id
-- author_id
-- body
-- moderation_state
-- created_at
-
-StoryView
-- story_id
-- viewer_id
-- viewed_at
-```
-
-Counters are cached projections, not the canonical engagement state. Media is immutable; edits change post metadata or create a replacement media asset rather than mutating CDN objects. User, post, story, and media IDs should be globally unique, time-sortable 64-bit or 128-bit IDs that encode or map to shard ownership so inserts do not coordinate through a single sequence.
-
-## 5. Core APIs
-
-### Start media upload
+</details>
 
 ```http
 POST /v1/media/uploads
-Idempotency-Key: client-generated-uuid
+Idempotency-Key: <client-uuid>
+Body: {"content_type":"video/mp4","size_bytes":25165824,"checksum":"sha256:..."}
 
-{
-  "content_type": "video/mp4",
-  "size": 25165824,
-  "checksum": "sha256:..."
-}
-```
+PUT <signed_part_url>
+Headers: Content-Range: bytes 0-8388607/25165824
 
-```json
-{
-  "media_id": "media-501",
-  "upload_id": "upload-81",
-  "part_size": 8388608,
-  "signed_part_urls": ["https://object-store/..."],
-  "expires_at": "2026-10-14T00:00:00Z"
-}
-```
+POST /v1/media/uploads/{upload_id}/complete
+Body: {"parts":[{"part":1,"checksum":"sha256:..."}]}
 
-### Publish a post
+GET /v1/media/{media_id}/status
+Response: {"state":"PROCESSING|READY|REJECTED","renditions":[...],"reason_code":"..."}
 
-```http
 POST /v1/posts
-Idempotency-Key: client-generated-uuid
+Idempotency-Key: <client-uuid>
+Body: {"media_ids":["m..."],"caption":"...","audience":"FOLLOWERS"}
 
-{
-  "media_ids": ["media-501"],
-  "caption": "Sunset",
-  "audience": "FOLLOWERS"
-}
+GET /v1/feed/home?cursor=<opaque>&limit=20
+GET /v1/users/{user_id}/posts?cursor=<opaque>&limit=30
+POST /v1/stories
+DELETE /v1/posts/{post_id}
+PUT /v1/users/{user_id}/follow
+PUT /v1/users/{user_id}/block
 ```
 
-### Read feeds and stories
+The upload API deliberately separates bytes from metadata. The media service returns presigned part URLs and records the expected size, content type, owner, checksum, and expiration. The object store receives the body; the app service receives completion metadata and verifies checksums before moving the asset to `PROCESSING`. A synchronous `POST /posts` that accepted a multipart video would tie mobile retries, video transcode time, and app worker memory together. Returning `202 Accepted`-style processing status keeps the app tier small and lets users leave and resume.
 
-```http
-GET /v1/feed/home?cursor=opaque-token&limit=20
-GET /v1/stories/tray?cursor=opaque-token
-GET /v1/users/{user_id}/posts?cursor=opaque-token
-```
+Publish is a second transaction because a post is a social object, not just a file. It checks that every `media_id` is owned by the author, has not expired as an unattached draft, is `READY`, and has an active policy decision. The idempotency key is scoped to `(user_id, operation, client_key)`, stores the request hash, and returns the original response for exact retries. If the same key is reused with different media IDs, the server rejects it rather than guessing client intent.
 
-Other endpoints:
+Read APIs use cursors instead of offsets. A feed can change between page one and page two because new posts arrive, ranking features update, and deletions happen. The cursor encodes a signed feed session, candidate watermark, last score and ID, model version, served-ID-set reference, and expiration. It does not grant access; each page still filters blocks, deletion, private-account state, age/regional policy, and story expiration before issuing media URLs.
 
-```http
-POST   /v1/stories
-DELETE /v1/stories/{story_id}
-PUT    /v1/users/{user_id}/follow
-POST   /v1/users/{user_id}/follow-requests/{request_id}/accept
-DELETE /v1/users/{user_id}/follow
-PUT    /v1/users/{user_id}/block
-PUT    /v1/posts/{post_id}/likes/me
-DELETE /v1/posts/{post_id}/likes/me
-POST   /v1/posts/{post_id}/comments
-GET    /v1/explore?cursor=...
-GET    /v1/search?q=...
-```
+Delete APIs create tombstones and invalidation events. They cannot synchronously purge every CDN edge and feed inbox before responding. The promise is stronger where it matters: canonical metadata immediately denies URL renewal and read hydration, while asynchronous workers remove stale projections and issue emergency CDN purge for severe policy takedowns.
 
-Mutations use idempotency keys and/or entity versions. Feed cursors are signed, opaque, and short-lived.
+## 4. Data model
 
-## 6. Media upload and processing flow
+Start with the obvious entity, `Post`, containing an author, caption, and media URL. That fails as soon as video processing is asynchronous. A URL might point to an untranscoded, unsafe, or not-yet-replicated object. The fix is to split `MediaAsset` from `Post`: media has an upload and processing lifecycle; post has a publication and social lifecycle.
 
-1. The client obtains a resumable upload session.
-2. It uploads parts directly to a nearby object store endpoint.
-3. The media service validates part checksums and atomically completes the source object.
-4. An outbox event starts a durable processing workflow.
-5. Image jobs correct orientation, strip unsafe metadata, crop previews, and generate AVIF/WebP/JPEG renditions.
-6. Video jobs probe the file, transcode an HLS/DASH ladder, create posters, and validate output.
-7. Safety classifiers inspect content and attach policy decisions before it can be referenced by a post.
-8. The media record becomes `READY`; the client may publish it.
+A single `MediaAsset` is still not enough because one source file produces many immutable variants. Mobile feed thumbnails, profile-grid squares, high-resolution photos, video posters, and adaptive video segments have different formats and cache behavior. That introduces `MediaRendition`, keyed by deterministic object keys and checksums. The post points to media IDs and ordering, while the serving layer chooses renditions based on device, network, and policy.
 
-Processing jobs are idempotent and write versioned deterministic output keys. A minimum image rendition or low video ladder can make publishing available while premium variants finish, but the post must never reference an unvalidated source.
+A post with an `audience` field also cannot by itself enforce privacy. Private-account access depends on a relationship that changes after the post enters feed inboxes or search indexes. The graph therefore needs canonical `FollowEdge` and `BlockEdge` records. Feed, story, search, notification, and Explore projections may contain stale references, but serving treats those references as candidates and rechecks graph state.
 
-Unattached uploads expire after a grace period. Published originals move to durable replicated storage; derived renditions can be regenerated and may use cheaper durability.
+Stories look like posts with expiration until viewer behavior is added. A story tray ranks authors, a story expires logically at `expires_at`, and read receipts may be visible to the author for a bounded period. Stories therefore share media assets but use separate `Story`, `StoryViewEvent`, and active-story indexes. Expiration is a read-time predicate, not just a cleanup job.
 
-## 7. Post publication and feed fan-out
+Engagement should not be stored as counters on `Post`. A viral post would make one counter row hot, duplicate like events would inflate counts, and deletes would race with delayed updates. The canonical action is an `Engagement` uniqueness record such as `(user_id, target_id, type)`. Counts are projections built from idempotent events and can be approximate or slightly stale.
 
-1. Verify that every media asset is owned by the author, ready, and policy-eligible.
-2. Commit the post, media ordering, idempotency record, and outbox event in one transaction.
-3. Return the canonical post immediately.
-4. Inject it into the author's own feed/profile for read-your-writes.
-5. Fan-out workers append references to ordinary followers' feed inboxes.
-6. Celebrity posts remain on the author's timeline and are pulled during feed reads.
-7. Ranking features, search indexes, notification candidates, and counters update asynchronously.
-
-Private-account posts can be materialized only to active followers, but final serving must still recheck the relationship. Presence in an inbox never grants access.
-
-## 8. Home feed generation
-
-Candidate sources include:
-
-- Materialized inbox entries from ordinary followed accounts.
-- Recent posts pulled from high-fan-out accounts.
-- Suggested posts from embedding/topic retrieval.
-- Reshares or collaborative posts.
-- Sponsored content from a separate ads system.
-
-The serving path deduplicates, filters private/blocked/deleted/ineligible posts, hydrates media and features, pre-ranks, applies the main ranker, then re-ranks for diversity and frequency caps. It performs a final authorization check before issuing media URLs. Recommendation sources should precompute/cache item embeddings and some candidate lists so online ranking is bounded by latency and CPU budgets.
-
-If recommendation systems fail, serve recent followed posts. If the online feature store is slow, use bounded stale features or a lightweight model. Core feed utility must not depend on every ML service.
-
-## 9. Stories design
-
-Stories differ from permanent posts:
-
-- They have an explicit `expires_at`, usually 24 hours.
-- The story tray ranks authors before individual stories.
-- Within an author's story set, ordering is normally chronological.
-- Read receipts may be visible to the author.
-- Audience can be followers or a close-friends list.
-
-Store active story IDs in time-bucketed per-author indexes and maintain a per-viewer tray projection containing candidate authors, not copies of every story. At read time, fetch non-expired stories and recheck current authorization.
-
-Expiration is enforced logically by `expires_at`; a delayed cleanup job must not make an expired story visible. Physical deletion and CDN eviction happen asynchronously. Authors may archive stories privately, which creates a separate durable record and access policy.
-
-For celebrity story view counts, append view events to a stream and aggregate. If the product exposes a viewer list, store exact viewer IDs only within a bounded window and paginate them; do not update one hot row.
-
-## 10. Profiles, Explore, and search
-
-### Profile grid
-
-Maintain an author timeline index ordered by publication time. Profile reads fetch IDs, batch-hydrate posts, and filter current state. Cache public first pages briefly; private profile content requires viewer-scoped authorization.
-
-### Explore
-
-Explore uses:
-
-1. Candidate retrieval from content/user embeddings, account/media KNN, topics, trends, and graph neighborhoods.
-2. Policy and eligibility filtering before ranking, so non-recommendable inventory is removed early.
-3. Multi-stage ranking: cheap retrieval/first-pass models narrow thousands of candidates before heavier models score hundreds.
-4. Diversity across creators, seed accounts, media types, and topics.
-5. Exploration slots for new content and cold-start fallbacks from graph exploration or popular media.
-
-### Search
-
-Index usernames, names, hashtags, places, captions where policy permits, and public content metadata. Exact username lookup uses a strongly consistent normalized-username index. General search is eventual and must recheck account/post visibility before returning or opening a result.
-
-## 11. Feed pagination and consistency
-
-Use a short-lived feed session containing:
+Instagram's production ID design is directly relevant. Their shard-aware IDs used time, logical shard, and per-shard sequence bits so IDs were roughly sortable without a central sequence. This design uses the same principle: post, story, media, and comment IDs should include or cheaply map to a shard and creation time. Profile grids, backfills, and hot-path hydration then route to the right shard without an extra lookup service.
 
 ```text
-session_id
-candidate watermark
-model version
-last score and post ID
-served-ID set reference
-expiry and signature
+User(user_id, username, account_type, status, profile_media_id, version)
+FollowEdge(follower_id, followee_id, state, created_at, version)
+BlockEdge(blocker_id, blocked_id, created_at)
+
+MediaAsset(media_id, owner_id, upload_id, source_object_key, state,
+           width, height, duration_ms, content_hash, policy_state, version)
+MediaRendition(rendition_id, media_id, format, width, height, bitrate,
+               object_key, checksum, storage_tier, created_at)
+
+Post(post_id, author_id, type, caption, audience, location_id,
+     moderation_state, created_at, edited_at, deleted_at, version)
+PostMedia(post_id, media_id, position)
+
+Story(story_id, author_id, media_id, audience, created_at, expires_at, deleted_at)
+StoryViewEvent(story_id, viewer_id, viewed_at)
+
+FeedInboxEntry(viewer_id, time_bucket, post_id, author_id, published_at, fanout_version)
+Engagement(user_id, target_id, type, created_at)
+Comment(comment_id, post_id, parent_comment_id, author_id, body, moderation_state, created_at)
+OutboxEvent(event_id, aggregate_type, aggregate_id, version, payload, created_at)
 ```
 
-This gives stable-enough pagination while allowing controlled insertion of fresh posts. Offset pagination would duplicate or skip items as the feed changes.
+Canonical users, posts, media lifecycle, follows, blocks, and idempotency records live in sharded transactional stores because ownership, deletion, privacy, and readiness need conditional updates and read-your-writes behavior. Feed inboxes, story trays, notifications, counters, search indexes, and Explore candidates live in rebuildable key-value or search stores because they are projections. Media bytes live in object/blob storage and CDN; large bodies deliberately do not go in the transactional store. Feed inboxes and graph projections need p99 and p999 objectives, not only average latency: Instagram's Rocksandra work showed how JVM garbage collection and compaction can dominate tail latency in online key-value paths.
 
-Strongly consistent state:
+> **Key idea.** Store the small facts that grant authority in canonical shards; store copied references and counters as disposable projections; store immutable media bytes in systems optimized for bandwidth and cache locality.
 
-- Post ownership, deletion, and audience.
-- Private follow requests and acceptance.
-- Blocks and account disablement.
-- Media readiness and active policy state.
-- Username uniqueness.
+## 5. High-level design
 
-Eventually consistent state:
+The simplest design is a web service that accepts media upload, writes a post row with a media path, and lets followers query recent posts from followed authors.
 
-- Feed inboxes and story trays.
-- Like/comment/view counters.
-- Search and Explore indexes.
-- Notifications, analytics, and ranking features.
-
-Edits use optimistic concurrency against `version`. Deletes create tombstones and high-priority invalidation events. Stale references are harmless only because serving rechecks the canonical object.
-
-## 12. Social graph and celebrity handling
-
-Store forward and reverse adjacency:
-
-```text
-(follower_id, followee_id) -> follow state
-(followee_id, follower_id) -> follower state
+```mermaid
+flowchart LR
+    C["Client"] --> A["App service"]
+    A --> DB[("SQL database")]
+    A --> FS[("File storage")]
+    C --> A
 ```
 
-Private follow transitions are state-machine operations:
+That design breaks in five concrete ways. App workers become byte proxies and collapse under video upload and download bandwidth. Posts can reference files that are not transcoded, replicated, or safety-checked. Feed reads become graph joins over hundreds of authors for every request. One celebrity post can overload a single fan-out partition. Finally, stale indexes or CDN URLs can expose private, blocked, deleted, or expired media unless metadata remains authoritative.
 
-```text
-NONE -> REQUESTED -> ACTIVE
-  ^         |          |
-  +---------+----------+
+### Fix 1: Direct upload plus asynchronous media workflow
+
+The client uploads bytes directly to object storage through presigned, resumable part URLs. The media service owns only upload sessions, checksums, state transitions, and workflow events. Processors create image variants, video ladders, posters, thumbnails, perceptual hashes, and safety decisions. A post can reference the media only after a conditional state transition marks the asset `READY`. This removes app servers from the byte path and gives the system a place to retry expensive work.
+
+### Fix 2: Immutable media delivery through cache hierarchy
+
+Derived media objects are immutable and versioned, so clients and CDNs can cache them aggressively. Public media uses long shared TTLs. Private media uses short-lived signed URLs or edge-validated cookies, but the bytes still come from CDN where possible. Facebook's photo stack measured browser, edge, origin, and Haystack layers, with only a small fraction of requests reaching backend storage. That lesson changes the design goal: optimize cache hit ratio and origin shielding before adding more storage servers.
+
+### Fix 3: Sharded metadata with an outbox
+
+Post creation commits the post, media ordering, idempotency record, and outbox event together. The event log then drives feed fan-out, search, Explore, notifications, counters, and deletion workflows. If a relay crashes after the commit, the outbox row remains and is republished. If a consumer sees the event twice, it uses event IDs and aggregate versions to make the update idempotent. This is the boundary between strongly consistent canonical state and eventually consistent projections.
+
+### Fix 4: Hybrid feed fan-out
+
+Ordinary authors are pushed into follower inboxes because it makes read latency predictable. High-fan-out authors are pulled at read time from their author timelines because pushing to tens of millions of inboxes per post is wasteful and bursty. The feed service merges materialized inbox entries, pulled celebrity timelines, and recommendation candidates, then delegates full ranking mechanics to the [News Feed](./news-feed-system-design.md) architecture. The important Instagram-specific rule is that candidates are references, not access grants.
+
+### Fix 5: Final authorization before media URL issuance
+
+Every read path hydrates canonical metadata before returning a playable media URL. The checks include post deletion, moderation state, account status, follow state, block state, story expiration, close-friends membership, and regional policy. A stale feed inbox entry may waste CPU, but it must not leak bytes. On uncertainty for private media, the system fails closed.
+
+### Putting it together
+
+```mermaid
+flowchart LR
+    C["Mobile or web client"] --> API["API gateway"]
+    API --> US["Upload service"]
+    US --> OS[("Source object storage")]
+    OS --> WF["Media workflow queue"]
+    WF --> MP["Processing and safety fleet"]
+    MP --> RO[("Rendition object storage")]
+    RO --> CDN["CDN and origin cache"]
+    CDN --> C
+    API --> PS["Post and story service"]
+    PS --> META[("Sharded metadata store")]
+    PS --> OUT[("Transactional outbox")]
+    OUT --> BUS["Event stream"]
+    BUS --> FAN["Feed fan-out workers"]
+    FAN --> INBOX[("Feed inbox store")]
+    BUS --> IDX["Search and Explore indexing"]
+    API --> FS["Feed and profile service"]
+    FS --> INBOX
+    FS --> META
+    FS --> GS["Graph service"]
+    GS --> GRAPH[("Social graph store")]
+    FS --> CDN
 ```
 
-Acceptance must be idempotent and authorize only the intended requester. Blocks override follows and should synchronously update a deny path while asynchronous workers clean projections.
+A publish begins with an upload session and direct object-store writes. Completion emits a media workflow job. The processing fleet writes immutable renditions and updates `MediaAsset` state with a compare-and-set on version. `POST /posts` then validates ownership and readiness, commits `Post` and `PostMedia`, and records an outbox event. Fan-out workers update ordinary follower inboxes; search and Explore update their indexes; notifications and counters update asynchronously. On read, the feed/profile/story service fetches candidate IDs, hydrates canonical metadata, asks the graph service for current authorization, and only then returns rendition descriptors and signed media access.
 
-Shard celebrity follower lists into stable buckets for fan-out of notifications or graph maintenance. Do not fan out every celebrity post. Hybrid push/pull mode is chosen by follower count, active audience, and post rate, with overlap deduplicated by `post_id`.
+> **Key idea.** Each component traces back to a specific failure of the naive design: byte overload, unsafe publication, projection loss, celebrity skew, or stale authorization.
 
-## 13. Engagement, comments, and notifications
+## 6. Deep dives
 
-Likes and saves use a canonical uniqueness constraint on `(user_id, target_id, type)`. Events update approximate counters asynchronously. The UI may optimistically show the local user's action while reconciling with server state.
+### 6.1 Media upload, processing, and safe publication
 
-Partition comments by `post_id` and bucket exceptionally popular posts. Rank top comments separately from chronological pagination. Moderation state is checked on every read.
+**Question.** The client completes a video upload, immediately retries publish twice, and the transcoder later rejects the source. What state is the post in?
+<details><summary>Answer</summary>
 
-Notifications are derived, coalesced, and rate-limited:
+There is no published post. Upload completion creates a `MediaAsset` in `PROCESSING`; publish returns a retryable “media not ready” status until processing reaches `READY`. If safety or transcode rejects the source, the asset becomes `REJECTED`, future publish attempts fail deterministically, and idempotency prevents duplicate posts from repeated client requests.
 
-- Aggregate “A and 20 others liked your post.”
-- Prioritize follow requests, mentions, and replies over bulk likes.
-- Store a durable notification inbox before sending optional mobile push.
-- Suppress notifications based on blocks, mutes, preferences, and later content removal.
-
-## 14. Partitioning, caching, and media delivery
-
-- Partition users and posts by stable IDs; index timelines by `(author_id, created_at)`.
-- Partition feed inboxes by viewer and time bucket.
-- Partition stories by author and expiration bucket.
-- Partition graph lists by user; shard extreme reverse lists.
-- Partition engagement streams by target with salting for viral posts.
-- Store source and derived media in object storage; serve immutable renditions through CDN. Keep small-object metadata compact enough for memory indexes, and tier older low-request media to cheaper erasure-coded warm storage while keeping hot media replicated for throughput.
+</details>
 
-Media URLs should reference versioned assets so TTLs can be long. For public content, CDN caches maximize sharing. For private content, use short-lived signed URLs/cookies and edge authorization while preserving cacheability of encrypted bytes. A leaked URL should expire quickly and be scoped to an object class.
+The tempting design is to let `POST /posts` accept a file and publish as soon as the upload finishes. That works for small photos in a toy system, but video breaks it. A 25 MB mobile upload can pause for minutes, transcode can take longer than the request timeout, decoders can crash on malformed files, and safety classifiers can reach a different decision than the MIME type suggests. If the post becomes visible before this work completes, followers can request media that does not exist, see unmoderated content, or cache a rendition that later should never have been served.
 
-Use layered media caches: browser/app cache, edge CDN, regional origin cache, and storage backend. Cache profile metadata, public profile grids, feed candidate IDs, graph summaries, and popular public post metadata. Never use a stale cache entry as sole proof of private-content authorization.
+The production mechanism is a small state machine around `MediaAsset`: `INITIATED -> UPLOADING -> UPLOADED -> PROCESSING -> READY` or `REJECTED`. Upload URLs are scoped to one user, one upload session, byte ranges, content length, and expiration. Completion verifies every part checksum and the total hash before moving to `UPLOADED`. The workflow consumes an outbox event, probes the file, strips unsafe metadata, normalizes orientation, creates deterministic rendition keys, computes perceptual hashes, and runs safety classifiers. Each job is idempotent: writing `media/{media_id}/{version}/w640.avif` twice with the same checksum is harmless, and a compare-and-set on `MediaAsset.version` prevents an older retry from overwriting a newer rejection.
 
-## 15. Reliable events and lifecycle management
+```mermaid
+stateDiagram-v2
+    [*] --> INITIATED
+    INITIATED --> UPLOADING: "Presigned URLs issued"
+    UPLOADING --> UPLOADED: "Complete with checksums"
+    UPLOADED --> PROCESSING: "Workflow claimed"
+    PROCESSING --> READY: "Renditions and policy pass"
+    PROCESSING --> REJECTED: "Transcode or safety fails"
+    READY --> ATTACHED: "Post commit references media"
+    READY --> EXPIRED: "Unattached draft timeout"
+    REJECTED --> [*]
+    ATTACHED --> [*]
+```
 
-Commit canonical mutations with an outbox row. Relays publish immutable, versioned events to the stream. Consumers include:
+Publication is then a conditional metadata transaction, not a media operation. The post service reads the media rows with a consistency level strong enough for the owner to observe the latest state, verifies `owner_id = author_id`, `state = READY`, `policy_state = ALLOW`, and `not expired`, then commits `Post`, `PostMedia`, idempotency, and an outbox event. A minimal image rendition or low video ladder can make the asset ready while premium variants continue, but the allowed set must be explicit: a post should never point to the unvalidated source object as a fallback.
 
-- Feed fan-out.
-- Search and Explore indexing.
-- Notifications.
-- Counter aggregation.
-- Moderation and integrity.
-- Analytics and creator insights.
-- Deletion and retention workflows.
+Failure modes are mostly about races. The user may delete a draft while processing is running; processors should still finish or stop safely, but a final compare-and-set should not resurrect an expired asset. The workflow may publish output and crash before updating state; a retry sees deterministic output keys and continues. A moderation model may later reclassify the media; that creates a policy update event and invalidates serving, but it does not mutate cached bytes. A client may reuse an idempotency key with different media IDs; the idempotency table must reject the mismatch.
 
-Consumers are idempotent and compare aggregate versions so a delayed update cannot resurrect a deleted post. Dead-letter queues retain poison events with alerting and replay tooling. Key-value stores that back feeds, inboxes, and graph projections need explicit p99/p999 tail-latency controls, not only average-latency dashboards.
+The alternative is synchronous processing for photos and asynchronous only for videos. That can reduce perceived latency for small images, but it complicates the API and still needs the same state machine for retries, safety, and downstream fan-out. A cleaner design lets all media use the same lifecycle while optimizing fast paths inside the workflow.
 
-Media garbage collection is conservative:
+Signals worth watching: upload abandonment, checksum failures, workflow queue age, time to `READY`, rejection rate by reason, retry counts, processor crash loops, and attempts to publish non-ready media.
 
-1. Tombstone the post or story.
-2. Remove it logically from all serving paths.
-3. Retain under recovery/legal policy.
-4. Check references from posts, stories, drafts, messages, and archives.
-5. Quarantine unreferenced assets.
-6. Delete after a safety delay.
+> **Strong-answer criteria.** A senior answer separates source upload from publication, names the media state machine, makes processing idempotent, and explains why policy eligibility is checked before post commit.
 
-## 16. Availability and multi-region design
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Publish as soon as the file upload finishes. | It exposes unprocessed, unsafe, or missing renditions and makes retries duplicate social objects. |
+| Good | Use async processing and let clients poll media status. | It handles latency but may still miss idempotency, ownership checks, and publish-time CAS. |
+| Great | Direct resumable upload, deterministic processing, policy-gated `READY`, idempotent publish, and conditional transitions. | It survives mobile retries, worker crashes, unsafe inputs, and races between expiration, delete, and publish. |
 
-- Run read APIs, ranking, search frontends, and upload coordinators active-active.
-- Route user/post mutations to a home region or globally consistent store.
-- Replicate metadata synchronously across availability zones and asynchronously across regions.
-- Upload media to the nearest compliant region, then replicate originals.
-- Use multi-region rendition origins and CDN failover.
-- Keep regional feed projections rebuildable from canonical timelines and event logs.
+### 6.2 Media storage and delivery: hot bytes, warm bytes, and cache hierarchy
 
-On ranking failure, return a followed-content fallback. On local inbox loss, pull recent posts from followed timelines while rebuilding. On privacy-store uncertainty, fail closed for private content. Public cached media can continue during a metadata incident only when its authorization and policy lease is still valid.
+**Question.** Why not store every rendition as a normal object and scale origin storage whenever CDN misses rise?
+<details><summary>Answer</summary>
 
-Region failover fences the previous writer before promotion. A small period of stale counters or Explore results is acceptable; accepting conflicting follow approvals or leaking a private story is not.
+Because media cost is dominated by repeated reads of immutable bytes, not by metadata rows. The system should first maximize browser, edge, and regional-origin cache hits, then store hot media in replicated low-latency storage and migrate cooled immutable blobs to erasure-coded warm storage behind stable media handles.
 
-## 17. Security, privacy, and abuse controls
+</details>
 
-- TLS, encryption at rest, least-privilege service credentials, and managed key rotation.
-- Device-bound sessions, risk-based login challenges, and rapid session revocation.
-- Authorize every private post, story, rendition URL, comment thread, and notification.
-- Apply blocks bidirectionally across profiles, search, feeds, stories, mentions, and sharing.
-- Rate limit login, follows, requests, likes, comments, uploads, and scraping.
-- Detect fake engagement, spam networks, impersonation, grooming, and account takeover.
-- Sandbox media decoders and link-preview fetchers; strip dangerous EXIF metadata.
-- Scan and classify content with human escalation and appeal workflows.
-- Protect minors and sensitive location data; avoid exposing precise upload metadata.
-- Audit employee tools and restrict access to private media.
-- Support export, deletion, retention, copyright, legal hold, and regional residency requirements.
+The naive storage design treats each thumbnail, photo, poster, and video segment as an independent object in one flat bucket. It is simple, but it ignores two facts. First, a feed page may request dozens of small thumbnails where filesystem or object metadata I/O can dominate. Second, popularity is extremely skewed: fresh posts, celebrity posts, and viral videos are read heavily for a short time, while old media must remain durable but is rarely fetched. Scaling one storage tier for both patterns wastes money.
 
-Image perceptual hashes help find known harmful or duplicate content but require strict access controls and false-positive review. Face recognition or location inference introduces additional legal and ethical constraints and should not be assumed.
+Facebook's Haystack lesson is that photo-serving systems can drown in metadata operations. Haystack packed many photos into large append-only files and kept tiny offset metadata in memory, avoiding repeated filesystem metadata lookups. An Instagram-like system does not need to literally copy that implementation if it uses modern object storage, but it should preserve the shape: immutable blobs, compact indexes, checksums, tombstones, and compaction. Small renditions should not require expensive per-file metadata work on every miss.
 
-## 18. Important failure cases
+The serving path is a hierarchy. The app returns a rendition manifest and an authorization token; the client asks its local cache, then an edge CDN, then a regional origin cache, then hot media storage, and only then warm storage. Facebook's photo caching work measured exactly why this matters: most requests should be absorbed before they reach backend storage. For public immutable media, object URLs can carry long TTLs because edits create new metadata or new media versions rather than mutating bytes. For private media, the cache key should represent the encrypted or immutable object, while authorization is short-lived and checked at the edge or before URL issuance.
 
-| Failure | Handling |
-|---|---|
-| Upload pauses on mobile network | Resume missing parts with durable session |
-| Complete upload is retried | Idempotent completion returns existing media |
-| Processor crashes | Workflow retries deterministic job; poison input is isolated |
-| Post commit succeeds but fan-out does not | Transactional outbox republishes |
-| User sees own post before fan-out | Read-your-writes injection intentionally supplies it |
-| Celebrity post overloads fan-out | Pull during feed reads |
-| Private follower is removed | Final graph check suppresses stale inbox item |
-| Story cleanup is delayed | `expires_at` prevents serving |
-| Deleted media remains at CDN | Metadata blocks URL renewal; emergency purge and short auth TTL |
-| Counter events duplicate | Event-ID deduplication and idempotent aggregates |
-| Main ranker fails | Recent followed-content fallback |
-| Search index is stale | Canonical authorization and policy check |
-| Regional feed store is lost | Rebuild from events and author timelines |
-| Block propagation lags | Synchronous deny cache/path overrides projections |
+```mermaid
+flowchart LR
+    C["Client cache"] --> E["Edge CDN"]
+    E --> R["Regional origin cache"]
+    R --> H[("Hot replicated media store")]
+    H --> W[("Warm erasure-coded store")]
+    M["Metadata and auth service"] --> T["Short-lived token or cookie"]
+    T --> E
+```
 
-## 19. Observability
+Hot-to-warm tiering follows media lifecycle. New uploads, recent posts, and viral media stay in hot replicated storage because they need high read throughput and low tail latency. Cooled originals and old renditions move to erasure-coded warm storage. Facebook's f4 warm BLOB system showed that immutable blobs can be stored more cheaply with erasure coding while preserving user-visible reads. The handle seen by metadata does not change; only the storage tier behind it changes. A cache miss for warm media may be slower, but the CDN can refill and shield repeated reads.
 
-Track:
+Private media creates the hardest trade-off. If every private photo is served through the app tier, correctness is easy and bandwidth cost is terrible. If private photos use public long-lived URLs, cost is good and privacy is terrible. The middle ground is short-lived signed URLs or cookies, edge authorization, and final metadata checks before issuing or refreshing tokens. A leaked URL expires quickly and can be scoped to a rendition class. For severe takedowns, the metadata service immediately denies renewal and a purge pipeline removes hot CDN entries, but normal deletion does not wait for every edge to confirm before the UI hides the post.
 
-- Upload throughput, resume rate, checksum failures, and abandoned sessions.
-- Media queue age, processing time, rendition failures, and time to publish-ready.
-- Feed/profile/story p50/p95/p99 latency and dependency breakdown.
-- Image load time, video startup time, rebuffering, and CDN hit ratio.
-- Fan-out lag, amplification, hybrid-mode rate, and inbox rebuild progress.
-- Candidate counts, ranking fallback rate, duplicate rate, empty feeds, model version, model criticality, and prediction-stability SLOs.
-- Story expiration correctness and unauthorized-access denials.
-- Follow-request and block propagation latency.
-- Counter/search/Explore freshness and notification delivery lag.
-- Safety classifier backlog, report rate, takedown propagation, and appeal outcomes.
-- Account-takeover signals, scraping volume, and rate-limit activity.
+Deletion is also a metadata-first operation. The post is tombstoned, URL renewal stops, search/feed projections are invalidated, and media enters a conservative garbage-collection workflow. Physical bytes are deleted only after checking references from posts, stories, drafts, archives, messages, legal holds, and safety retention. Derived renditions are regenerable; originals may have stricter retention or export requirements.
 
-Use trace IDs through publication and fan-out, but do not log private captions, tokens, or signed URLs. Synthetic accounts continuously verify public/private follow, block, story expiry, media delivery, and deletion flows from multiple regions.
+Signals worth watching: CDN hit ratio by surface, origin cache hit ratio, warm-store recall latency, hot-tier bytes by age, video startup time, rebuffering, signed URL denial rates, purge lag, and backend requests per media view.
 
-## 20. Major trade-offs
+> **Strong-answer criteria.** A senior answer treats CDN and tiering as core architecture, distinguishes original durability from derived rendition regeneration, and explains how private authorization avoids proxying bytes through app servers.
 
-### Unified post model versus separate media products
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Store files on app servers or proxy all media through the API. | App workers become the bottleneck and media bandwidth dominates cost. |
+| Good | Put immutable renditions in object storage behind a CDN. | It handles most public reads but may ignore hot/cold skew and private authorization. |
+| Great | Layer client/edge/origin caches, use Haystack-like compact blob storage, tier hot to f4-like warm storage, and issue short-lived authorized access. | It optimizes the actual cost driver while preserving deletion and privacy semantics. |
 
-A shared base model simplifies engagement and permissions, while photos, videos, carousels, and stories need different processing and retention. Share identity and policy primitives, but keep product-specific indexes and workflows.
+### 6.3 Shard-aware metadata IDs and correctness under stale projections
 
-### Fan-out on write versus fan-out on read
+**Question.** A private account removes a follower after a post was already copied into that follower's feed inbox. Can the follower still open the media?
+<details><summary>Answer</summary>
 
-Write fan-out accelerates ordinary feed reads. Celebrity fan-out is prohibitively expensive. Hybrid delivery is required, with read-time deduplication during mode changes.
+No. Feed inbox entries are only candidate references. The read path hydrates canonical post and graph metadata, sees that the follow edge is no longer active or a block exists, and suppresses the item without issuing a media URL.
 
-### Public CDN caching versus private authorization
+</details>
 
-Public immutable media can use long shared TTLs. Private media needs short-lived authorization without forcing every byte through application servers. Edge token validation balances security and cache efficiency.
+Metadata is small compared with media, but it is where correctness lives. The naive approach is to partition posts by author, feed inbox by viewer, and rely on projections being updated quickly. That fails whenever projections lag. A private follower can be removed, an account can block another, a story can expire, a post can be deleted, or a safety system can takedown media while stale references remain in inboxes, search indexes, caches, notifications, or Explore candidate stores.
 
-### Exact story viewers versus aggregate counts
+The first requirement is routable identity. Instagram's shard-aware ID scheme avoided a central ID generator by combining time, shard ID, and sequence bits inside PostgreSQL shards. This design uses the same idea so `post_id`, `media_id`, `story_id`, and `comment_id` tell services where to route or can be mapped with a cheap directory. Time order also makes profile grids and backfills efficient. The exact bit split is an implementation detail; the property matters more than the constants: no global sequence bottleneck, rough chronological sort, and shard locality.
 
-Exact viewer lists are a valued feature but expensive and privacy sensitive. Bound retention and use append/compact storage; use aggregate streaming counters for large audiences.
+The second requirement is a canonical authority for relationships and object state. `FollowEdge(follower_id, followee_id)` and `BlockEdge(blocker_id, blocked_id)` are not optional caches. Private follow acceptance is a state-machine transition from `REQUESTED` to `ACTIVE`, authorized by the private account owner and protected with version checks. Blocks synchronously update the deny path because block correctness is more important than asynchronous cleanup speed. Deletions create tombstones with monotonically increasing versions so delayed events cannot resurrect a post in a projection.
 
-### Precompute every video rendition versus demand-aware ladders
+```mermaid
+sequenceDiagram
+    participant Viewer
+    participant Feed as Feed service
+    participant Inbox as Feed inbox
+    participant Meta as Metadata store
+    participant Graph as Graph service
+    participant Media as Media auth
+    Viewer->>Feed: GET /v1/feed/home
+    Feed->>Inbox: Read candidate post IDs
+    Inbox-->>Feed: Stale private post reference
+    Feed->>Meta: Hydrate post and author state
+    Feed->>Graph: Check follow and block state
+    Graph-->>Feed: Follow is not active
+    Feed-->>Viewer: Page without denied item
+    Feed-xMedia: No media URL issued
+```
 
-Full ladders improve device coverage and playback immediately but cost compute and storage. Generate a standard ladder first and add premium codecs/resolutions based on source and demand.
+The third requirement is projection discipline. Feed inboxes, story trays, search indexes, notification inboxes, and Explore candidates are rebuildable. They store enough data to serve fast candidates, but they do not make final decisions. Consumers process outbox events with event IDs and aggregate versions. If `PostDeleted(v7)` arrives before a delayed `PostUpdated(v6)`, the consumer keeps the tombstone. If fan-out misses an event, replay from the log or backfill from author timelines can repair the inbox. If an index is stale, the read path filters it.
 
-### Ranked feed versus chronological fallback
+This is also where tail latency matters. Metadata reads are on the critical path for media URL issuance. Instagram's Rocksandra work is a warning that a key-value store can meet average latency goals while p99 reads spike due to garbage collection or compaction. Feed inboxes, graph projections, and notification stores should use bounded partitions, request hedging or coalescing around hot keys, compaction-aware storage engines, and p99/p999 alerts. For a celebrity profile or viral post, avoid making one partition serve every read; shard reverse follower lists and engagement streams into stable buckets.
 
-Ranking improves relevance but introduces feature and model dependencies. A following-only chronological fallback preserves availability, predictability, and user control.
+There are trade-offs. Rechecking authorization on every item costs CPU and storage reads, so the system should batch graph checks, cache negative and public-account results briefly, and precompute viewer-scoped summaries. But stale cache entries cannot be the sole proof for private content. When the graph store is uncertain, public content may degrade to cached metadata, but private content fails closed.
 
-## 21. Lessons from production systems
+Signals worth watching: stale-reference suppression rate, unauthorized media URL attempts, graph check latency, block propagation latency, follow state-machine conflicts, projection lag, tombstone replay counts, and p99/p999 metadata tail latency.
 
-### Instagram sharded PostgreSQL IDs
+> **Strong-answer criteria.** A senior answer distinguishes candidate projections from canonical authorization, uses shard-aware IDs to avoid routing bottlenecks, and explicitly fails closed for private content.
 
-Instagram avoided a central ID service by generating IDs inside PostgreSQL shards: 41 bits of millisecond time, 13 bits of logical shard ID, and 10 bits of per-shard sequence, allowing 1024 IDs per shard per millisecond. For this design, post/media/story IDs should be time-sortable and either encode the shard or cheaply map to it, so profile grids and feed backfills can route without a lookup bottleneck.
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Trust feed/search indexes because they are usually fresh. | Projection lag leaks private, blocked, deleted, or expired content. |
+| Good | Recheck post deletion and private account state on feed reads. | It improves privacy but may miss ID routing, event versions, blocks, and tail-latency pressure. |
+| Great | Use shard-aware IDs, canonical graph/object state, versioned outbox events, stale-reference filtering, and deny-by-default private authorization. | It keeps fast projections safe without making them the source of truth. |
 
-### Instagram Rocksandra for tail latency
+### 6.4 Home feed and Explore integration without repeating the feed system
 
-Instagram used Cassandra heavily for online key-value workloads and built Rocksandra, a RocksDB-backed storage engine, after JVM GC drove p99 read spikes. One production cluster dropped p99 reads from 60 ms to 20 ms and GC stalls from 2.5% to 0.3%. Feed inboxes, graph projections, and notification stores therefore need p99/p999 objectives, GC/compaction isolation, and request hedging/coalescing around hot keys rather than relying on average latency.
+**Question.** Where should Instagram-specific design stop and the generic news-feed design begin?
+<details><summary>Answer</summary>
 
-### Facebook Haystack for photo storage
+Instagram should define candidate sources, media hydration, privacy checks, and media-specific ranking constraints, then delegate generic fan-out, ranking sessions, deduplication, and pagination mechanics to the news-feed architecture. The integration point is a candidate reference plus metadata and media features, not raw bytes.
 
-Facebook's Haystack combined many photos into large append-only files and kept minimal offset metadata in memory, eliminating repeated filesystem metadata I/O. Instagram-like media storage should not store every rendition as an independently expensive filesystem object; it should use immutable objects, compact indexes, checksums, tombstones, and online compaction or object-store equivalents.
+</details>
 
-### Facebook photo caching stack
+A photo platform is not only a news feed, but the home feed is still a major read path. The mistake is to spend the whole Instagram design rebuilding a feed-ranking system and ignore media lifecycle. The right boundary is that Instagram produces safe, hydrated candidates with media descriptors, and the [News Feed](./news-feed-system-design.md) design handles fan-out strategy, ranking sessions, cursor semantics, and pagination stability.
 
-Facebook measured a layered photo-serving stack of browser cache, edge cache, origin cache, and Haystack; only 9.9% of traced photo requests reached Haystack. Media delivery here should treat CDN and origin caches as core architecture, route origin requests consistently by media ID, and tune eviction policy and cache size before scaling backend storage.
+Home feed candidates come from four sources. First, materialized inbox entries from ordinary followed accounts provide low-latency baseline content. Second, pull-on-read author timelines cover celebrities and accounts whose fan-out cost is too high. Third, Explore-style recommendation sources provide unconnected or suggested posts. Fourth, ads or commerce modules may insert separately governed inventory. The feed service deduplicates by `post_id`, filters canonical eligibility, fetches media and author features, applies ranking, then returns rendition manifests.
 
-### Facebook f4 warm BLOB storage
+Explore has a different contract. It searches a much larger inventory, so it needs staged retrieval and ranking. Instagram's Explore engineering has described mechanisms such as account and media embeddings, nearest-neighbor retrieval, model distillation, and multi-stage funnels. Meta's newer Explore descriptions add Two Tower retrieval, cached item embeddings, online user embeddings, ANN lookup, off-peak precomputation, multi-task scoring, and final integrity/diversity reranking. The architectural lesson is not a specific model; it is that retrieval must be bounded before online ranking, and policy filtering must happen early and again before serving.
 
-Facebook's f4 moved older, lower-request BLOBs from hot replicated storage to erasure-coded warm storage, storing over 65 PB and reducing effective replication from 3.6 to 2.8 or 2.1 while preserving low-latency user reads. This maps directly to Instagram originals and old renditions: keep new or viral media on hot replicated storage, then migrate cooled immutable media to erasure-coded warm tiers behind the same media handle.
+Suggested posts inside home feed need a product constraint: they should feel adjacent to what the user follows. Instagram's Suggested Posts work distinguished connected and unconnected recommendations, using seeds from user activity, account/media KNN, co-occurrence, graph exploration, popular-media fallbacks, and negative feedback. In this design, recommendation candidates carry provenance and reason codes so ranking can blend them conservatively with followed content and suppress them when the user asks for less.
 
-### Instagram Explore ranking funnel
+The media platform adds constraints that a text-oriented feed may not. Ranking should know whether a candidate has a playable rendition for the device and network. It should avoid returning ten heavy videos to a user on constrained bandwidth if lightweight alternatives exist. It should include integrity state, creator diversity, media-type diversity, freshness, and viewer feedback. If the online feature store or heavy model fails, the system returns recent followed posts with ready media; it does not block the core feed on every ML dependency. Instagram's reported model-operations work around model registries, launch automation, criticality tiers, and stability SLOs reinforces this: ranking models are production dependencies that need rollback and health policy.
 
-Instagram's Explore system used IGQL, account embeddings, FAISS-backed nearest-neighbor retrieval, model distillation, and a three-stage ranking funnel that selected 150, then 50, then 25 items from 500 sampled candidates. Explore in this design should make candidate generation a first-class service with early policy filtering, ANN retrieval, cheap first-pass rankers, and heavier final rankers only after the candidate set is small.
+Signals worth watching: candidate counts by source, empty-feed rate, recommendation fallback rate, duplicate suppression, media-not-ready candidates, model criticality violations, Explore policy-filter rate, and user negative-feedback rate.
 
-### Meta's newer Explore retrieval
+> **Strong-answer criteria.** A senior answer avoids duplicating the full feed design, but still names candidate contracts, hybrid push/pull boundaries, media hydration, early policy filtering, and graceful ranking fallback.
 
-Meta later described Explore as retrieval, first-stage ranking, second-stage ranking, and final reranking over billions of possible items, with Two Tower models, cached item embeddings, online user embeddings, ANN lookup, off-peak precomputation, MTML scoring, and final integrity/diversity reranking. This supports the design choice to cache embeddings and precompute some recommendations while keeping final authorization and policy checks online.
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Say “use ML ranking” after fan-out. | It misses candidate generation, media readiness, policy, and fallback behavior. |
+| Good | Merge followed posts, celebrity pulls, and recommendations. | It covers sources but may not define the contract with media and authorization. |
+| Great | Integrate with the news-feed design through safe candidate references, staged retrieval, media-aware hydration, final auth checks, and model fallback tiers. | It keeps Instagram-specific complexity clear without repeating a separate system. |
 
-### Instagram Suggested Posts cold start
+## 7. Variants
 
-Instagram's Suggested Posts system distinguishes connected recommendations from unconnected recommendations, uses seeds from user activity, account/media KNN, co-occurrence, and fallbacks through one-hop/two-hop graph exploration or popular media for sparse users. Home-feed recommendations here should preserve a “feels like home” merge policy: prioritize sources related to followed/home accounts, match freshness and media-type distribution, and use explicit negative feedback in ranking.
+**10x scale.** At 10x, media views reach about `200B/day`, or `2.31M` average views/s and `11.57M` views/s at a 5x peak. The metadata design stays similar, but CDN contracts, regional origin shielding, tiering automation, and cache-aware encoding become existential. Feed fan-out thresholds move downward because write amplification becomes more expensive. More recommendation and Explore work shifts to offline precomputation, but final authorization remains online.
 
-### Instagram model operations at scale
+**Multi-region active-active.** Reads, uploads, and CDN delivery can be active-active, but canonical mutations need clear ownership. Route user/profile/post mutations to a home region or a globally consistent shard; replicate originals asynchronously after durable local write; fence the old writer during failover. Counters, Explore, and search may be stale across regions. Follow approval, block, deletion, and private media authorization must not accept conflicting writes.
 
-Instagram reported more than 1000 ML models across Feed, Stories, Reels, comments, notifications, and tagging, then added a model registry, launch automation, criticality tiers, and model-stability SLOs. A production Instagram design needs model ownership and safe rollout tooling, not just ranking algorithms: every model in the feed/story/Explore path should have a baseline, rollback plan, criticality, and health metric.
+**A Reels-heavy product shift.** If short video dominates, source ingest and derived ladders grow faster than post QPS. The upload workflow adds more compute scheduling, hardware transcode pools, codec negotiation, and demand-aware ladder generation. Feed ranking also becomes more sensitive to video startup time and rebuffering. The metadata model still works because posts reference media assets and renditions rather than embedding byte details.
 
-### Instagram's Python/Django serving efficiency
+**Strict regional residency.** If certain users' media and metadata must remain in-region, upload sessions choose compliant origins, source replication excludes disallowed regions, and feed/search projections carry residency labels. Global Explore can rank metadata references only when policy permits, and media URL issuance must choose an allowed CDN/origin path. The same final authorization mechanism becomes the enforcement point for geography.
 
-Meta still describes Instagram's frontend server as Python/Django using multiprocess serving plus asyncio per process; at that scale, Python object reference-count writes caused copy-on-write memory growth, motivating PEP 683 immortal objects. This design can use Python/Django-style stateless API workers, but should keep media bytes off the app tier, use async I/O for fan-out-friendly calls, and track per-worker memory growth during deploys.
+## 8. The transferable pattern
 
-## 22. Recommended interview presentation
+This is the pattern of a byte-heavy social system with correctness-heavy metadata. The large objects are immutable, cached, and tiered; the small records are versioned, sharded, and authoritative; derived indexes are fast but disposable. Similar shapes appear in YouTube-like video systems, TikTok-like short-video feeds, Pinterest-like media boards, and file-sharing products where a link or preview is cheap but authorization to fetch bytes is not.
 
-1. Clarify whether Stories, Reels/short video, Explore, private accounts, and messaging are in scope.
-2. Estimate media ingest, rendition amplification, views, feed requests, and social-graph skew.
-3. Draw direct upload, asynchronous processing, object storage/CDN, metadata, graph, hybrid feed, and story paths.
-4. Deep-dive media processing and the atomic transition from ready asset to published post.
-5. Explain hybrid fan-out and why private-account authorization is rechecked at serve time.
-6. Contrast permanent posts, profile grids, Explore, and expiring stories.
-7. State consistency boundaries for blocks/private follows/deletion versus feeds/counters/search.
-8. Walk through failed processing, stale inbox entries, story expiry, CDN revocation, and region loss.
-9. Close with graceful ranking fallback, abuse controls, observability, and cost.
+The feed side is a sibling pattern rather than the whole system. Use [News Feed](./news-feed-system-design.md) for fan-out, ranking-session cursors, deduplication, and pagination mechanics; use this Instagram design for upload lifecycle, rendition storage, CDN authorization, and media-aware candidate hydration. The transferable rule is to ask what must be true before issuing a byte URL, then make every cache and projection subordinate to that truth.
 
-A strong answer does not describe Instagram as only a news feed. It explicitly designs the media lifecycle, private graph, profile and discovery surfaces, ephemeral stories, CDN authorization, and integrity controls that define the product.
+## Review
 
-## Further reading: curated engineering blogs
+The design starts from the constraint that media bytes dominate cost while metadata and graph state dominate correctness. That leads to direct resumable upload, asynchronous processing, immutable renditions, and publish only after readiness and safety checks. It separates authoritative metadata from rebuildable projections, uses shard-aware IDs to avoid global routing bottlenecks, and relies on outbox events for fan-out, search, Explore, notifications, counters, and deletion. Media delivery is a cache hierarchy with hot replicated storage and f4-like warm tiering, inspired by Haystack and Facebook photo caching lessons. Feed and Explore receive safe candidate references and recheck authorization before media URL issuance, so stale projections degrade relevance rather than privacy.
+
+### Check your understanding
+
+1. Why is `MediaAsset` separate from `Post`?
+   <details><summary>Answer</summary>
+
+   Because upload, transcode, rendition generation, and safety checks complete asynchronously and can fail. A post is a social object that should only reference media after the asset is ready and policy-eligible.
+
+   </details>
+
+2. Why are feed inbox entries not treated as proof of access?
+   <details><summary>Answer</summary>
+
+   They are staleable projections. A private follow, block, deletion, story expiration, or policy decision can change after fan-out, so serving must recheck canonical metadata and graph state before issuing media URLs.
+
+   </details>
+
+3. What does shard-aware ID generation buy beyond uniqueness?
+   <details><summary>Answer</summary>
+
+   It avoids a central sequence service, preserves rough time order, and lets services route post/media/story/comment operations to the owning shard without an expensive lookup on hot paths.
+
+   </details>
+
+4. Why does media storage need hot-to-warm tiering?
+   <details><summary>Answer</summary>
+
+   Fresh and viral media need replicated low-latency throughput, while old immutable blobs need durable cheap storage. Erasure-coded warm tiers reduce cost without changing the media handles used by metadata and caches.
+
+   </details>
+
+5. How should Explore integrate with the rest of the design?
+   <details><summary>Answer</summary>
+
+   Explore should provide bounded, policy-filtered candidate references using embeddings, ANN retrieval, and staged ranking. The serving path still hydrates canonical metadata, checks authorization, and returns media renditions only for eligible items.
+
+   </details>
+
+## Sources and further reading
 
 | Source | Article | Why it matters |
 |---|---|---|
