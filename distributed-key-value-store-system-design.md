@@ -1,350 +1,400 @@
-# Production Distributed Key-Value Store
+# Distributed Key-Value Store System Design
+
+A distributed key-value store keeps opaque values addressable by ordered byte-string keys while hiding node failures, data movement, and storage-engine details from applications. This design is for a regional, multi-tenant production service that supports point reads/writes, conditional mutation, bounded scans, TTL, snapshots, and change streams; rich query, joins, unbounded cross-key transactions, and object-sized values are deliberately outside the core.
 
 ## 1. Requirements
 
-### Functional requirements
+### 1.1 Functional requirements
 
-1. Store and retrieve opaque values by key.
-2. Support `Put`, `Get`, `Delete`, conditional writes, and batched operations.
-3. Offer range scans over ordered keys within a table/partition.
-4. Provide tunable or clearly defined consistency.
-5. Replicate data across failure domains and recover automatically.
-6. Support TTL, snapshots, backup/restore, and change streams.
-7. Repartition online as data and traffic grow.
-8. Enforce tenant/table quotas and access controls.
+- Store, retrieve, delete, and conditionally update values by key within a named table.
+- Support bounded ordered scans over key ranges, with continuation tokens that survive range splits.
+- Let each table or key range choose a consistency mode: linearizable operations when quorum is available, or highly available eventual operations when the product accepts conflicts.
+- Replicate data across failure domains, repair corrupt or stale replicas, and recover from node or zone loss without acknowledged data loss in the configured mode.
+- Repartition online as data volume and request heat change, including split, merge, and replica movement without stopping clients.
+- Provide TTL, snapshots, backup/restore, and at-least-once change streams for derived indexes, caches, and analytics.
 
-### Non-functional requirements
+### 1.2 Non-functional requirements
 
-- Petabytes of data and millions of operations per second.
-- Single-digit millisecond regional point reads/writes at the median.
-- No acknowledged data loss under the configured failure model.
-- Predictable consistency during leader changes and network partitions.
-- Horizontal scale without global stop-the-world rebalancing.
-- Verifiable repair, backup, and disaster recovery.
+- **Scalability.** The keyspace is far too large for one machine, so the design must shard data and metadata without a global write bottleneck.
+- **Tail-latency control.** A few hot keys or hot prefixes can dominate p99 latency, so routing, admission control, and split decisions must use heat rather than only bytes.
+- **Explicit consistency.** Applications must know whether a successful read/write is linearizable, read-your-writes, bounded-stale, or eventual, because hiding that choice produces data-loss and conflict bugs.
+- **Reconfiguration safety.** Clients and servers will hold stale range maps during split, merge, and failover, so ownership must be fenced by epochs rather than by best-effort cache invalidation.
+- **Storage correctness over time.** Deletes, TTL, snapshots, repair, and change consumers interact through old versions and tombstones, so garbage collection needs a safe horizon.
+- **Operational isolation.** One tenant's scan, hot partition, compaction debt, or change-stream lag must not starve unrelated tenants sharing the same storage fleet.
 
-The baseline design is a strongly consistent, range-partitioned store. Multi-key transactions are limited to one range initially; distributed transactions are an explicit extension.
+### 1.3 The binding constraint
 
-## 2. Scale assumptions and capacity
+The binding constraint is not simply petabytes of storage. It is the choice between availability during a partition and linearizable reads/writes, made independently per range, while the keyspace is too large for one machine and traffic is highly skewed. A single global consensus group gives clean semantics but fails capacity and availability. Pure hash sharding spreads random load but makes ordered scans and range movement awkward. A leaderless, always-writable design remains available through partitions but gives the application conflict resolution and stale-read semantics.
 
-Assume:
+The architecture therefore partitions the ordered keyspace into many ranges, lets each range choose either a consensus-backed mode or a leaderless quorum mode, and makes reconfiguration explicit through epochs. That choice forces three mechanisms to be first-class: heat-aware partitioning and safe routing changes, replication protocols with honest guarantees, and an LSM/MVCC storage engine whose tombstones are retained until repair, snapshots, and streams can no longer need them.
 
-- 10 PB logical data, 1 KB average value, roughly 10 trillion keys.
-- 5 million reads/second and 1 million writes/second peak: 6 million ops/s, roughly 83/17 read/write.
-- Replication factor three: 30 PB replicated data before compression and metadata overhead.
-- Roughly 3,000-9,000 storage nodes with 10-20 TB usable capacity after headroom, compaction, index, and tombstone overheads.
-- 30-day point-in-time recovery through snapshots and logs.
-- Individual ranges can be highly skewed even when aggregate traffic is read-heavy.
+## 2. Back-of-the-envelope estimation
 
-```text
-1M writes/s x 1 KB = 1 GB/s logical ingress
-3 replicas + compaction amplification => several GB/s disk/network traffic
-```
+Use illustrative numbers to size the shape of the system, not to predict one company's workload. Suppose the service stores 10 PB of logical user data with an average 1 KB value. That is `10 PB / 1 KB = 10^13` keys, roughly ten trillion distinct records before metadata and old versions. No single catalog entry, server cache, or scan plan can enumerate keys directly; the unit of routing must be a range descriptor that covers many keys.
 
-Plan for write and compaction amplification, indexes, tombstones, checksums, and 30% free-space headroom.
+Assume peak regional traffic is 5 million reads/s and 1 million writes/s. The logical write ingress is `1,000,000 × 1 KB = 1 GB/s`. With three replicas, synchronous replication alone sends about `3 GB/s` of storage traffic before indexes, checksums, compression, change streams, and compaction. If LSM write amplification is 8x after replication, the storage fleet may perform about `1 GB/s × 3 × 8 = 24 GB/s` of sustained disk write work. That number implies compaction cannot be an afterthought; it needs admission control and per-tenant budgets just like foreground writes.
 
-## 3. High-level architecture
+For capacity, three replicas turn 10 PB logical into `10 PB × 3 = 30 PB` replicated data. If each node contributes 12 TB of safe usable space after filesystem reserve, repair headroom, snapshots, compaction slack, and operational margin, raw capacity alone needs `30 PB / 12 TB = 2,500` storage nodes. A real deployment would provision more because metadata, MVCC history, tombstones, backups in flight, and uneven range placement all consume headroom. The design consequence is that the metadata plane manages thousands of nodes and millions of ranges, but no client request should depend on a strongly consistent lookup for every operation.
 
-```mermaid
-flowchart LR
-    C[Clients / SDK] --> G[Gateway / Range Router]
-    G --> L[Range Leaders]
-    L --> F1[Followers]
-    L --> F2[Followers]
-    L --> WAL[(Replicated Log)]
-    L --> MEM[Memtable]
-    MEM --> SST[(SSTables)]
-    SST --> OBJ[(Backups / Cold Storage)]
-    META[Metadata Service / Consensus] --> G
-    META --> L
-    CDC[Change Stream] --> SUB[Subscribers]
-    L --> CDC
-    REPAIR[Scrub / Repair] --> SST
-```
+Heat is the number that changes the design most. With one million ranges, average load is only `6,000,000 ops/s / 1,000,000 = 6 ops/s` per range, which looks trivial. The average is misleading: a celebrity account, a popular Discord channel, or one tenant's daily batch can concentrate tens of thousands of requests on one key or narrow prefix. Range splitting helps when heat covers many adjacent keys; it does not split a single hot key. That is why the gateway must track per-key heat, coalesce duplicate reads, throttle tenants, and sometimes force application-level sharding.
 
-The metadata plane maps key ranges to replica groups. Each range is an independent consensus group, avoiding one global write bottleneck.
+> **Key idea.** The store scales by making the range, not the node or table, the unit of routing, replication, heat management, and storage ownership. The arithmetic says capacity is a solved horizontal problem, while skew and reconfiguration safety are the hard parts.
 
-## 4. Data model and internal records
+## 3. API design
 
-```text
-Table
-- tenant_id
-- table_id
-- key_encoding
-- consistency_policy
-- ttl_policy
-- encryption_key
+**Question.** If a client sends a write, the leader commits it, and the response is lost, what makes a retry safe?
+<details><summary>Answer</summary>
 
-RangeDescriptor
-- range_id
-- start_key
-- end_key
-- replicas
-- leader
-- epoch
-- split_parent
+Every mutation carries a stable idempotency identity, such as `(client_id, request_sequence)`, and the serving range persists the final result for a bounded window. A retry with the same identity returns the original committed version or original conditional failure instead of applying the mutation again.
 
-MVCCRecord
-- user_key
-- commit_timestamp
-- value_or_tombstone
-- expires_at
-- checksum
-
-Mutation
-- client_id
-- request_sequence
-- operation
-- key
-- value
-- expected_version
-
-ChangeEvent
-- range_id
-- log_index
-- key
-- operation
-- commit_timestamp
-```
-
-Keys are byte strings compared lexicographically. Values have size limits; large blobs belong in object storage with a reference in the store.
-
-## 5. Core APIs
+</details>
 
 ```http
 PUT /v1/tables/{table}/keys/{key}
-If-Match: "version"
-Idempotency-Key: client-sequence
+If-Match: "version-or-*"
+Idempotency-Key: "client-id:sequence"
+Consistency: linearizable
 
-GET /v1/tables/{table}/keys/{key}?consistency=linearizable
+GET /v1/tables/{table}/keys/{key}?consistency=linearizable|bounded_stale|eventual
+
 DELETE /v1/tables/{table}/keys/{key}
+If-Match: "version-or-*"
+Idempotency-Key: "client-id:sequence"
+
+POST /v1/tables/{table}:batchGet
+{ "keys": ["..."], "consistency": "bounded_stale", "maxFanout": 64 }
+
+POST /v1/tables/{table}:batchWrite
+{ "mutations": [...], "atomicity": "single_range" }
+
+GET /v1/tables/{table}:scan?start=a&end=z&limit=500&snapshot=...
+
+GET /v1/tables/{table}:changes?from=range_id:log_index
 ```
+
+The API exposes consistency rather than making the SDK guess. A `GET` in `linearizable` mode must route to the current range leader or perform a quorum/read-index protocol. A bounded-stale read can use a follower only if that replica proves its applied index or timestamp is within the requested bound. An eventual read can trade freshness for availability and locality, but the response includes the serving replica, version, and staleness watermark so the application can make that choice visible.
+
+Conditional headers make lost-update prevention explicit. `If-Match: "version"` is a compare-and-swap on the current visible version; `If-Match: "*"` means blind overwrite. This is more precise than a generic `PUT` because an opaque value store cannot inspect application invariants. Batch writes are atomic only when all keys map to one range unless the caller opts into a slower transaction API; otherwise a partial failure is possible and must be surfaced as per-key results.
+
+Scans use continuation tokens rather than offsets. An offset like "start at row 10,000" is unstable when keys are inserted or a range splits during the scan. The token contains the last returned key, snapshot timestamp, original table epoch, and a signature. If the next request reaches a child range after a split, the gateway can continue from the last key at the same snapshot instead of duplicating or skipping keys.
+
+Change streams are at least once. The stable event identity is `(range_id, log_index, mutation_sequence)` for consensus ranges or a comparable version vector for leaderless ranges. Consumers checkpoint positions and deduplicate. If the checkpoint is older than retention, the API returns `CHECKPOINT_EXPIRED`; the correct recovery is a snapshot plus tail, not silently starting at the oldest retained event.
+
+## 4. Data model
+
+Start with the obvious entity: a table contains keys and opaque values. That is enough for a toy store, but it cannot route a request because a ten-trillion-key table spans thousands of machines. Add a `RangeDescriptor` with `[start_key, end_key)`, replica set, leader, and epoch. Now clients can route a key to the right servers, but a split creates a race: a stale client may send a write to the parent after children already own the interval. The epoch becomes a fencing token; every request includes the descriptor epoch it used, and the server rejects stale epochs with the newer descriptor or a pointer to metadata.
+
+The value itself cannot be a single mutable cell because reads need snapshots, retries need stable outcomes, and deletes must survive repair. Represent each key as MVCC versions ordered by commit timestamp or committed log index. A delete is a tombstone version, not physical removal. TTL is not a background delete that happens at exactly the expiration time; it is a read-time visibility rule plus an asynchronous tombstone or compaction decision. That distinction prevents an expired value from reappearing when a slow replica repairs from an old copy.
+
+A conditional write needs more than the value. It needs the expected version, the idempotency identity, and the committed result. Without a request result table, a timeout after commit is indistinguishable from a timeout before commit. Retrying a blind increment or append would double-apply it. Persisting `(client_id, request_sequence) -> outcome` in the same range log as the mutation ties deduplication to the data it protects.
+
+Change streams introduce another record: a committed mutation event. It should be derived from the authoritative range log, not from compaction output, because compaction can reorder files and drop shadowed versions. The event carries enough identity for deduplication and enough split metadata for consumers to move from a parent range to child ranges.
 
 ```text
-BatchGet(keys, consistency)
-BatchWrite(mutations)              // atomic only when one range unless requested otherwise
-Scan(start_key, end_key, limit, continuation, snapshot_timestamp)
-CompareAndSwap(key, expected, value)
-Watch(start_position, key_prefix)
+Table
+- table_id, tenant_id
+- key_encoding: bytes_lexicographic | typed_prefix
+- default_consistency: linearizable | quorum_eventual
+- ttl_policy, snapshot_retention, change_stream_retention
+- quotas: storage_bytes, read_qps, write_qps, scan_bytes, batch_fanout
+
+RangeDescriptor
+- range_id
+- table_id
+- start_key_inclusive, end_key_exclusive
+- mode: consensus | leaderless_quorum
+- replicas: [{node_id, zone, role}]
+- leader_id nullable
+- epoch
+- parent_range_id nullable
+- split_children nullable
+- heat_counters: range_qps, top_key_estimates
+
+MVCCRecord
+- table_id, user_key
+- version: commit_timestamp_or_log_index
+- value_or_tombstone
+- expires_at nullable
+- checksum
+
+RequestResult
+- range_id
+- client_id, request_sequence
+- status: committed | condition_failed | rejected
+- committed_version nullable
+- response_hash
+- expires_after
+
+ChangeEvent
+- range_id
+- log_index_or_version
+- event_id
+- user_key
+- operation: put | delete | ttl_delete | split_marker
+- commit_timestamp
 ```
 
-Responses include value version, serving range epoch, and continuation tokens. Errors explicitly identify stale routing, retryable leader loss, condition failure, throttling, and indeterminate outcomes.
+Descriptors live in a small replicated metadata service because they are control-plane state, not user data. MVCC records, request results, and change events live inside the range's replicated storage so the mutation, dedupe result, and stream position commit together. Large blobs do not live in the key-value store; the value holds an object-store reference and checksum, otherwise compaction and repair would be dominated by multi-megabyte cells rather than key-value access.
 
-## 6. Write flow
+> **Key idea.** Each field exists because mutable cells and cache-only routing fail under retries, splits, snapshots, or repair. The final model treats ownership, versions, and idempotency as durable data.
 
-1. The SDK caches the range descriptor for the key and sends the mutation to its leader.
-2. The leader checks table authorization, item limits, range epoch, idempotency sequence, and compare condition.
-3. It proposes the mutation to the range's consensus log.
-4. A quorum persists the entry; the entry becomes committed.
-5. Each replica applies it in log order to a memtable/MVCC state and emits a change record.
-6. The leader acknowledges with the committed version/log index.
-7. Memtables later flush as immutable SSTables.
+## 5. High-level design
 
-If the client loses the response, it retries using `(client_id, request_sequence)`. Replicas retain a bounded session result table so a duplicate returns the original outcome.
+The simplest design is a stateless API tier in front of one primary database node with replicas for failover. The API hashes or compares the key, sends writes to the primary, and reads from the primary or a replica.
 
-## 7. Read and scan flow
+```mermaid
+flowchart LR
+    C["Client"] --> A["API server"]
+    A --> P[("Primary KV node")]
+    P --> R1[("Replica 1")]
+    P --> R2[("Replica 2")]
+```
 
-A linearizable read goes to the leader. The leader confirms its lease/read index is current with the consensus group, waits until state is applied through that index, and returns the newest visible version.
+That design breaks in four concrete ways. First, ten petabytes and millions of operations per second cannot fit behind one primary. Second, a network partition forces an implicit choice: reject writes without the primary or accept divergent writes on both sides. Third, range scans require ordered placement, while uniform hashing hides locality. Fourth, a single hot key or prefix can overload its owner even when average cluster load is low.
 
-Follower reads are optional:
+### Fix 1: Partition the ordered keyspace into ranges
 
-- Stale reads return the replica's applied timestamp/index.
-- Bounded-staleness reads require lag below the requested bound.
-- Snapshot reads use an MVCC timestamp and ignore newer versions.
+Make `[start_key, end_key)` ranges the unit of ownership. Ordered ranges preserve scans and prefix locality, while the metadata service maps each range to a replica group. Hash partitioning is still useful inside the key design: a table can add a hashed tenant prefix when it does not need global order. The store should not force one answer; it should make the key encoding explicit at table creation.
 
-A range scan reads sorted SSTables plus the memtable, merges versions, and returns a signed continuation token containing last key, snapshot timestamp, and descriptor epoch. Crossing a split consults metadata and continues without duplicating keys.
+Ranges split when bytes, QPS, write bandwidth, or compaction debt cross thresholds. They merge when adjacent cold ranges waste metadata and file handles. This turns capacity into an online control loop instead of a one-time sharding plan.
 
-## 8. Consensus, consistency, and concurrency
+### Fix 2: Replicate each range independently
 
-Each range uses Raft/Paxos-style consensus with one leader and replicas across zones. Majority quorum intersection ensures committed log entries survive leader replacement.
+Each range has its own replication group. In linearizable mode, the group uses Raft or Multi-Paxos: one leader orders writes, a majority persists each log entry, and reads either go through the leader or use a safe read-index/lease protocol. Losing quorum means rejecting linearizable writes rather than accepting split brain.
 
-Linearizability applies per key and per range operation. Compare-and-swap prevents lost updates. MVCC permits snapshot reads without blocking writers.
+In eventual mode, the same range abstraction can use leaderless quorums with version vectors or dotted versions. Writes may be accepted by any reachable replica and repaired later through hinted handoff, read repair, and anti-entropy. That mode is more available during partitions but pushes conflict semantics to the table policy.
 
-For multi-range transactions, add:
+### Fix 3: Fence routing changes with epochs
 
-1. A transaction record with timestamp and status.
-2. Per-range provisional intents.
-3. Two-phase commit after conflict checking.
-4. A recovery protocol where participants resolve abandoned coordinators.
+A range descriptor has an epoch. Split, merge, replica move, and leadership transfer all create a new epoch or a new descriptor lineage. A server only accepts a request if the request's epoch matches its current ownership. Stale clients receive `STALE_RANGE_EPOCH` with enough information to refresh. This prevents the dangerous case where a parent and child both accept writes for the same key interval.
 
-This provides atomicity but increases latency, write amplification, and contention; long-running transactions also pin multi-tenant resources and should be tightly bounded. Keep the initial interview design single-range unless cross-range transactions are required.
+### Fix 4: Put heat controls before the storage engine
 
-## 9. Partitioning, splitting, and routing
+Storage engines do not magically fix a single hot key. The gateway tracks top keys and prefixes, coalesces identical concurrent reads, applies per-tenant admission control, and can route hot read-only keys through caches with version validation. If a hot prefix contains many keys, split-for-heat can isolate it. If one key is hot, the application may need sharded counters, cached materialization, or a data-service layer that combines concurrent requests.
 
-Ordered range partitioning supports scans and locality. Start with coarse ranges and split when size, QPS, or write bandwidth exceeds thresholds. A split:
+### Fix 5: Use an LSM/MVCC engine per replica
 
-1. Chooses a split key avoiding a single hot prefix.
-2. Creates two child descriptors with a higher epoch.
-3. Establishes consistent child replica state at a committed log index.
-4. Atomically publishes routing metadata.
-5. Leaves forwarding/tombstone metadata so stale clients refresh.
+A replica appends mutations to a log, applies them to a memtable, flushes immutable SSTables, and compacts old files. MVCC versions allow snapshot reads and change-stream replay without blocking writers. Tombstones stay until the GC horizon says repair, snapshots, and stream consumers cannot need the deleted version.
 
-Ranges can move replica-by-replica using joint consensus, then transfer leadership. Merge adjacent cold ranges to control metadata overhead.
+### Putting it together
 
-Sequential keys create a hot last range. Recommend hashed key prefixes, reversed timestamps, or application sharding when ordered global insertion is not required. Splitting helps hot ranges, but a single hot key or very narrow prefix still needs request coalescing, caching, tenant throttles, or explicit application-level sharding.
+```mermaid
+flowchart LR
+    C["Client SDK"] --> G["Gateway and range router"]
+    G --> M["Metadata service"]
+    G --> L["Range leader or quorum coordinator"]
+    L --> R1["Replica A"]
+    L --> R2["Replica B"]
+    L --> R3["Replica C"]
+    R1 --> E1[("WAL and consensus log")]
+    R1 --> S1[("Memtable and SSTables")]
+    R2 --> E2[("WAL and consensus log")]
+    R2 --> S2[("Memtable and SSTables")]
+    R3 --> E3[("WAL and consensus log")]
+    R3 --> S3[("Memtable and SSTables")]
+    L --> CS["Change stream"]
+    S1 --> B["Snapshot and backup store"]
+    H["Heat and rebalance controller"] --> M
+    H --> G
+```
 
-## 10. LSM storage engine
+A write starts in the SDK with a cached descriptor. The gateway verifies tenant budgets and forwards to the current range owner. In consensus mode, the leader checks the epoch, conditional version, and idempotency key, proposes the mutation, waits for a majority, applies the committed entry to MVCC state, records the request result, and emits a change event. In leaderless mode, the coordinator writes to a configured quorum and returns a version that may later need reconciliation. The metadata service is not on the steady-state data path except on cache miss or reconfiguration.
 
-Writes append to a WAL and update a sorted memtable. Full memtables flush to level-0 SSTables containing data blocks, sparse indexes, Bloom filters, and checksums. Reads consult Bloom filters and block indexes before fetching data.
+> **Key idea.** Each component traces back to a specific failure of the naive design: ranges solve capacity and scans, replication makes failure semantics explicit, epochs make movement safe, heat controls handle skew, and LSM/MVCC makes durable history manageable.
 
-Compaction merges SSTables, discards shadowed versions older than the safe MVCC horizon, and reclaims tombstones only after all replicas, snapshots, and change consumers no longer need them.
+## 6. Deep dives
 
-Leveled compaction offers good read and space amplification at higher write cost. Size-tiered compaction improves write throughput but increases read and space amplification. Configure by workload class rather than claiming one universal choice.
+### 6.1 Partitioning, rebalancing, and hot-key mitigation
 
-## 11. Deletes, TTL, and garbage collection
+**Question.** A range owns keys `tenant42#2026-10-13#...`; one product launch sends 80,000 reads/s to one item and 20,000 writes/s across the surrounding prefix. Should the system hash, split, move, cache, or throttle?
+<details><summary>Answer</summary>
 
-Delete writes a versioned tombstone. TTL expiration behaves like a logical tombstone at read time; physical removal is asynchronous.
+Use different tools for different heat shapes. Split the range if heat spans many adjacent keys, move or add replicas if the group is underprovisioned, coalesce/cache identical reads for the one hot item, and throttle or require application sharding if one key receives sustained writes that cannot be merged safely.
 
-Never drop a tombstone before:
+</details>
 
-- Older values cannot arrive through repair or replication.
-- No retained snapshot can see the deleted version.
-- Change-stream retention has advanced.
-- Backup/legal-retention policy permits it.
+Hash partitioning looks attractive because it spreads keys uniformly. For point lookups with no ordering requirement, it is often the simplest answer. The problem is that this store promises ordered scans, prefix reads, snapshots, and continuation across adjacent keys. A pure hash of the full key destroys locality: scanning `tenant42#orders#2026-10-13` becomes a fanout to every partition. A pure range scheme preserves locality but creates the classic hot-last-range problem for timestamps and monotonically increasing IDs. The production design needs both: ordered ranges in the storage layer and explicit key encodings, such as hashed tenant buckets or reversed timestamps, when the application does not need strict global order.
 
-Track a global or per-range garbage-collection safe point derived from active snapshots, replication progress, and subscriber checkpoints. Long-running snapshots can pin large histories and must be bounded.
+A split is a protocol, not a file operation. The parent range chooses a split key, usually near a boundary that reduces both bytes and heat. It commits a split marker at log index `i`, flushes or identifies a consistent state through `i`, creates child descriptors with epoch `parent_epoch + 1`, and publishes them atomically in metadata. The parent then rejects new requests for child-owned intervals with `STALE_RANGE_EPOCH`. For a while, stale clients still send to the parent. That is safe because the parent has a durable tombstone/forwarding descriptor saying, in effect, "I no longer own this interval after index `i`." Without that fence, the parent and child can both accept writes and no later repair can know which order was intended.
 
-## 12. Change streams and secondary consumers
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as Parent range
+    participant M as Metadata
+    participant A as Child A
+    participant B as Child B
+    C->>P: Write key k with epoch 7
+    P->>P: Commit split marker at index i
+    P->>M: Publish children with epoch 8
+    C->>P: Retry write key k with epoch 7
+    P-->>C: STALE_RANGE_EPOCH and child hint
+    C->>M: Refresh descriptor
+    M-->>C: Child B owns k at epoch 8
+    C->>B: Write key k with epoch 8
+```
 
-Committed range-log entries feed an ordered per-range change stream. Subscribers checkpoint `(range_id, log_index)` and receive split events that map a parent position to child positions.
+Moving a range is similar but uses joint consensus or an equivalent membership-change protocol. Add a new replica as a learner, stream it the snapshot and subsequent log entries, promote it only after it catches up, then remove the old replica. Leadership transfer is a separate step; moving bytes and moving the write leader at the same time creates avoidable unavailability. Merge is the inverse of split and should be conservative because it reduces parallelism. Many systems split automatically but avoid automatic merges because merging can reintroduce heat and complicate old descriptors.
 
-Delivery is at least once. Consumers deduplicate by stable event identity. If retention expires, return `CHECKPOINT_EXPIRED` and require a snapshot-plus-tail bootstrap. Change streams enable indexes, search, analytics, and cache invalidation, but those derived systems are not authoritative.
+DynamoDB's public material on split-for-heat is a useful production lesson: partition splitting can raise throughput for a hot partition, but it cannot make one partition key infinitely writable, and split decisions are constrained by local secondary indexes and access patterns. This maps directly to range heat. If heat covers a range of sort keys, split it. If all heat is one key, splitting creates two ranges where one remains hot.
 
-## 13. Reliability, repair, and failure handling
+Discord hit the latter pattern with hot channels in its message store. The fix was not only moving from Cassandra to ScyllaDB; Discord also put Rust data services in front of storage to consistently route channel traffic and coalesce identical concurrent reads. That is the right mental model for this design's gateway. If 10,000 clients ask for the same key at once, the gateway should send one in-flight read to storage and fan out the response. If a hot counter receives 10,000 increments/s, coalescing is not enough unless the operation is semantically mergeable; the product may need sharded counters or an append log.
 
-| Failure | Handling |
-|---|---|
-| Leader fails before commit | New leader may reject/retry; client uses request sequence |
-| Leader fails after commit before response | Retry returns recorded result |
-| Follower disk corrupts block | Checksum detects; copy from healthy replica |
-| Zone fails | Majority in other zones elects leader |
-| No quorum | Reject linearizable writes rather than split brain |
-| Client has stale range map | Epoch error includes/refers to new descriptors |
-| Compaction crashes | Input SSTables remain; unreferenced output is discarded |
-| Tombstone removed too early | Prevent through GC safe point and repair horizon |
-| Hot range overloads | Split, relocate, coalesce duplicate reads, isolate tenant, throttle, cache, or redesign key |
-| Metadata service unavailable | Cached routes and range consensus continue; reconfiguration pauses |
+Signals worth watching: per-range QPS, top-key estimates, stale-epoch rejection rate, split backlog, move duration, coalescing hit rate, and how often throttling protects one tenant from another.
 
-Periodic Merkle-tree or block-checksum comparisons detect silent divergence. Repair transfers only differing blocks and never overwrites newer committed state.
+> **Strong-answer criteria.** A senior answer separates byte imbalance from heat imbalance and explains why stale routing needs epoch fencing. It also admits that single-key heat is an application/API problem, not just a database partitioning problem.
 
-## 14. Backup and disaster recovery
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Hash every key and rely on random distribution. | Point reads balance, but scans, locality, and continuation semantics become expensive fanout. |
+| Good | Use ordered ranges with split and merge. | Preserves scans and supports online growth, but misses stale-route races and single-key heat. |
+| Great | Use range epochs, joint reconfiguration, heat-aware splits, request coalescing, tenant throttles, and application sharding for unsplittable keys. | Makes routing changes safe and picks the mitigation that matches the heat shape. |
 
-Create incremental, content-addressed SSTable snapshots plus a manifest at a consistent timestamp. Retain consensus/change logs after the snapshot for point-in-time recovery. Encrypt, checksum, and replicate backup objects independently of serving storage.
+### 6.2 Replication choices: consensus ranges versus leaderless quorums
 
-Restore into a separate cluster, verify row counts/checksums and application invariants, then cut over. Regular restore drills are mandatory; successful uploads alone do not prove recoverability.
+**Question.** During a zone-isolating network partition, two clients write the same key on opposite sides. Should both writes succeed?
+<details><summary>Answer</summary>
 
-## 15. Multi-region design
+Only if the range is configured for leaderless eventual semantics and the table has a conflict policy. In linearizable mode, the side without quorum must reject writes; otherwise the system has silently traded correctness for availability.
 
-Three options should be explicit:
+</details>
 
-1. **Regional quorum:** replicas across zones in one region; async disaster-recovery copy. Lowest latency, nonzero regional RPO.
-2. **Cross-region quorum:** replicas span regions. Strong consistency and near-zero RPO, but every write pays WAN latency.
-3. **Home-region per key/range:** each range has one writable region, async read replicas elsewhere. Scales globally with clear per-key order.
+A distributed key-value store is often described as if replication is one module. In reality, replication is the product contract. A consensus-backed range and a leaderless Dynamo-style range can share the same range descriptor and storage engine, but they promise different things.
 
-The practical default is regional consensus plus asynchronous DR, or home-region ranges for global products. Promotion fences the former region through epochs and waits for an accepted recovery point. Multi-leader last-write-wins may be offered as a separate eventual-consistency mode, not mixed invisibly with linearizable tables.
+In consensus mode, a range has a leader and a replicated log. A write is acknowledged after a majority persists the log entry. Majority intersection means any later leader must contain that committed entry or learn it before serving. A linearizable read cannot simply ask the nearest follower, because that follower may be behind or may not know a newer leader exists. The common solutions are leader reads with a lease that is valid under bounded clock assumptions, or a read-index protocol where the leader confirms it is still current with a quorum and waits until its state machine has applied through that index. The cost is clear: if the group has three replicas and only one is reachable, it cannot accept linearizable writes.
 
-## 16. Security and tenant isolation
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as Range leader
+    participant F1 as Follower 1
+    participant F2 as Follower 2
+    C->>L: Put k=v with epoch 12
+    L->>F1: Append log entry 51
+    L->>F2: Append log entry 51
+    F1-->>L: fsync ack
+    F2-->>L: fsync ack
+    L->>L: Commit entry 51 and apply MVCC version
+    L-->>C: version 51 committed
+```
 
-- Mutual TLS for node and client traffic with short-lived identities.
-- Table/key-prefix permissions for read, write, scan, watch, and administer.
-- Envelope encryption at rest with per-tenant/table data keys.
-- Quotas for storage, QPS, bandwidth, scans, snapshots, and change retention.
-- Validate key/value sizes before memory allocation.
-- Audit schema, ACL, backup, restore, and bulk-delete operations.
-- Prevent timing and metrics leakage across tenants; isolate very large tenants.
-- Secure decommissioning through cryptographic erasure and disk sanitization.
+Leaderless quorum mode starts from a different priority: remain writable when some replicas or paths fail. A coordinator writes to `W` replicas and reads from `R` replicas. If `R + W > N`, a read is likely to overlap a write in a healthy system, but that arithmetic alone does not provide linearizability under sloppy quorums, clock skew, concurrent writes, or partitions. The system needs version vectors or dotted versions to identify siblings, hinted handoff to remember writes intended for unavailable replicas, read repair to fix stale copies encountered during reads, and anti-entropy, often Merkle-tree based, to find divergence in the background. Deletes still require tombstones, because a replica that missed the delete might otherwise reintroduce the old value during repair.
 
-## 17. Observability
+Amazon's original Dynamo popularized this leaderless style for highly available shopping-cart-like workloads where conflict resolution was acceptable. DynamoDB, despite the name, is different for many core paths: public papers describe partitioned replication groups with Multi-Paxos and a managed service around admission control, auto scaling, backups, and global tables. The lesson is not that one protocol is universally better; it is that the guarantee must match the product. A bank balance and a cache of recommended videos do not need the same partition behavior.
 
-Track:
+Mixing the modes invisibly is the trap. If a table normally gives linearizable reads and writes, it cannot quietly fall back to accepting local writes during a partition. That creates histories no linearizable client can reason about. Instead, the table or range declares its mode. In consensus mode, errors say `QUORUM_UNAVAILABLE` or `NOT_LEADER`, and retries with the same idempotency key are safe. In leaderless mode, writes may return success with a version context, reads may return siblings, and the application or merge policy resolves them.
 
-- Read/write latency by consistency mode and range.
-- Request rate, throttling, conditional failures, and indeterminate outcomes.
-- Consensus proposal latency, leader changes, quorum health, and apply lag.
-- Range size/QPS skew, split/move backlog, and hot-key estimates.
-- WAL fsync, memtable stalls, Bloom effectiveness, and cache hit rate.
-- Compaction debt, read/write/space amplification, and free disk.
-- Checksum failures, repair bytes, backup age, and restore test results.
-- Change-stream lag and GC safe-point age.
+Multi-range transactions add another layer. DynamoDB's transactions paper is a reminder that distributed transactions are a feature, not a flag: transaction records, participant intents, timestamp ordering or locking, coordinator recovery, idempotency, and strict timeouts are part of correctness. This design keeps single-range atomicity in the baseline. If a batch spans ranges and asks for atomicity, it goes through a transaction coordinator and pays the latency and contention cost explicitly.
 
-Trace a request using range ID, epoch, leader, and log index without logging sensitive keys or values.
+Signals worth watching: leader changes, quorum write latency, read-index latency, rejected writes due to no quorum, hinted-handoff backlog, sibling/conflict rate, anti-entropy bytes, and repair age.
 
-## 18. Major trade-offs
+> **Strong-answer criteria.** A senior answer names the guarantee each replication family provides and refuses to blur availability fallback with linearizability. It also explains the repair machinery leaderless replication needs to avoid permanent divergence.
 
-### Hash versus range partitioning
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Replicate to three nodes and read from any node. | Fast, but reads can be stale and failover can lose acknowledged writes if commit rules are vague. |
+| Good | Use Raft or Paxos per shard. | Gives clean linearizable semantics, but sacrifices writes without quorum and may over-serve workloads that can tolerate conflicts. |
+| Great | Offer consensus and leaderless modes per range/table, expose the guarantee in the API, and implement idempotency, repair, conflict metadata, and tombstone retention accordingly. | Aligns partition behavior with product needs instead of hiding CAP choices. |
 
-Hashing balances random traffic naturally but makes scans expensive. Ranges support ordered scans and locality but can hotspot. This design chooses ranges and addresses skew explicitly.
+### 6.3 LSM storage, MVCC, compaction, and tombstone GC
 
-### Strong versus eventual consistency
+**Question.** A key is deleted, one replica is offline for a day, and compaction drops the tombstone on healthy replicas. What happens when the old replica returns?
+<details><summary>Answer</summary>
 
-Consensus simplifies application reasoning but sacrifices writes without quorum and adds latency. Eventual multi-leader designs favor availability but need conflict resolution. Expose the choice at table creation.
+The old value can be resurrected during repair. Tombstones must not be garbage-collected until the repair horizon, snapshot horizon, and change-stream horizon have all advanced beyond the delete.
 
-### LSM tree versus B-tree
+</details>
 
-LSMs optimize sustained writes and sequential storage with compaction cost. B-trees offer steadier reads and in-place updates. At this scale and write rate, an LSM is a strong default.
+The storage engine has to absorb high write throughput while supporting point reads, scans, snapshots, TTL, and repair. A B-tree gives in-place updates and stable read paths, but random writes across a petabyte-scale fleet create many small disk updates. An LSM tree fits this workload better: append to a WAL, insert into a sorted memtable, flush immutable SSTables, and compact them later. Sequential writes are efficient, and immutable files are convenient for snapshots and repair.
 
-### Synchronous versus asynchronous geo-replication
+The cost is read and write amplification. A point read may check the memtable and several SSTable levels, using Bloom filters and sparse indexes to avoid unnecessary disk reads. A scan merges sorted runs and filters MVCC versions. Compaction rewrites data repeatedly to reduce overlap, reclaim shadowed values, and keep read latency under control. With `1 GB/s` logical writes and three replicas, even moderate write amplification becomes fleet-scale disk work. That is why compaction has to be scheduled with foreground latency in mind and why tenants need quotas for write rate, scan bytes, and retained history.
 
-Synchronous replication minimizes RPO but adds WAN latency and can reduce availability. Asynchronous replication gives regional speed with explicit lag and failover loss risk.
+MVCC turns every update into a new version rather than an in-place overwrite. A linearizable read asks for the newest version at or below the committed read index. A snapshot scan asks for the newest version at or below its snapshot timestamp. Change streams read committed log entries and do not depend on whether old SSTables have been compacted. This separation is powerful: writers do not block readers, and backup can copy immutable SSTables plus a manifest. It also means old versions are intentionally retained, so garbage collection must be conservative.
 
-### Large versus small ranges
+Tombstones are the sharp edge. A delete writes a versioned marker saying "from this version onward, the key is absent." TTL is similar: the value is invisible after `expires_at`, but physical removal is a later compaction decision. Dropping the tombstone too early is worse than wasting space because it can resurrect data. A replica that missed the delete, a backup restore from before the delete, or a lagging change-stream consumer may still hold or need the old value. Repair must see the tombstone and prefer it over the older value.
 
-Large ranges reduce metadata and consensus groups but move slowly and hotspot. Small ranges rebalance well but add control-plane and file overhead.
+```mermaid
+stateDiagram-v2
+    [*] --> Live
+    Live --> Tombstoned: delete or TTL expires
+    Tombstoned --> Retained: wait for GC horizon
+    Retained --> Collectable: repair snapshot and stream horizons pass
+    Collectable --> Removed: compaction rewrites SSTables
+    Removed --> [*]
+```
 
-## 19. Lessons from production systems
+The GC horizon is the minimum of several watermarks: the oldest active snapshot timestamp, the oldest required change-stream checkpoint, the anti-entropy/repair horizon for replicas that may still return, and any legal or backup retention policy. In a consensus range, the log and snapshots give a precise committed order, but a slow follower can still pin history. In a leaderless range, the horizon must also consider hinted handoff and anti-entropy progress. If any watermark stalls, tombstones accumulate and compaction debt grows; that is an operational signal, not merely a storage nuisance.
 
-### Amazon DynamoDB: partition splitting, adaptive capacity, and heat
+Production systems reinforce this. Uber Schemaless used immutable versioned cells and asynchronous indexes, showing how version history and derived data decouple write paths from query features. FoundationDB keeps an ordered transactional KV core and builds layers above it; the transferable lesson is to keep the storage semantics tight and test failure histories aggressively. A system that cannot simulate compaction crashes, lost responses, split races, and repair from stale replicas will eventually discover those histories in production.
 
-DynamoDB scales by adding partitions and can split partitions for size or sustained traffic, but partition-level limits still exist and partitions are split rather than merged. This reinforces the design's range split triggers and adds two operational rules: pre-warm or pre-split when launching a known high-traffic table, and do not assume automatic splitting fixes a single hot partition key. For this design, the gateway should track per-range and per-key heat separately so range split, routing, coalescing, and application sharding are chosen deliberately.
+Signals worth watching: L0 file count, read amplification, write amplification, compaction debt, oldest snapshot age, oldest stream checkpoint, tombstone ratio, repair lag, and disk free-space headroom.
 
-### Amazon DynamoDB: managed Multi-Paxos at massive scale
+> **Strong-answer criteria.** A senior answer connects LSM mechanics to user-visible guarantees: snapshots require MVCC, deletes require tombstones, and tombstone GC is bounded by repair and consumers, not by a fixed timer alone.
 
-The DynamoDB USENIX ATC paper describes a managed NoSQL service using partitioned replication groups with Multi-Paxos, admission control, auto scaling, backups, and global tables; Amazon reported 89.2 million peak requests/second during Prime Day 2021 while maintaining single-digit millisecond performance. This maps directly to this design's independent consensus ranges and underscores that capacity automation, per-tenant guardrails, and operational workflows are as important as the core log protocol.
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Delete the key from disk when the user calls delete. | Breaks snapshots and can resurrect data from stale replicas. |
+| Good | Use WAL, memtables, SSTables, and tombstones. | Handles write throughput and deletes, but may leak space or drop history without a GC horizon. |
+| Great | Tie compaction and tombstone GC to MVCC, repair, snapshots, backup, and change-stream watermarks with admission control for compaction debt. | Preserves correctness while keeping the storage engine operable under sustained load. |
 
-### Amazon DynamoDB transactions: keep cross-partition transactions bounded
+## 7. Variants
 
-Amazon's transactions paper adds distributed transactions using timestamp ordering while exploiting key-value semantics to keep both transactional and non-transactional operations low-latency. The important interview lesson is not to bolt on unbounded 2PC casually: transaction records, participant recovery, conflict detection, idempotency, and strict time limits are part of the feature. This is why this design keeps single-range atomicity in the baseline and treats multi-range transactions as an explicit extension.
+**10x scale.** At 100 PB logical data and 60 million ops/s, the architecture stays range-based but the control plane must become more hierarchical. Metadata is cached aggressively, range controllers are partitioned by table or keyspace, and placement decisions are batched to avoid thrashing. The storage path still uses per-range replication and LSM files, but compaction, repair, and heat analytics need fleet-level scheduling so background work does not consume the same resources everywhere at once.
 
-### Discord: hot partitions need upstream protection, not just a faster database
+**Global active-active product.** If users must write locally in multiple regions during WAN partitions, consensus per regional range is not enough. Either assign each key a home region and accept remote-write latency for that key, or use leaderless/multi-leader semantics with conflict-free data types, version vectors, or application merges. What stays the same is epoch-fenced range ownership inside each region and MVCC/tombstone storage; what changes is the conflict contract exposed to callers.
 
-Discord's message store hit Cassandra hot partitions, compaction debt, and JVM GC toil at trillions of messages. Its migration added Rust data services that consistently route by channel and coalesce duplicate reads, then moved from 177 Cassandra nodes to 72 ScyllaDB nodes; historical-message p99 improved from 40-125 ms to about 15 ms and inserts to about 5 ms. For this design, a gateway/routing layer should include request coalescing and concurrency caps for hot keys before traffic reaches range leaders.
+**Strict financial ledger.** For account balances, choose consensus mode, single-range account placement where possible, conditional updates, and bounded transactions for cross-account movement. Reject writes without quorum. Do not offer eventual reads on ledger keys unless clearly marked as non-authoritative. The same storage engine works, but API defaults, audit retention, and transaction recovery become stricter.
 
-### Meta ZippyDB: a shared strongly consistent KV tier needs flexible isolation
+**Read-heavy derived feature store.** A Venice-like derived store for recommendations may accept eventual consistency and optimize BatchGet. The gateway enforces fanout budgets, partial-result policies, and per-tenant quotas. Change-stream bootstrap and bulk ingestion matter more than per-key linearizability. Hot-key coalescing, cache validation, and invisible dataset migration become central features.
 
-Meta built ZippyDB as a managed, strongly consistent, geographically distributed key-value store on RocksDB, Data Shuttle, shard management, and ZooKeeper. It groups resources into tiers, usually using a generic multi-tenant tier for utilization while allowing dedicated tiers for stricter isolation, and can use Paxos or async replication depending on durability/latency needs. This supports the design's tenant quotas and consistency-at-table-creation model rather than one global policy.
+## 8. The transferable pattern
 
-### Uber Schemaless: immutable versions and secondary indexes simplify scale-out
+This problem has the same reusable shape as many large stateful systems: split an enormous namespace into ownership units, replicate each unit with an explicit consistency contract, fence ownership changes, and push expensive background maintenance behind watermarks. The hardest part is not drawing replicas; it is preserving the ordering and ownership facts that make retries, repair, and reconfiguration safe.
 
-Uber's Schemaless stored immutable cells addressed by row key, column name, and ref key, with updates represented as newer versions and eventually consistent secondary indexes over JSON fields. Even though it used MySQL underneath rather than an LSM/consensus range, the production lesson is relevant: versioned immutable records, asynchronous derived indexes, and migration-friendly storage abstractions reduce risk when scaling core business data. This matches the MVCC/tombstone/change-stream parts of this design.
+The pattern appears in ordered storage systems like [FoundationDB](./distributed-key-value-store-system-design.md), reservation systems such as [Ticketmaster](./ticketmaster-system-design.md), and any design where a hot logical entity can overload one shard even when average load is low. The names change: range epoch becomes fencing token, MVCC version becomes ledger sequence, tombstone horizon becomes retention watermark. The design instinct is the same: identify the smallest unit that can own correctness, then make movement of that unit explicit.
 
-### LinkedIn Venice: derived KV stores need batch-get and fanout controls
+## Review
 
-LinkedIn Venice is a derived-data key-value platform used for read-heavy recommendation and ML features, serving 6.25M Single Get QPS and 45M key lookups/s for Batch Get at peak in the open-sourcing post. Venice emphasizes multi-region operation, multi-tenancy, quotas, self-healing, and invisible dataset migration across clusters. For this design, BatchGet should have key-count quotas, fanout budgets, partial-result semantics where acceptable, and operator-driven movement that is invisible to clients.
+The design starts from the CAP and skew constraint: each range must choose linearizable quorum behavior or higher-availability eventual behavior, and no single machine can own the keyspace. The answer is an ordered range abstraction with epoch-fenced routing, per-range replication, heat-aware split/move/coalescing, and an LSM/MVCC engine. Consensus ranges reject writes without quorum and give simple semantics; leaderless ranges remain available but require conflict metadata, hinted handoff, read repair, and anti-entropy. Storage correctness depends on retaining versions and tombstones until snapshots, repair, backups, and change streams have advanced. The production lesson from DynamoDB, Discord, ZippyDB, Schemaless, Venice, FoundationDB, and Netflix is that the protocol is only half the system; admission control, safe APIs, and operational guardrails make the guarantee usable.
 
-### FoundationDB: keep the KV core minimal and prove it under failure
+### Check your understanding
 
-FoundationDB exposes an ordered transactional key-value core and pushes richer data models into layers. Its technical overview emphasizes optimistic concurrency control, specialized cluster roles, fault tolerance, and simulation/testing as first-class engineering tools. This argues for keeping this system's core API small, making range ownership and transaction rules precise, and validating leader changes, splits, recovery, and backup restore through deterministic fault testing rather than relying on happy-path integration tests.
+1. Why is range partitioning chosen even though hashing balances load better?
+   <details><summary>Answer</summary>
 
-### Netflix KV DAL: hide sharp datastore edges behind a disciplined API
+   Ordered ranges preserve scans, prefix locality, and snapshot continuation. Hashing is still useful in key design when global order is unnecessary, but a pure full-key hash would turn range scans into broad fanout.
 
-Netflix's Key-Value Data Abstraction Layer sits above Cassandra, DynamoDB, EVCache, RocksDB, and other stores to standardize modeling and operational patterns. Netflix calls out repeated problems with consistency reasoning, tail latency, idempotency, wide partitions, fat columns, and slow pagination. This maps to a production SDK/gateway that should reject unsafe key shapes, enforce idempotency tokens, cap value and page sizes, expose consistency explicitly, and give teams one safe path for common KV access patterns.
+   </details>
 
-## 20. Recommended interview presentation
+2. What prevents a stale client from writing to a parent range after a split?
+   <details><summary>Answer</summary>
 
-1. Clarify consistency, scan, transaction, durability, and regional requirements.
-2. Estimate operations, bytes, replicas, and write amplification.
-3. Draw metadata routing and independent consensus groups per range.
-4. Walk through quorum write and linearizable/follower reads.
-5. Deep-dive into range split/move and stale-route epochs.
-6. Explain WAL, memtables, SSTables, compaction, and tombstone safety.
-7. Cover request deduplication, repair, backup restore, and change streams.
-8. Finish with multi-region consistency/latency trade-offs.
+   Every descriptor has an epoch, and every request carries the epoch used for routing. After the split marker commits and child descriptors are published, the parent rejects requests for child-owned keys with `STALE_RANGE_EPOCH` and a refresh hint.
 
-The central design insight is:
+   </details>
 
-> Partition the ordered keyspace into independently replicated consensus ranges, use epochs to make routing and ownership changes safe, and combine a replicated log with an LSM engine and MVCC so durable writes, scalable scans, repair, and snapshots have explicit correctness boundaries.
+3. Why does `R + W > N` not automatically mean a leaderless system is linearizable?
+   <details><summary>Answer</summary>
 
+   Quorum overlap helps, but sloppy quorums, concurrent writes, partitions, clock assumptions, and stale replicas can still produce multiple versions. Linearizability requires a single real-time order; leaderless systems need version metadata and reconciliation, and they usually provide eventual consistency rather than linearizability.
 
-## Further reading: curated engineering blogs
+   </details>
+
+4. Why can a single hot key survive range splitting?
+   <details><summary>Answer</summary>
+
+   A split divides key intervals. If all traffic targets one key, that key remains entirely in one child range. The fix is request coalescing, caching, throttling, mergeable/sharded data structures, or an application-level redesign.
+
+   </details>
+
+5. Why is tombstone garbage collection tied to multiple horizons?
+   <details><summary>Answer</summary>
+
+   A tombstone must remain until no stale replica, repair process, snapshot, backup restore, or change-stream consumer can need it to suppress an older value. The safe GC point is the minimum of those watermarks, not merely the delete time plus a fixed delay.
+
+   </details>
+
+## Sources and further reading
 
 | Source | Article | Why it matters |
 |---|---|---|

@@ -1,577 +1,370 @@
-# Ticketmaster-like Event Ticketing Platform
+# Ticketmaster System Design
+
+A Ticketmaster-like platform lets fans discover events, wait for high-demand onsales, reserve scarce inventory, pay, receive digital tickets, transfer tickets, and enter a venue. The hard part is not browsing events; it is a synchronized onsale where millions of buyers compete for far fewer seats, each seat must be sold exactly once, and payment is an external system that cannot join our database transaction.
 
 ## 1. Requirements
+### 1.1 Functional requirements
+- Let fans search events, view event details, prices, fees, seat maps, and current availability hints.
+- Gate high-demand onsales through presales, access codes, bot defenses, and a virtual waiting room.
+- Place reserved seats or general-admission quantities on short-lived holds while a buyer checks out.
+- Convert a valid hold into an order, payment authorization/capture, issued tickets, and buyer notifications.
+- Support ticket transfer, controlled resale, refunds, revocation, and venue scanning.
+- Let venue operators publish events, load inventory, manage allocations, and audit inventory transitions.
 
-### Functional requirements
+### 1.2 Non-functional requirements
+- **No oversells.** A seat sold twice is worse than a temporarily rejected purchase, so authoritative inventory mutations must be strongly consistent.
+- **Spike tolerance.** A major onsale can create traffic that is orders of magnitude above normal, so admission must be shaped before requests reach inventory.
+- **Low-latency browsing.** Event pages and seat maps must remain responsive under load, which means browse data cannot depend on synchronous seat-by-seat reads.
+- **Idempotent checkout.** Buyers retry during slowdowns and payment providers time out, so duplicate requests must produce one business outcome.
+- **Auditable money and inventory.** Every hold, release, sale, refund, transfer, and scan needs durable evidence for customer support, settlement, fraud review, and venue operations.
+- **Fast admission.** A ticket should scan in hundreds of milliseconds online and degrade safely when a venue has weak connectivity.
 
-1. Search and browse events by artist, venue, city, category, and date.
-2. Display event details, seat maps, prices, fees, and availability.
-3. Support reserved seating and general-admission inventory.
-4. Place seats in a short-lived hold while a buyer checks out.
-5. Process payment and issue digitally signed tickets.
-6. Prevent overselling and duplicate ticket issuance.
-7. Support waiting rooms, presales, access codes, and per-account limits.
-8. Allow cancellation, refund, transfer, and controlled resale.
-9. Let venue operators create events, allocate inventory, and scan tickets.
-10. Notify buyers about purchases, transfers, refunds, and event changes.
+### 1.3 The binding constraint
+The binding constraint is a synchronized onsale where demand exceeds inventory by orders of magnitude and every seat must be sold exactly once. The read side wants massive caching and approximate freshness. The write side cannot be approximate: two buyers racing for the last seat need one winner, not two eventual winners and a refund apology.
 
-### Non-functional requirements
+This forces three mechanisms that shape the whole design. First, seat holds are short TTL leases created by atomic conditional updates, not by long distributed locks. Second, a virtual waiting room meters admitted shoppers with signed tokens so the inventory system sees a survivable write rate. Third, checkout is a saga: hold, authorize payment, confirm inventory and tickets, then capture or compensate, with idempotency and an outbox at every boundary.
 
-- Correct inventory is more important than write availability.
-- Event browsing should remain available during sale spikes.
-- Seat availability should update within seconds.
-- Checkout must be idempotent and auditable.
-- The platform must withstand bot traffic and hundred-fold flash-sale bursts.
-- Payment data must meet PCI obligations.
-- A sold ticket must scan quickly even if venue connectivity is degraded.
+## 2. Back-of-the-envelope estimation
+Assume these numbers are illustrative for one large platform, not claims about a specific company. A normal day might sell `5,000,000 / 86,400 ≈ 58` tickets per second on average, but this average is not useful for architecture. The dangerous moment is a launch where `5,000,000` fans chase `100,000` seats. If even `20%` click through in the first minute, that is `5,000,000 × 0.2 / 60 ≈ 16,667` seat-selection attempts per second for one event before retries, bots, and refreshes.
 
-The design covers primary sales and transfers. Auction pricing and a complete recommendation engine are out of scope.
+Browsing is bigger but easier. If `5,000,000` fans reload a page every `10` seconds, the edge sees `500,000` requests per second for that event. Add search, static seat-map tiles, queue polling, and mobile reconnects, and a platform-wide browse peak of `1,000,000-2,000,000` requests per second is plausible. That implies CDN and edge waiting-room infrastructure must absorb most traffic; the catalog database should not see this load.
 
-## 2. Scale assumptions
+Inventory writes are smaller but more constrained. Suppose we allow `50,000` admitted shoppers in the protected shopping zone and each makes one hold attempt every `30` seconds after failed selections. That is `50,000 / 30 ≈ 1,667` authoritative hold attempts per second for a hot event. If each request touches an average of `2.5` seats, the event home shard performs about `4,167` seat conditional updates per second. This is high but tractable with event-local partitioning, short transactions, and admission control; it is not tractable if every buyer can hammer the hold endpoint directly.
 
-- 200 million registered users and 20 million daily active users.
-- 2 million future events; 100,000 venues.
-- 5 million tickets sold on an ordinary day.
-- A major onsale can attract 5 million users for 100,000 seats in minutes.
-- Browse peak: 2 million requests/second, mostly served from caches.
-- Inventory mutation peak: 100,000 hold attempts/second for one event.
-- Checkout peak: 20,000 orders/second platform-wide.
-- Average reserved event: 20,000 seats; stadium event: 100,000.
-- Hold duration: 5-10 minutes.
+Checkout is bounded by successful holds. If a `100,000` seat event sells out over `20` minutes, it completes `100,000 / 1,200 ≈ 83` tickets per second, maybe `30-60` orders per second depending on tickets per order. Payment systems and order databases must handle platform-wide peaks, but the hottest event's payment rate is far below its failed seat-selection rate. This difference is why queue admission and hold failures must be cheap, while finalization must be conservative.
 
-Ordinary average ticket sales:
+> **Key idea.** The architecture is sized by skew, not averages: millions can browse, thousands can attempt holds, and only tens to hundreds per second can actually convert for one event. We spend strong consistency only on scarce inventory and use admission control to keep that path within its safe operating envelope.
 
-```text
-5M tickets / 86,400 seconds = about 58 tickets/second
-```
+## 3. API design
+**Question.** What makes a checkout retry safe when the browser, our order service, and the payment provider can each time out independently?
+<details><summary>Answer</summary>
 
-That average is misleading. Capacity planning is driven by synchronized onsales and extreme skew toward a few events.
+Every mutating API takes an idempotency key scoped to the authenticated user and operation. The order service stores the first result for that key, uses the order ID as the payment-provider idempotency key, and exposes an order status resource so a retry observes progress rather than creating a second charge or a second ticket.
 
-## 3. High-level architecture
-
-```mermaid
-flowchart LR
-    U[Web / Mobile Users]
-    V[Venue Scanners / Operator Portal]
-    EDGE[CDN / WAF / Bot Defense]
-    WAIT[Virtual Waiting Room]
-    API[API Gateway]
-    CATALOG[Catalog Service]
-    SEARCH[Search Service]
-    PRICE[Pricing Service]
-    INV[Inventory Service]
-    HOLD[Hold Service]
-    ORDER[Order Service]
-    PAY[Payment Orchestrator]
-    TICKET[Ticket Service]
-    TRANSFER[Transfer / Resale Service]
-    NOTIFY[Notification Service]
-    BUS[Event Stream]
-    CATDB[(Catalog DB)]
-    IDX[(Search Index)]
-    INVDB[(Strongly Consistent Inventory DB)]
-    ORDERDB[(Order DB)]
-    CACHE[(Availability Cache)]
-    OBJ[(Seat Maps / Ticket Assets)]
-    PSP[Payment Providers]
-
-    U --> EDGE --> WAIT --> API
-    V --> EDGE --> API
-    API --> CATALOG --> CATDB
-    CATALOG --> IDX
-    API --> SEARCH --> IDX
-    API --> PRICE
-    API --> INV --> INVDB
-    API --> HOLD --> INVDB
-    API --> ORDER --> ORDERDB
-    ORDER --> PAY --> PSP
-    ORDER --> TICKET
-    API --> TRANSFER
-    INV --> CACHE
-    ORDER --> BUS
-    BUS --> NOTIFY
-    BUS --> TRANSFER
-    TICKET --> OBJ
-```
-
-Browsing and seat-map reads are a scalable, eventually consistent plane. Holds, orders, and ticket ownership form the strongly consistent transaction plane.
-
-## 4. Data model
-
-```text
-Event
-- event_id
-- venue_id
-- name
-- starts_at
-- onsale_at
-- status
-- home_region
-- seating_plan_version
-
-Seat
-- event_id
-- seat_id
-- section
-- row
-- number
-- price_level_id
-- accessibility_attributes
-- state: AVAILABLE | HELD | SOLD | BLOCKED
-- hold_id
-- state_version
-
-GeneralAdmissionPool
-- event_id
-- pool_id
-- capacity
-- held_count
-- sold_count
-- version
-
-Hold
-- hold_id
-- event_id
-- user_id
-- status: ACTIVE | CONVERTED | EXPIRED | RELEASED
-- expires_at
-- idempotency_key
-
-HoldItem
-- hold_id
-- seat_id_or_pool_id
-- quantity
-- quoted_unit_price
-- fee_breakdown
-
-Order
-- order_id
-- user_id
-- event_id
-- hold_id
-- amount
-- currency
-- status: PENDING_PAYMENT | PAYMENT_AUTHORIZED | PAID | FAILED | REFUNDED | CANCELLED
-- payment_attempt_id
-- idempotency_key
-
-Ticket
-- ticket_id
-- order_id
-- event_id
-- seat_id
-- current_owner_id
-- credential_version
-- status: ACTIVE | TRANSFER_PENDING | REVOKED | SCANNED
-
-TicketOwnershipEvent
-- ticket_id
-- sequence
-- from_owner_id
-- to_owner_id
-- reason
-- timestamp
-
-AdmissionScan
-- ticket_id
-- gate_id
-- scanned_at
-- result
-- scanner_id
-```
-
-Seat state is authoritative in the inventory database. The availability cache and search index are hints. Store the price quote on the hold so checkout cannot silently change the total.
-
-## 5. Core APIs
-
-### Browse availability
+</details>
 
 ```http
-GET /v1/events/{event_id}/availability?section=102
-```
-
-```json
-{
-  "event_id": "evt-9",
-  "as_of": "2026-10-13T07:20:01Z",
-  "seats": [
-    {"seat_id": "102-A-1", "state": "AVAILABLE", "price": {"amount": 12500, "currency": "USD"}}
-  ]
-}
-```
-
-### Create a hold
-
-```http
-POST /v1/events/{event_id}/holds
-Idempotency-Key: 33b...
-
-{
-  "seat_ids": ["102-A-1", "102-A-2"],
-  "offer_token": "signed-presale-or-queue-token"
-}
-```
-
-```json
-{
-  "hold_id": "hold-71",
-  "expires_at": "2026-10-13T07:28:00Z",
-  "price": {"subtotal": 25000, "fees": 4200, "total": 29200, "currency": "USD"}
-}
-```
-
-### Checkout
-
-```http
-POST /v1/orders
-Idempotency-Key: 76c...
-
-{
-  "hold_id": "hold-71",
-  "payment_method_token": "pm-token",
-  "expected_total": 29200
-}
-```
-
-Other endpoints:
-
-```http
+GET  /v1/events?city=SEA&from=2026-11-01&category=music
 GET  /v1/events/{event_id}
-GET  /v1/search/events
+GET  /v1/events/{event_id}/availability?section=102&since_version=4812
+POST /v1/waiting-rooms/{onsale_id}/join
+POST /v1/waiting-rooms/{onsale_id}/token/refresh
+POST /v1/events/{event_id}/holds
+     Idempotency-Key: <uuid>
+     {"seat_ids":["102-A-1","102-A-2"],"admission_token":"<signed>","quote_token":"<signed>"}
+POST /v1/orders
+     Idempotency-Key: <uuid>
+     {"hold_id":"hold_71","payment_method_token":"pm_...","expected_total":{"amount":"292.00","currency":"USD"}}
 GET  /v1/orders/{order_id}
-POST /v1/orders/{order_id}/refund
 POST /v1/tickets/{ticket_id}/transfers
-POST /v1/transfers/{transfer_id}/accept
-POST /v1/tickets/{ticket_id}/resale-listings
 POST /v1/admission/scans
 ```
 
-Every mutating request is idempotent. Queue tokens are signed, event-scoped, short-lived, and bound to an account where possible.
+The availability endpoint returns hints, not promises. It can include `as_of`, a section version, and deltas since a prior version, but the create-hold endpoint is the only place where availability becomes authoritative. The API should say this explicitly because otherwise users experience a stale green seat as a lie rather than normal contention.
 
-## 6. Browse and onsale flow
+Queue admission tokens are separate from holds. A token says this account/session may enter the protected shopping zone for this onsale until a short expiration; it does not reserve a seat. The hold API validates the token on every request so a script cannot bypass the waiting-room page and call inventory directly. Tokens should be signed, event-scoped, audience-scoped, rate-limit classed, and preferably bound to account plus device/session. A refresh endpoint extends active shoppers only while they heartbeat and stay within policy.
 
-Before onsale:
+Checkout returns either a completed order or `202 Accepted` with a status resource when payment or finalization is still in progress. That is better than making clients guess after a timeout. Cancel semantics are deliberately narrow: releasing an active hold is allowed before payment authorization starts, but once an order is in `AUTHORIZING` or later, the system resolves through the saga and compensates if needed. This avoids a race where a buyer cancels locally while a payment authorization succeeds remotely.
 
-1. Operators publish event metadata, seat map, price levels, and inventory allocations.
-2. Catalog changes update the search index and CDN.
-3. Inventory is loaded into the event's home region and validated against venue capacity.
-4. Waiting-room admission begins before the sale.
+Money amounts use decimal strings or integer minor units consistently. The hold stores the quoted subtotal, fees, taxes, currency, and expiration so the order can reject `expected_total` mismatches rather than silently changing the buyer's price during checkout.
 
-During onsale:
+## 4. Data model
+Start with the obvious entity: `Seat(event_id, seat_id, state)`. That is enough to draw a map, but not enough to explain who owns a temporary claim or protect against stale releases. Add `hold_id`, `state_version`, and `updated_at` so every transition can be conditional: only change this exact seat if it is still in the expected state and, for releases, still belongs to the hold being released.
 
-1. CDN serves event pages and static seat-map geometry.
-2. The waiting room admits users at a controlled rate.
-3. Availability APIs return cached summaries and fresher section-level deltas.
-4. Selecting seats sends a strongly consistent hold request.
-5. Inventory changes publish invalidations to the availability cache.
+General admission breaks the per-seat model because there may not be individual seat IDs. For that, use a `GeneralAdmissionPool(event_id, pool_id, capacity, held_count, sold_count, version)`. A hold on GA inventory is a conditional counter update: `capacity - held_count - sold_count >= requested_quantity`. The same invariant, `held + sold <= capacity`, is enforced without pretending to know seat numbers.
 
-The UI must communicate that displayed availability is provisional until a hold succeeds.
+A `Hold` is not just a cache key. It is a lease with an owner, expiration, price quote, status, and idempotency key. Without a durable hold row, checkout cannot prove that the buyer is entitled to convert the seats, expiration cannot be raced safely, and support cannot audit why a seat disappeared. `HoldItem` records the exact seats or pool quantities and the quoted price components.
 
-## 7. Seat hold algorithm
+An `Order` records the attempt to turn a hold into money and tickets. It needs a state machine because payment can succeed while our response is lost, or our finalization transaction can fail after authorization. `PaymentAttempt` is separate because one order may have several attempts while the hold remains valid, and provider webhooks can arrive after the client has left.
 
-For reserved seats, atomically transition every requested seat:
+A `Ticket` should not be a static barcode. It is an owned entitlement for an event and seat, with a current owner, credential version, and status. `TicketOwnershipEvent` gives an append-only chain for transfers, resale, refunds, and disputes. `AdmissionScan` records the first accepted scan and rejected duplicates.
+
+```text
+Event(event_id, venue_id, name, starts_at, onsale_id, status, home_region, seating_plan_version)
+Seat(event_id, seat_id, section, row, number, price_level_id, state, hold_id, state_version, updated_at)
+GeneralAdmissionPool(event_id, pool_id, capacity, held_count, sold_count, version)
+Hold(hold_id, event_id, user_id, status, expires_at, idempotency_key, quote_version, total_amount, currency)
+HoldItem(hold_id, item_id, seat_id, pool_id, quantity, unit_amount, fee_amount, tax_amount)
+Order(order_id, user_id, event_id, hold_id, status, idempotency_key, total_amount, currency, created_at)
+PaymentAttempt(payment_attempt_id, order_id, provider, provider_key, status, authorized_amount, captured_amount)
+Ticket(ticket_id, order_id, event_id, seat_id, current_owner_id, credential_version, status)
+TicketOwnershipEvent(ticket_id, sequence, from_owner_id, to_owner_id, reason, created_at)
+OutboxEvent(event_id, aggregate_type, aggregate_id, sequence, type, payload, created_at)
+AdmissionScan(ticket_id, event_id, gate_id, scanner_id, scanned_at, result)
+```
+
+Inventory tables live in the event's home region in a strongly consistent relational database or a key-value store with conditional multi-item transactions for the access pattern. Reserved seats are partitioned by `event_id`, and for very large venues may be subpartitioned by section while keeping multi-seat holds section-local. Orders can partition by `order_id` or buyer, but order finalization calls the event home shard. Catalog, search, static seat geometry, and availability summaries live in caches, object storage, and search indexes because they are read-heavy and tolerate staleness. Raw card data deliberately does not enter the core store; tokenized payment methods and provider references do.
+
+> **Key idea.** The data model separates hints from rights. Availability caches hint that seats may be open; only a durable hold tied to authoritative inventory grants the temporary right to buy.
+
+## 5. High-level design
+The simplest design is a web app in front of catalog, inventory, order, and payment services. Users browse events, select seats, the app marks seats sold after payment, and tickets are issued.
+
+```mermaid
+flowchart LR
+    U["Fan"] --> API["API service"]
+    API --> CATALOG["Catalog database"]
+    API --> INV["Inventory database"]
+    API --> PAY["Payment provider"]
+    API --> TICKET["Ticket issuer"]
+```
+
+This breaks in several concrete ways. First, browsing load from a hot onsale overloads origin before any purchase happens. Second, marking seats sold after payment lets two buyers pay for the same last seat. Third, holding database locks while users type card details destroys concurrency and creates deadlocks. Fourth, direct access to hold endpoints lets bots multiply pressure on the only strongly consistent path. Fifth, publishing events to caches, notifications, and ticket services after committing orders creates dual-write gaps when a process crashes.
+
+### Fix 1: Split browsing from authoritative inventory
+Event pages, search results, seat-map geometry, and section-level availability summaries are served from CDN, search indexes, object storage, and short-TTL caches. Inventory mutations do not depend on those systems being fresh. This makes browsing resilient during a stampede and preserves the mental model: green seats are invitations to try, not promises.
+
+SeatGeek's resilience writing describes a similar need for CDN shielding, short TTLs, stale-while-revalidate, route-specific limits, and circuit breakers because origin failure can reduce cacheability and amplify load. That lesson maps directly here: the cache layer is not an afterthought; it is the blast shield between millions of reloads and fragile origin paths.
+
+### Fix 2: Add a virtual waiting room before protected APIs
+The waiting room absorbs burst intake, assigns queue order or lottery rank, and issues signed admission tokens at a controlled rate. The protected zone includes seat holds and checkout, not just a web page. Ticketmaster describes Smart Queue as account sign-in, assigned positions, controlled admission, and live messaging; AWS's SeatGeek waiting-room architecture similarly separates edge gatekeeping from a protected ticket-selection zone with explicit throughput controls. The important architectural point is that queue admission is a pressure valve for inventory, not a fairness decoration.
+
+### Fix 3: Use short seat holds with atomic conditional updates
+A hold is a TTL lease recorded with the inventory transition. The system atomically moves requested seats from `AVAILABLE` to `HELD` only if every requested seat is still available, or atomically increments a GA held counter only if capacity remains. This prevents oversells without keeping locks open while the buyer checks out. Expiration is also conditional, so a delayed worker cannot release a seat that has already been converted or re-held.
+
+### Fix 4: Make checkout an idempotent saga
+Payment cannot join an ACID transaction with inventory, so the order service advances through explicit states: pending, authorizing, authorized, confirmed, paid, failed, or compensated. If the provider times out, the service queries by idempotency key before retrying. If authorization succeeds but finalization fails, the hold remains fenced and finalization retries. Only an audited compensation releases inventory after money is voided or refunded.
+
+### Fix 5: Publish state changes through a transactional outbox
+Order, inventory, and ticket updates write an outbox row in the same transaction as the state change. A relay publishes those rows to Kafka or another event bus. SeatGeek's outbox work, including WAL-based emission with Debezium/Kafka Connect, is evidence that this is not theoretical hygiene: without an atomic outbox, a crash after commit but before publish leaves stale availability, missing notifications, and broken reconciliation.
+
+### Putting it together
+```mermaid
+flowchart LR
+    U["Web and mobile fans"] --> EDGE["CDN, WAF, bot defense"]
+    EDGE --> WAIT["Virtual waiting room"]
+    EDGE --> CACHED["Cached event pages and seat maps"]
+    WAIT --> API["API gateway"]
+    API --> CATALOG["Catalog and search services"]
+    API --> AVAIL["Availability cache"]
+    API --> HOLD["Hold service"]
+    HOLD --> INVDB[("Event home inventory store")]
+    API --> ORDER["Order service"]
+    ORDER --> INVDB
+    ORDER --> PAY["Payment provider"]
+    ORDER --> TICKET["Ticket service"]
+    TICKET --> TICKETDB[("Ticket store")]
+    INVDB --> OUTBOX["Transactional outbox"]
+    ORDER --> OUTBOX
+    TICKETDB --> OUTBOX
+    OUTBOX --> BUS["Event stream"]
+    BUS --> AVAIL
+    BUS --> NOTIFY["Notifications and reconciliation"]
+    API --> SCAN["Admission service"]
+```
+
+A fan first hits the edge, which serves static event data and places them in a waiting room if the onsale is protected. When admitted, the fan receives a signed token and may call availability and hold APIs. The hold service validates the token, writes `Hold` and `Seat` or `GeneralAdmissionPool` changes in the event home inventory store, and emits invalidation through the outbox. Checkout creates an `Order`, authorizes payment, finalizes inventory, creates `Ticket` rows, and publishes events for notifications, cache updates, settlement, and reconciliation. The only path that decides whether a seat is still sellable is the event home inventory transaction.
+
+> **Key idea.** Each component traces back to a specific failure of the naive design: caches protect reads, the waiting room protects writes, holds protect seats during checkout, sagas protect money boundaries, and the outbox protects downstream truth.
+
+## 6. Deep dives
+### 6.1 Seat holds as TTL leases, not distributed locks
+**Question.** Two buyers race for the same last pair of seats, one hold expires at the same time checkout starts, and an expiration worker is running late. How do we avoid selling or releasing the wrong seats?
+<details><summary>Answer</summary>
+
+Create holds with atomic conditional inventory updates and release them with conditional expiry checks against database time, hold status, and seat ownership. Checkout revalidates the hold inside the finalization transaction. No worker may release a seat unless the seat still references that exact active hold and the hold is expired.
+
+</details>
+
+The tempting design is to put a distributed lock around each seat: lock seats, send the buyer to checkout, unlock after payment. That fails because checkout takes minutes and payment is external. Long locks strand inventory when clients disappear, create lock convoys around popular seats, and require correctness from a lock service during the most overloaded moment. Worse, a lock is not the business state. Support, checkout, and scanners need to know whether the buyer has a valid claim, what price was quoted, and when the claim expires.
+
+A hold should be modeled as a TTL lease in the authoritative inventory store. For reserved seating, create a `Hold` row and update all requested seats in one transaction:
 
 ```sql
 UPDATE seats
-SET state = 'HELD',
-    hold_id = :hold_id,
-    state_version = state_version + 1
+SET state = 'HELD', hold_id = :hold_id, state_version = state_version + 1
 WHERE event_id = :event_id
-  AND seat_id IN (...)
+  AND seat_id IN (:seat_ids)
   AND state = 'AVAILABLE';
 ```
 
-Commit only if the affected count equals the requested count. Otherwise roll back and return which seats are unavailable, possibly with nearby alternatives.
+The transaction commits only if the affected row count equals the requested seat count, then inserts `HoldItem` rows and the quoted price. If one seat is unavailable, the whole hold fails. Partial holds look user-friendly until a buyer asks for four adjacent seats and receives two random seats; they also complicate payment totals and release logic.
 
-For general admission, use a conditional counter:
+For general admission, the equivalent is a conditional counter update on the pool: increase `held_count` only when `capacity - held_count - sold_count >= quantity`. This can be a row lock in a relational database, a compare-and-swap on a versioned item, or a serializable transaction in a distributed store. A cache decrement is never the source of truth because cache replication and retries are exactly where oversells are born.
 
-```text
-if capacity - sold_count - held_count >= requested_quantity:
-    held_count += requested_quantity
-else:
-    reject
-```
-
-This update executes under a row lock or serializable compare-and-swap. Never use a cache decrement as the source of truth.
-
-The hold row and inventory transition commit in one transaction. A delay queue schedules expiration, but expiration correctness comes from `expires_at`, not from delivery timing.
-
-## 8. Checkout and payment saga
-
-Payment cannot share an ACID transaction with the inventory database. Use an explicit saga:
-
-1. Validate the active hold, ownership, price, limits, and expiration.
-2. Create `PENDING_PAYMENT` order idempotently.
-3. Authorize or charge through the payment provider using the order ID as its idempotency key.
-4. On authorization success, transactionally mark seats `SOLD`, mark the hold `CONVERTED`, mark the order `PAYMENT_AUTHORIZED`, create ticket records, and write an outbox event.
-5. Capture payment, if authorization and capture are separate, then mark the order `PAID`; if the provider charged immediately, record the successful charge and mark `PAID` in the finalization transaction.
-6. Deliver ticket notifications asynchronously.
-
-If payment succeeds or is authorized but finalization initially fails, retain the hold and retry finalization. Do not sell those seats to someone else. If finalization is permanently impossible, void or refund the payment and release inventory with an audited compensation.
-
-If payment fails, mark the order failed. The user may retry while the hold remains valid.
-
-## 9. Hold expiration and fairness
-
-Expiration workers scan buckets by `expires_at` and conditionally release:
+Expiration is where many designs accidentally reintroduce races. A delay queue can wake a worker at `expires_at`, but queues are not clocks and delivery can be early, late, duplicated, or lost. Correctness comes from the conditional release:
 
 ```text
-release only when:
-hold.status == ACTIVE
-and hold.expires_at <= database_now
-and seat.hold_id == hold.id
+release hold H only if
+  database_now >= H.expires_at
+  and H.status = ACTIVE
+  and each seat.state = HELD
+  and each seat.hold_id = H.hold_id
 ```
 
-This prevents a delayed worker from releasing a seat belonging to a newer hold. Database time avoids client-clock manipulation.
+Using database time prevents client-clock manipulation. Checking `seat.hold_id` prevents a delayed expiration job for an old hold from releasing a seat that was already re-held by another buyer. Checking hold status prevents expiration from undoing a successful conversion. Checkout performs the symmetric condition: it can convert only when `status = ACTIVE`, `expires_at > database_now`, and every item still belongs to that hold.
 
-Fairness controls:
-
-- Virtual waiting room with randomized ordering before onsale.
-- Signed admission tokens and controlled per-event issue rate; a queue token permits shopping, not a specific seat, and protected APIs still validate the token on every request.
-- Per-account, card, device, address, and phone purchase limits.
-- CAPTCHA or step-up checks based on risk, not on every request.
-- Short holds and limits on concurrent holds.
-- No advantage from request flooding; rate limits apply before inventory.
-- Accessible inventory receives policy-specific enforcement and auditing.
-
-## 10. Consistency and concurrency
-
-Strong consistency is required for:
-
-- Seat and pool availability transitions.
-- Hold conversion and expiration.
-- Order state changes.
-- Ticket ownership and revocation.
-- Admission's first successful scan.
-
-Event catalog, search, aggregate availability, recommendations, and notifications may be eventual.
-
-All state transitions are conditional:
-
-```text
-AVAILABLE -> HELD -> SOLD
-             |
-             -> AVAILABLE on expiration
+```mermaid
+stateDiagram-v2
+    [*] --> AVAILABLE
+    AVAILABLE --> HELD: "atomic hold if available"
+    HELD --> AVAILABLE: "conditional expiry or release"
+    HELD --> SOLD: "checkout finalization"
+    SOLD --> REVOKED: "refund or cancellation policy"
 ```
 
-No transition from `SOLD` back to `AVAILABLE` occurs without an explicit cancellation/refund policy. State versions and audit events expose illegal transitions.
+The main trade-off is partitioning. Keeping all seats for an event in one strongly consistent shard makes multi-seat holds straightforward. A stadium onsale may push that shard hard, but the waiting room can throttle write QPS and most reads are cached. If one event cannot fit on one shard, partition by section and make the product prefer section-local holds. Cross-section atomic holds require a coordinator or a small distributed transaction, but that complexity should be reserved for cases that truly need it.
 
-Exactly-once delivery is not assumed. Idempotency at API, payment, order, ticket, and consumer boundaries produces exactly-once business effects.
+Signals worth watching: hold transaction latency, conditional-update conflict rate, expiration lag, active expired holds, held-to-sold conversion, and any invariant violation where `sold_count + held_count > capacity` or a sold seat has more than one active ticket.
 
-## 11. Partitioning and storage
+> **Strong-answer criteria.** A senior answer distinguishes a lease from a lock, makes every state transition conditional, and explains delayed expiration races. It also states which store is authoritative and which cached views are only hints.
 
-Partition inventory by `event_id`, keeping one event's seat mutations in a single strongly consistent shard or database partition. This enables multi-seat atomic holds.
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Decrement a cache or lock seats while the user pays. | Cache writes are not authoritative, and long locks collapse under abandoned checkouts and provider delays. |
+| Good | Store holds with TTL and atomically mark seats held. | This prevents most oversells but may still be vague about expiration races and GA counters. |
+| Great | Use conditional updates, database-time TTL leases, idempotency keys, hold ownership checks, and event-local partitioning. | This handles retries, late workers, exact-seat and GA inventory, and hot-event contention without weakening the sell-once invariant. |
 
-The hottest event can exceed one shard. Options:
+### 6.2 Virtual waiting room as admission control and fairness policy
+**Question.** Five million fans arrive before an onsale for one hundred thousand seats. Should the first TCP connections get the first chance to buy, or should the system randomize access, and how does queueing actually protect inventory?
+<details><summary>Answer</summary>
 
-- Partition by section and restrict a hold to one partition.
-- Use a dedicated high-capacity shard for major events.
-- Preallocate inventory ranges to section leaders with no overlap.
-- Keep a small cross-section coordinator for atomic multi-partition holds.
+Use a waiting room that assigns eligibility before the sale according to the product's fairness policy, then admits shoppers at a measured rate with signed, short-lived, account-bound tokens. FIFO after the sale is intuitive, while randomized ordering before a hype launch prevents early refresh races from dominating. The hold and checkout APIs reject requests without valid admission tokens.
 
-Prefer dedicated event shards and section-local selection before introducing distributed transactions.
+</details>
 
-Catalog data is partitioned geographically or by event ID. Orders partition by buyer or order ID, with an event index for operations. Tickets use `ticket_id` and maintain a strongly consistent current-owner pointer plus immutable ownership history.
+A waiting room is often described as a queue page, but the production mechanism is a protected-zone token system. The edge can accept millions of visitors because it serves static pages, queue status, and heartbeats cheaply. Only a controlled number of users receive tokens that allow calls to seat selection and checkout. If the inventory shard, payment provider, or checkout error rate degrades, operations lower the admission rate; if holds are converting smoothly, they raise it.
 
-## 12. Caching, search, and seat maps
+Ticketmaster's public Eras Tour explanation gives the scale of the problem: more than `3.5 million` registrations, about `1.5 million` access codes, `2 million` waitlisted fans, and `3.5 billion` total system requests, roughly `4x` a previous peak. The lesson is that Verified Fan or presale registration is demand shaping, not capacity magic. Many users and bots still arrive, refresh, reconnect, and call APIs. Therefore, access codes must be just one input to admission; every protected commerce request still needs token validation and rate limits.
 
-- CDN-cache event pages, venue assets, and static seat geometry.
-- Search indexes event metadata and is updated asynchronously.
-- Cache section-level available counts with a very short TTL.
-- Use CDN shield POPs and route/service rate limits so cache misses do not stampede fragile origin services.
-- Stream seat-state deltas to active clients rather than refetching full maps.
-- For large venues, load geometry and availability by viewport/section.
+The queue policy is a product decision. FIFO feels fair once the sale starts because a user's position moves forward and wait estimates make sense. Before a high-demand launch, strict FIFO rewards people who open tabs hours early, run many sessions, or exploit clock and network quirks. Cloudflare's waiting-room material explicitly supports FIFO and random queueing, and that maps well here: randomize the eligible population at onsale start, then process admitted cohorts FIFO. Communicate the rule clearly so refreshing or arriving excessively early is not rewarded.
 
-The cache may falsely show an available seat, but a hold never succeeds without authoritative validation. Avoid falsely showing a sold seat for too long by invalidating on every hold, release, and sale.
+A useful token contains `onsale_id`, `account_id`, `session_id`, `issued_at`, `expires_at`, `admission_sequence` or cohort, `rate_limit_class`, and a signature. It may also include a risk decision or proof that the user passed an access-code check. The token is not a bearer ticket to unlimited API calls. The gateway and hold service verify signature, expiration, audience, account binding, and per-token request budget. Refresh requires active heartbeat and can be denied if the user opens too many sessions.
 
-Pricing responses include signed quote IDs, fee details, and expiration. Dynamic pricing rules are versioned and auditable; already-held quotes remain stable through their stated expiry.
-
-## 13. Tickets, transfer, resale, and admission
-
-Issue an opaque ticket ID with a rotating, device-bound signed barcode. Do not encode reusable bearer credentials in screenshots or static wallet images.
-
-Transfer flow:
-
-1. Owner initiates transfer and the ticket becomes `TRANSFER_PENDING`.
-2. Recipient accepts while authenticated.
-3. A transaction appends an ownership event, changes current owner, revokes the prior credential, and activates a new credential.
-4. Both parties receive notifications.
-
-Resale locks the ticket while listed and transfers it only after payment settlement. Venue and jurisdiction rules determine price caps and transfer eligibility.
-
-At admission, online scanners submit the current rotating credential. The admission service atomically records the first valid scan. For weak connectivity, scanners receive encrypted, time-bounded event allowlists and later reconcile; offline mode carries a controlled duplicate-admission risk and should coordinate scanners over a local venue network.
-
-## 14. Reliability and failure handling
-
-Use transactional outboxes for order, inventory, and ticket events; high-throughput implementations can emit domain events in the same database transaction and relay them from the write-ahead log to Kafka. Consumers are idempotent. Periodic reconcilers compare:
-
-- Paid orders against sold inventory.
-- Sold seats against active tickets.
-- Provider settlements against internal payment records.
-- Active holds against held seats.
-- Ticket ownership against credential versions.
-
-| Failure | Handling |
-|---|---|
-| Hold request is retried | Return the original hold by idempotency key |
-| One of several seats is unavailable | Roll back the entire requested hold |
-| Expiration event is late | Validate `expires_at` during every checkout and release |
-| Payment times out | Query provider by idempotency key before retrying |
-| Payment succeeds, response is lost | Reconcile provider state and finalize the same order |
-| Finalization temporarily fails | Preserve inventory and retry; compensate only if unrecoverable |
-| Notification fails | Ticket remains available in account; retry delivery |
-| Availability cache is stale | Authoritative hold rejects unavailable inventory |
-| Inventory shard fails | Pause holds rather than risk overselling |
-| Duplicate barcode scan | Atomic first-scan wins and later scans alert staff |
-| Queue service degrades | Stop new admission tokens; existing tokens remain verifiable |
-
-## 15. Multi-region design
-
-Each event has a home region for inventory writes:
-
-- Inventory and hold data replicate synchronously across availability zones.
-- Catalog, seat maps, and search are global.
-- Edge waiting rooms and bot defense run near users.
-- Remote hold requests travel to the event home region.
-- Orders may be globally partitioned, but event finalization calls the home inventory shard.
-
-Active-active writes for the same seat invite oversells. During home-region failure, stop new holds, assess replication position, fence the old primary, and promote a zero-data-loss secondary. Browsing and already-issued ticket access continue.
-
-Venue admission uses a geographically nearby deployment and pre-provisioned offline data. Data residency and payment routing may select the event home region.
-
-## 16. Security and abuse prevention
-
-- WAF, DDoS protection, behavioral bot scoring, and device attestation.
-- Do not expose sequential seat mutation endpoints or trust client prices.
-- Signed queue, presale, offer, quote, and ticket tokens with narrow scope.
-- Tokenized payment methods; isolate the PCI cardholder-data environment.
-- Encrypt PII and apply field-level access controls.
-- Require MFA and strong audit logs for venue operators.
-- Rate-limit by account, device, IP range, card fingerprint, event, and action.
-- Detect account takeover, card testing, bulk purchase, and collusive resale.
-- Rotate barcode credentials and revoke old versions on transfer/refund.
-- Verify webhook signatures and replay windows.
-- Retain immutable audit evidence for inventory and money transitions.
-
-## 17. Observability
-
-Track:
-
-- Waiting-room depth, admission rate, and estimated wait error.
-- Browse latency and CDN hit ratio.
-- Hold success rate by event, section, and rejection reason.
-- Inventory transaction latency, lock waits, and shard saturation.
-- Held-to-sold conversion and hold expiration lag.
-- Checkout latency and payment authorization outcomes by provider.
-- Paid-but-not-finalized orders.
-- Inventory/order/ticket reconciliation mismatches.
-- Bot challenges, rate-limit decisions, and suspicious account clusters.
-- Ticket issuance and transfer latency.
-- Admission validation latency and duplicate-scan rate.
-
-Critical invariants should page immediately:
-
-```text
-sold_count <= capacity
-one active ticket per sold seat
-one current owner per active ticket
-no expired active hold accepted at checkout
+```mermaid
+sequenceDiagram
+    participant Fan as Fan browser
+    participant Edge as Edge and bot defense
+    participant Queue as Waiting room
+    participant API as Protected API
+    participant Inv as Inventory shard
+    Fan->>Edge: "Join onsale"
+    Edge->>Queue: "Register account and session"
+    Queue-->>Fan: "Queue cookie and position or cohort"
+    Fan->>Queue: "Heartbeat"
+    Queue-->>Fan: "Signed admission token"
+    Fan->>API: "Create hold with token"
+    API->>API: "Verify token and limits"
+    API->>Inv: "Atomic hold attempt"
+    Inv-->>API: "Hold or conflict"
+    API-->>Fan: "Result"
 ```
 
-Run protocol-level load tests, real-browser onsale simulations, and payment-provider fault injection before major releases.
+Cloudflare's global waiting-room design uses encrypted cookies with bucket IDs and allocates slots across data centers using recent traffic ratios, accepting bounded overshoot instead of constant global coordination. That is a good trade for browse admission because a small over-admission only raises pressure. It is not acceptable for selling a seat. The queue may be eventually coordinated globally, but all hold attempts still converge on the event's strongly consistent home shard.
 
-## 18. Major trade-offs
+SeatGeek's AWS waiting-room architecture adds another practical lesson: model the protected zone explicitly with counters, user mappings, and metrics like queue length and wait time. Without those metrics, operators cannot tune the sale while it is running. SeatGeek also found that browser-based load testing with Playwright exposed WebSocket, heartbeat, reload, and token-exchange behaviors that protocol-level purchase tests missed. A major onsale release gate should simulate real browsers through the waiting room, not only POST `/holds` in a loop.
 
-### Pessimistic locks versus optimistic conditional updates
+Signals worth watching: queue depth, token issue rate, protected-zone active users, token rejection reason, hold QPS, checkout error rate, wait estimate error, bot challenge pass rate, and whether admission changes correlate with inventory or payment saturation.
 
-- Locks are intuitive but can create long queues.
-- Short conditional transactions scale better.
-- Never keep a database lock open while the user pays.
+> **Strong-answer criteria.** A strong answer says what the queue token authorizes, where it is enforced, how admission rate is adjusted, and why FIFO versus randomized fairness is a product choice. It also separates queue over-admission tolerance from inventory correctness.
 
-### Availability versus oversell prevention
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Put a static queue page in front of the website. | Direct API calls, refresh storms, and bots still reach the protected path. |
+| Good | Issue signed tokens and admit users gradually. | This protects inventory but may not address fairness, account binding, or live rate control. |
+| Great | Combine pre-sale randomization or FIFO policy, account-bound short-lived tokens, enforcement on every protected API, and feedback-controlled admission. | This handles both perceived fairness and the operational need to keep hold and checkout paths below saturation. |
 
-- Multi-master inventory is highly available.
-- Single-home strongly consistent inventory prevents conflicting sales.
-- For ticketing, temporary write unavailability is safer.
+### 6.3 Checkout saga across inventory, payment, and tickets
+**Question.** The payment provider authorizes the card but our order service times out before marking seats sold. What state is the order in, and can those seats be released to other buyers?
+<details><summary>Answer</summary>
 
-### Exact seats versus best available
+The order is in an authorized-but-not-finalized state, and the hold remains fenced. A retry or reconciler queries the provider by idempotency key and finalizes the same order. The seats are not released unless the system voids or refunds the authorization through an audited compensation path.
 
-- Exact selection improves user control but creates hot-seat contention.
-- Best-available allocation can assign from precomputed blocks efficiently.
+</details>
 
-### Longer versus shorter holds
+The naive checkout transaction is impossible: update inventory, charge the card, create tickets, send confirmation, and commit. The payment provider is external, slow, and failure-prone; notifications and event streams are also external. Holding a database transaction open across those calls would block scarce inventory and still would not make the provider roll back if our database commit failed.
 
-- Longer holds improve checkout completion.
-- Shorter holds recycle scarce inventory and resist hoarding.
+The better design is a saga with explicit state and idempotency. First, checkout validates that the hold belongs to the user, has not expired according to database time, contains the expected items, and matches the expected decimal money total. It creates an `Order` in `PENDING_PAYMENT` or returns the existing order for the same idempotency key. Then it creates a `PaymentAttempt` using the order ID as the provider idempotency key and asks for authorization. Authorization is preferred for high-value ticketing because it reserves funds before final inventory conversion; capture can happen after tickets are durably issued.
 
-### Online-only versus offline admission
+On authorization success, the order service performs one local finalization transaction in the event home region: mark held seats `SOLD` only if they still point to the hold, mark the hold `CONVERTED`, create ticket rows, advance the order to `CONFIRMED` or `PAYMENT_AUTHORIZED`, and write outbox events. Then it captures payment if authorization and capture are separate, records the capture, and marks the order `PAID`. If the provider uses immediate charge rather than auth/capture, the same principle applies: record the provider's successful charge and finalize or compensate.
 
-- Online validation prevents duplicates globally.
-- Offline validation keeps gates moving but accepts bounded duplicate risk.
+```mermaid
+sequenceDiagram
+    participant Buyer
+    participant Order as Order service
+    participant Inv as Inventory store
+    participant PSP as Payment provider
+    participant Ticket as Ticket service
+    participant Outbox as Outbox relay
+    Buyer->>Order: "POST /orders with hold and idempotency key"
+    Order->>Inv: "Validate active hold"
+    Order->>Order: "Create or load pending order"
+    Order->>PSP: "Authorize with order idempotency key"
+    PSP-->>Order: "Authorized or timeout"
+    Order->>PSP: "Lookup by key if timeout"
+    Order->>Inv: "Finalize hold to sold and write outbox"
+    Inv-->>Order: "Committed"
+    Order->>Ticket: "Create tickets in finalization boundary or same store"
+    Order->>PSP: "Capture"
+    Outbox-->>Buyer: "Confirmation notification"
+```
 
-## 19. Lessons from production systems
+Timeouts drive most edge cases. If the call to authorize times out, the service does not send a blind second charge. It asks the provider for the result by idempotency key. If the provider is unavailable, the order remains `AUTHORIZING` until a retry or webhook resolves it, while the hold remains active or is extended under an internal fence. If authorization succeeded but our finalization transaction fails transiently, we retry finalization and keep the seats unavailable. Releasing seats at this point would create the worst failure: another buyer purchases them while the first buyer has an approved charge.
 
-### Ticketmaster: Verified Fan is demand shaping, not capacity magic
+If finalization becomes permanently impossible, perhaps because an operator canceled the event inventory or a data corruption check fails, the compensation is financial first: void the authorization or refund the capture, mark the order compensated, then release or block the inventory according to policy. Compensation must be rare and audited. It is not a normal timeout path.
 
-Ticketmaster's Eras Tour postmortem-style business note says TaylorSwiftTix had more than 3.5 million preregistrations, about 1.5 million access codes, and 2 million waitlisted fans; the onsale still saw 3.5 billion total system requests, about 4x the previous peak. Map that to this design by treating registration and access codes as only the first filter: the edge must still absorb non-code traffic, queue tokens must be validated before every protected commerce API, and sale pacing must slow when checkout error rates rise.
+The outbox matters because finalization has multiple observers: availability cache, notification service, ticket wallet, settlement jobs, fraud review, and reconciliation. Publishing to Kafka after the database commit creates a gap where the source of truth changed but the world never hears about it. Writing `OutboxEvent` in the same transaction makes the event stream retryable and reconstructable. Consumers still remain idempotent because event delivery is at-least-once.
 
-### Ticketmaster: Smart Queue needs account binding and live communication
+Signals worth watching: orders stuck in `AUTHORIZING`, authorized-not-finalized age, capture failure rate, payment lookup latency, outbox relay lag, duplicate idempotency-key hits, paid orders without tickets, and sold seats without paid or compensated orders.
 
-Ticketmaster describes Smart Queue as account sign-in before the sale, assignment of queue position at start, and admission at a rate that minimizes checkout errors, with in-queue inventory, price, and added-date messaging. For this design, the waiting room should not be a blind FIFO pipe: it should bind tokens to account/session, publish realistic availability and price-band updates, and let operations lower the admission rate without changing inventory correctness.
+> **Strong-answer criteria.** A senior answer refuses to make payment and inventory one fake distributed transaction, names the intermediate states, and describes the compensation path. It also uses provider idempotency keys and an outbox rather than hoping retries are harmless.
 
-### Ticketmaster: SafeTix shifts tickets from bearer images to managed credentials
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Charge first, then try to mark seats sold. | A finalization failure creates paid buyers without inventory or tickets. |
+| Good | Hold seats, charge, then convert the hold. | This is directionally right but incomplete without timeout handling and idempotency. |
+| Great | Use an explicit saga with order/payment states, provider idempotency lookup, fenced holds, transactional finalization, capture, compensation, and outbox events. | This produces exactly-once business effects over at-least-once networks and external payment behavior. |
 
-SafeTix describes tickets that refresh automatically, stay authenticated in the Ticketmaster ecosystem, block screenshots/recordings, bind to a fan device, and support secure transfer/resale. The analogous ticket service should rotate credentials, revoke old credential versions on transfer or refund, keep chain-of-custody events, and make offline admission explicitly risk-bounded rather than accepting static barcodes.
+## 7. Variants
+**10x scale.** If the largest sale is `50 million` interested fans for `1 million` seats, the read plane must become more edge-native: static pages, queue status, and most availability summaries served from CDN or edge workers. The write plane should still not become multi-master for the same seat. Instead, split the event into section-local inventory shards, bias the UI toward section-local choices, raise waiting-room sophistication, and reserve cross-section holds for limited cases with a coordinator. The invariant remains one authoritative owner for each seat transition.
 
-### SeatGeek/AWS: a ticketing waiting room is a protected-zone token system
+**Multi-region active-active.** Catalog, search, waiting-room edges, and ticket wallet reads can be active-active. Inventory writes for one event should have a home region with synchronous replication across zones and a fenced failover process. During home-region uncertainty, pause new holds rather than accept conflicting sales. Already-issued tickets and venue scanning can continue from replicated ticket data, with admission reconciliation after recovery.
 
-AWS's SeatGeek architecture uses a gatekeeper at the edge, waiting-room and queueing modes, predefined throughput into the protected ticket-selection zone, DynamoDB tables for protected zones/counters/user connections/queue mappings, and metrics such as queue length and wait time. This supports modeling queue admission separately from inventory holds: issue access tokens at a controlled rate, cap users in the protected zone, and track business metrics so operators can tune the sale while it runs.
+**Best-available allocation.** Some onsales do not let fans click exact seats; they request a price band and quantity. This reduces hot-seat contention because the inventory service can allocate from precomputed contiguous blocks or section pools. The same hold, checkout, and expiration design remains, but `HoldItem` may reference an allocated block chosen by the service rather than client-provided seat IDs.
 
-### SeatGeek: test the browser behavior, not just the purchase endpoint
+**Offline venue admission.** A venue may need scanning when internet connectivity is weak. Scanners can receive encrypted, time-bounded allowlists and revocation snapshots before doors open, then coordinate over a local venue network to suppress duplicates. This preserves gate throughput but accepts bounded duplicate-admission risk until reconciliation. SafeTix-like rotating, managed credentials reduce screenshot fraud online; offline mode must be explicit about its risk window.
 
-SeatGeek built browser-based load testing with AWS Batch and Playwright to simulate 50,000+ users because protocol tests missed WebSocket, heartbeat, reload, and edge-token behaviors in high-demand queues. This design should keep cheap API load tests, but the release gate for major onsales needs full browser simulations that exercise waiting room refreshes, queue-token exchange, seat-map loading, checkout, and failure messaging.
+## 8. The transferable pattern
+This is the scarce-inventory pattern: a huge, mostly cacheable read audience competes for a small number of items whose ownership transitions must be linearizable. The reusable shape is to separate hints from rights, meter entry into the write path, create short leases with conditional updates, and convert leases through a saga when money or another external system is involved. Hotel rooms, limited sneaker drops, restaurant reservations, and ad-budget allocation all have the same outline.
 
-### SeatGeek: transactional outbox avoids dual-write drift
+The closest sibling pattern is any system where a user-visible flow spans a strongly consistent internal resource and an unreliable external party. A ride-hailing match, an e-commerce checkout, or a marketplace payout can borrow the same idempotency, fencing, and outbox techniques. The Ticketmaster version is harsher because the burst is synchronized and the losing requests outnumber winning requests by orders of magnitude.
 
-SeatGeek's data-platform team adopted a transactional outbox pattern, then optimized it by emitting domain events directly into Postgres WAL with `pg_logical_emit_message()`, relaying with Debezium/Kafka Connect, and enforcing schemas. For ticketing, inventory/order/ticket state transitions and their events must be atomic; a direct publish to Kafka after commit is insufficient because a crash creates missing notifications, stale availability, or broken reconciliation inputs.
+## Review
+The design is built around one invariant: a seat is sold exactly once. Browsing, search, and seat maps are cached because they are high-volume hints. The waiting room meters users into protected APIs with signed account-bound tokens because direct demand would overwhelm the authoritative path. Holds are TTL leases created by atomic conditional updates because users need checkout time but locks cannot be held across payment. Checkout is an idempotent saga because payment cannot be part of our database transaction. A transactional outbox and reconcilers make downstream systems eventually complete without pretending delivery is exactly once.
 
-### SeatGeek: cache shielding and rate limits prevent failure cascades
+### Check your understanding
+1. Why is a displayed available seat not a promise?
+   <details><summary>Answer</summary>
 
-SeatGeek's resilience write-up describes Fastly shield POPs, short TTL and stale-while-revalidate caching, Kong token-bucket/per-consumer limits, and circuit-breaking for fragile services. The important lesson is that failed origin responses often cannot be cached, so overload can reduce cache hit rate and amplify itself. Event pages, maps, and cacheable availability summaries need edge shielding plus route-specific throttles before origin saturation.
+   Availability views are cached and can lag behind real holds or sales. The promise is created only when the authoritative inventory store atomically transitions the seat from `AVAILABLE` to `HELD` for a specific hold.
 
-### Cloudflare: global waiting rooms trade exact global state for bounded overshoot
+   </details>
+2. Why not use a distributed lock for each seat during checkout?
+   <details><summary>Answer</summary>
 
-Cloudflare's Waiting Room uses encrypted cookies with bucket IDs, accepted timestamps, and last check-in time; it divides active-user and new-user-per-minute slots across data centers using recent historical traffic ratios to avoid constant global coordination. This maps well to browse admission, where slight over-admission is acceptable, but not to seat holds; holds still go to the event's strongly consistent home shard.
+   Checkout lasts minutes and calls external payment systems. Long locks strand inventory, create lock convoys, and still do not provide durable business evidence. A TTL hold records the claim and can be conditionally converted or expired.
 
-### Cloudflare: queueing policy is a product decision
+   </details>
+3. What does a waiting-room token authorize?
+   <details><summary>Answer</summary>
 
-Cloudflare supports FIFO and random queueing. FIFO gives intuitive wait estimates, while random queueing can be fairer for hype launches where pre-start arrival time should not dominate; switching can preserve the underlying bucketed queue state. Ticketing systems should make that policy explicit per onsale: randomized assignment before sale start, FIFO after start, and clear communication so users do not gain advantage by refreshing or arriving hours early.
+   It authorizes a specific account/session to call protected commerce APIs for an onsale for a short time and within rate limits. It does not reserve a seat, and every hold still needs an authoritative inventory transaction.
 
-### AWS Virtual Waiting Room: protect APIs with signed, time-limited tokens
+   </details>
+4. If payment authorization succeeds but finalization times out, why can't we release the hold?
+   <details><summary>Answer</summary>
 
-AWS's reference solution combines API Gateway, Lambda, SQS batching for burst intake, DynamoDB token state, Secrets Manager keys, and a Lambda authorizer or OIDC adapter to validate signed time-limited tokens before protected APIs. In this design, the queue service must be in the enforcement path, not just the web page: direct calls to hold or checkout endpoints without a valid admission token should be rejected before they reach inventory.
+   The buyer may already have an approved charge. Releasing the hold could let another buyer purchase the same seats. The system must retry finalization under the same order or void/refund first through an audited compensation path.
 
-## 20. Recommended interview presentation
+   </details>
+5. What problem does the transactional outbox solve?
+   <details><summary>Answer</summary>
 
-A clear 45-minute sequence is:
+   It prevents dual-write gaps. State changes and their events are committed together, so a crash cannot leave sold inventory without cache invalidation, ticket issuance signals, notifications, or reconciliation inputs.
 
-1. Clarify reserved seating, GA, onsales, checkout, and ticket transfer.
-2. Quantify normal load versus flash-sale skew.
-3. Separate cached browsing from authoritative inventory.
-4. Deep-dive into atomic seat holds and expiration.
-5. Walk through the payment/order saga and compensation.
-6. Explain waiting-room fairness and bot controls.
-7. Cover event-based partitioning and hot-event isolation.
-8. Discuss ticket credentials, transfer, scanning, and failover.
-9. Finish with consistency, availability, and hold-duration trade-offs.
+   </details>
 
-The central design insight is:
-
-> Treat every seat as scarce strongly consistent inventory: atomically hold it for a bounded time, never lock it across payment, and convert the hold through an idempotent saga. Scale volatile onsales with waiting rooms and cached browsing, not by weakening the sale invariant.
-
-
-## Further reading: curated engineering blogs
-
+## Sources and further reading
 | Source | Article | Why it matters |
 |---|---|---|
 | Ticketmaster | [Taylor Swift \| The Eras Tour Onsale Explained](https://business.ticketmaster.com/press-release/taylor-swift-the-eras-tour-onsale-explained/) | Real incident numbers for Verified Fan demand shaping, bot/non-code traffic, queue slowdowns, and sale outcomes. |

@@ -1,686 +1,410 @@
-# Dropbox-like File Storage and Sync Service
+# Dropbox File Storage and Sync System Design
+
+A Dropbox-like service stores files, folders, versions, shares, and device synchronization state for users who may edit the same namespace from many online and offline clients. This design focuses on storage, metadata commits, sync reconciliation, conflict handling, and safe reclamation of space; it does not deeply cover document co-editing, full-text search ranking, billing, or enterprise administration.
 
 ## 1. Requirements
 
-### Functional requirements
+### 1.1 Functional requirements
 
-1. Upload and download files.
-2. Organize files into folders.
-3. Synchronize changes across devices.
-4. Support resumable uploads.
-5. Maintain file versions and restore deleted files.
-6. Share files or folders with users or public links.
-7. Detect simultaneous edits and preserve both versions.
-8. Notify clients quickly when files change.
-9. Handle large files efficiently.
+- Upload, download, move, rename, delete, restore, and version files and folders.
+- Resume interrupted uploads and downloads without retransferring bytes that already arrived.
+- Synchronize changes across desktop, mobile, and web clients with a durable catch-up path after disconnection.
+- Preserve user data when concurrent offline edits race, including conflicted copies instead of silent overwrites.
+- Share files or folders with named users and short-lived public links.
+- Support large files efficiently through chunking, parallel transfer, and deduplication.
 
-### Non-functional requirements
+### 1.2 Non-functional requirements
 
-- High durability: target `99.999999999%` for stored file data.
-- High availability for downloads and synchronization.
-- Low synchronization latency, ideally a few seconds.
-- Support billions of files and millions of concurrent clients.
-- Encrypt data in transit and at rest.
-- Keep metadata operations strongly consistent.
-- Allow eventual consistency for immutable file content.
+- **Durability.** File bytes must survive disk, host, rack, and regional failures because users treat the service as the canonical copy of irreplaceable data.
+- **Strong metadata consistency.** Folder uniqueness, current file version, permissions, quotas, and sync sequence numbers must be linearizable within a namespace, or clients will lose updates and disagree about the tree.
+- **Eventual byte availability.** Immutable chunks can be replicated and cached asynchronously, but a metadata commit must not expose a version until every referenced chunk is durable enough to read.
+- **Low sync latency.** A user expects an edit on one device to appear on another in seconds, so push notifications should reduce waiting while cursor-based polling remains authoritative.
+- **Scalable storage economics.** Logical storage reaches exabytes, so the design must deduplicate, erasure-code, compress where safe, and reclaim dead chunks without risking live data.
+- **Offline tolerance.** Clients can spend hours disconnected, so every mutation protocol must tolerate retries, stale base versions, and reconciliation against a later server history.
 
-## 2. Scale assumptions
+### 1.3 The binding constraint
 
-State these assumptions explicitly during an interview and adjust them when challenged:
+The binding constraint is the split personality of the system. File bytes are huge, immutable after upload, naturally content-addressed, and worth treating as a storage problem. Metadata is small, mutable, user-visible, and must be strongly consistent because one wrong race can overwrite a file or create two active children with the same name. A good design keeps these worlds separate: the byte store optimizes for bandwidth, durability, deduplication, and compaction, while the metadata store optimizes for transactions, ordering, permissions, and sync cursors.
 
-- 100 million registered users.
-- 20 million daily active users.
-- 5 million concurrently connected devices.
-- Average user stores 10 GB.
-- Approximately 1 EB of logical storage.
-- 20 uploads and 100 downloads per active user per day.
-- Average file size: 5 MB.
-- Maximum file size: 100 GB.
-- Read-to-write ratio: approximately 5:1.
+Offline clients make the split harder. A client can upload chunks for an edit based on version `V10` while another client has already committed `V11`. The bytes for the stale edit may be perfectly valid, but the metadata commit must fail or turn into a conflicted copy. That forces three mechanisms throughout the design: chunked content-addressed upload followed by an atomic metadata commit, a per-namespace journal with durable cursors, and conservative garbage collection that never deletes a block merely because one reference counter says it is unused.
 
-Approximate upload request rate:
+## 2. Back-of-the-envelope estimation
 
-```text
-20M users x 20 uploads / 86,400 seconds
-= approximately 4,600 uploads/second average
-= approximately 20,000-50,000 uploads/second at peak
+Use these as illustrative assumptions, not claims about Dropbox. Suppose the service has `100M` registered users, `20M` daily active users, and `5M` connected devices during a busy window. If each active user uploads `20` files per day, average upload-file rate is `20M × 20 / 86,400 = 4,630` file commits per second. Peak traffic is usually several times higher, so a busy service should be comfortable around `25K` to `50K` file commits per second. The metadata write path therefore needs sharding by namespace, idempotency, and short transactions; it cannot put all commits behind one global sequencer.
+
+Assume an average file is `5 MB`. Upload ingress is `20M × 20 × 5 MB = 2,000,000,000 MB/day`, which is `2 PB/day` or about `23 GB/s` average. At a `5×` peak multiplier, ingress reaches about `115 GB/s`; if peak commits reach `50K/s`, byte ingress at `5 MB` each is `250 GB/s`. Application servers must not proxy these bodies. They should issue signed URLs and let clients stream chunks directly to a storage edge.
+
+Downloads are larger. If each daily active user downloads or syncs `100` files, that is `20M × 100 × 5 MB = 10 PB/day`, about `116 GB/s` average before CDN and local-cache hits. Immutable content-addressed chunks make CDN caching simple because a new version has new chunk hashes rather than invalidating an old key.
+
+Storage dominates everything. If `100M` users each store `10 GB`, logical storage is `1 EB`. With fixed `4 MB` chunks, `1 EB / 4 MB = 268,435,456,000` logical chunks, about `268B` chunk references before versions and deduplication. A transactional metadata database cannot store hot per-chunk placement details for every read path in one row per request; it needs compact manifests, cold manifest storage, batching, and a storage layer that groups chunks into larger extents for erasure coding and compaction.
+
+> **Key idea.** The numbers say the architecture is not a generic CRUD app with file blobs attached. File bytes need a direct, content-addressed data plane, while metadata commits and sync ordering need a strongly consistent control plane sharded by namespace.
+
+## 3. API design
+
+**Question.** What makes a retry safe when the client uploaded bytes successfully but lost the commit response?
+<details><summary>Answer</summary>
+
+Every mutating request carries a client-generated idempotency key and a base metadata version. The server records the result of the first successful commit under that key, so a retry returns the same committed version instead of creating a duplicate file or appending another change event.
+
+</details>
+
+```http
+POST   /v1/uploads
+       body: {parent_node_id, name, size, base_version_id, idempotency_key, chunk_hashes[]}
+
+POST   /v1/uploads/{upload_id}/chunks
+       body: {chunks: [{index, hash, size}]}
+       returns: {missing_chunks: [{index, upload_url, expires_at}]}
+
+POST   /v1/uploads/{upload_id}/commit
+       body: {node_id?, parent_node_id?, name, base_version_id?, chunks: [{index, hash}], idempotency_key}
+
+GET    /v1/nodes/{node_id}/download?version_id={version_id}
+       returns: {manifest_id, chunks: [{index, hash, download_url, expires_at}], file_hash}
+
+PATCH  /v1/nodes/{node_id}
+       body: {base_revision, parent_node_id?, name?, deleted?}
+
+GET    /v1/namespaces/{namespace_id}/changes?cursor={cursor}&limit={limit}
+       returns: {changes[], next_cursor, has_more}
+
+POST   /v1/shares
+       body: {resource_id, principal_id?, role?, public_link_options?}
+
+POST   /v1/nodes/{node_id}/restore
+       body: {version_id, idempotency_key}
 ```
 
-Approximate byte volume with 5 MB average files:
+The upload API deliberately has two phases. Registering chunks is not a file-system mutation; it only arranges for missing immutable bytes to reach storage. The commit endpoint is the only step that changes the namespace. That keeps a half-finished `100 GB` upload from creating a visible file and lets the garbage collector quarantine abandoned chunks later.
 
-```text
-Uploads:   20M x 20 x 5 MB = 2 PB/day = ~23 GB/s average
-Downloads: 20M x 100 x 5 MB = 10 PB/day = ~116 GB/s average
-Peak upload ingress: 20K-50K uploads/s x 5 MB = ~100-250 GB/s
-```
+Downloads return manifests rather than forcing the metadata service to stream bytes. The service checks current permissions, chooses storage replicas or CDN URLs, and issues short-lived signed URLs scoped to specific chunk keys and HTTP methods. For highly sensitive folders, the service can proxy through an authorization gateway, but the default path should keep large bodies away from application servers.
 
-Storing every version indefinitely would be prohibitively expensive. The system therefore needs retention policies, deduplication, compression where useful, and lifecycle-based movement to colder storage.
+The changes API uses cursors, not offsets. An offset assumes a stable list, but a sync journal is compacted and partitioned. A cursor represents the last durable namespace sequence applied by that client. Push notifications are only hints: a device receiving `namespace X changed` still calls `/changes` and advances its cursor only after applying changes locally. If the cursor is too old, the server returns `CURSOR_EXPIRED`, and the client performs a snapshot reconciliation.
 
-## 3. High-level architecture
-
-```mermaid
-flowchart LR
-    C[Desktop / Mobile / Web Clients]
-    DNS[Global DNS / Load Balancer]
-    API[API Gateway]
-    AUTH[Auth Service]
-    META[Metadata Service]
-    SYNC[Sync Service]
-    SHARE[Sharing Service]
-    NOTIFY[Notification Service]
-    UPLOAD[Upload Coordinator]
-    MQ[Event Stream]
-    DB[(Sharded Metadata DB)]
-    CACHE[(Metadata Cache)]
-    OBJ[(Object Storage)]
-    CDN[CDN]
-    SEARCH[(Search Index)]
-
-    C --> DNS --> API
-    API --> AUTH
-    API --> META
-    API --> SHARE
-    API --> UPLOAD
-    C <--> SYNC
-    SYNC --> META
-    META --> DB
-    META --> CACHE
-    UPLOAD --> OBJ
-    META --> MQ
-    MQ --> NOTIFY
-    MQ --> SEARCH
-    NOTIFY --> C
-    OBJ --> CDN --> C
-```
-
-The key separation is:
-
-- **Control plane:** authentication, namespace, permissions, versions, and synchronization state.
-- **Data plane:** transfer and storage of file bytes.
-
-Application servers should not proxy large file bodies. Clients should transfer chunks directly to object storage using short-lived signed URLs.
+Mutation APIs include both idempotency keys and base versions. Idempotency handles transport uncertainty; base versions handle semantic uncertainty. If a client edited `V10` and the server current version is `V11`, replaying the request safely is not enough. The server must either reject the commit with a conflict response or commit it as a separate conflicted file.
 
 ## 4. Data model
 
-### File namespace
+Start with the obvious entity: a file path such as `/team/plan.pdf` with a blob pointer. That fails as soon as a user renames a parent folder while another device edits a child file offline. The path changed, but the identity of the file did not. The model therefore needs a stable `node_id` for each file and folder, with parent and name as mutable attributes.
+
+A stable node still is not enough because file content changes over time. If `node_id = N7` points directly at a blob, an overwrite destroys the previous version and makes restore, conflict handling, and retry reasoning difficult. The node should instead point at a current immutable `version_id`, while historical `FileVersion` rows remain recoverable until retention expires.
+
+A version cannot contain one giant object key because uploads are resumable, files are large, and identical ranges should deduplicate. Each version points to an ordered manifest of chunks. Chunks are content-addressed by a cryptographic hash and stored independently from the metadata transaction. The metadata commit records the manifest only after storage confirms the referenced chunks exist and pass checksum verification.
+
+Finally, sync requires a history that clients can replay. A table of nodes tells the current state, but it cannot tell a reconnecting laptop what happened since cursor `98127`, nor can it preserve ordering between rename, edit, and delete. Each namespace therefore has a monotonic `ChangeEvent` journal. The same transaction that updates nodes and versions appends the next event, so the cursor is not an eventually published side effect.
 
 ```text
 User
-- user_id
-- account_status
-- storage_quota
-- storage_used
+- user_id, account_status, storage_quota_bytes, storage_used_bytes
+
+Namespace
+- namespace_id, owner_id, home_region, current_sequence, retention_policy
 
 Node
-- node_id
-- namespace_id
-- parent_node_id
-- name
+- node_id, namespace_id, parent_node_id, normalized_name, display_name
 - type: FILE | FOLDER
-- current_version_id
-- owner_id
-- deleted_at
-- created_at
-- updated_at
-- revision
+- current_version_id, revision, deleted_at, created_at, updated_at
 
 FileVersion
-- version_id
-- node_id
-- size
-- content_hash
-- created_by
-- created_at
-- status: PENDING | COMMITTED | DELETED
+- version_id, node_id, namespace_id, size_bytes, file_hash
+- manifest_id, base_version_id, created_by, created_at
+- status: PENDING | COMMITTED | TOMBSTONED | EXPIRED
 
-Chunk
-- chunk_hash
-- object_key
-- size
-- encryption_metadata
-- reference_count
+Manifest
+- manifest_id, chunk_count, total_size_bytes, encoding, created_at
 
-VersionChunk
-- version_id
-- chunk_hash
-- sequence_number
-- byte_offset
-- length
+ManifestChunk
+- manifest_id, sequence_number, chunk_hash, byte_offset, length, compressed_length
+
+ChunkIndex
+- chunk_hash, tenant_id, physical_extent_id, size_bytes, checksum, encryption_metadata
+- refcount_estimate, quarantine_until, state: PRESENT | QUARANTINED | DELETING
 
 Permission
-- resource_id
-- principal_id
-- role: OWNER | EDITOR | VIEWER
+- resource_id, principal_id, role: OWNER | EDITOR | VIEWER, inherited_from
 
 ShareLink
-- share_id
-- resource_id
-- token_hash
-- expires_at
-- password_hash
-- revoked_at
+- share_id, resource_id, token_hash, expires_at, password_hash, revoked_at
 
 ChangeEvent
-- namespace_id
-- sequence_number
-- node_id
-- operation
-- version_id
-- actor_id
-- timestamp
+- namespace_id, sequence_number, operation, node_id, version_id, actor_id, payload, created_at
+
+IdempotencyRecord
+- scope, idempotency_key, request_hash, result_type, result_id, expires_at
 ```
 
-### Important decisions
+`Namespace`, `Node`, `FileVersion`, permissions, idempotency records, and the sync journal live in a strongly consistent metadata layer partitioned primarily by `namespace_id`. Dropbox's Edgestore is a useful production analogue: it exposes a strongly consistent metadata abstraction over sharded MySQL with caching and geo-replication, so product logic does not hand-code shard details. Very large tenants eventually need movable key ranges and transactional support similar to Dropbox's Panda work; manual shard splitting is not a durable scaling strategy for petabyte-scale metadata.
 
-- Assign every file and folder a stable `node_id`; names and paths can change.
-- Store parent-child relationships rather than using the full path as identity.
-- Treat file content as immutable. Editing creates a new `FileVersion`.
-- Have each version reference an ordered manifest of immutable chunks.
-- Use a monotonically increasing sequence number within each synchronization namespace.
+Chunk bytes live in the storage system, not the transactional database. `Manifest` records can begin in metadata for small files but should spill to a manifest store as they grow. The metadata database stores the manifest identity and enough checksums to validate commits. Physical placement, erasure coding stripes, disk repair state, and compaction bookkeeping belong to the storage tier.
 
-A namespace might represent one user's root directory or a shared team folder.
+> **Key idea.** Stable node identity, immutable versions, ordered manifests, and a per-namespace journal are all responses to path-based sync failures and offline races.
 
-## 5. Core APIs
+## 5. High-level design
 
-### Start an upload
+The simplest design puts metadata rows and file blobs behind one API service. The client uploads a whole file, the service writes a blob, updates a path row, and sends notifications.
 
-```http
-POST /v1/uploads
-
-{
-  "parent_node_id": "folder-123",
-  "file_name": "report.pdf",
-  "size": 7340032,
-  "base_version_id": "version-41",
-  "idempotency_key": "client-generated-uuid"
-}
+```mermaid
+flowchart LR
+    C["Client"] --> A["API service"]
+    A --> D[("Metadata database")]
+    A --> O[("Object store")]
+    A --> N["Notification worker"]
+    N --> C
 ```
 
-Response:
+This works for a prototype and fails in several concrete ways. A `100 GB` upload ties up application servers and restarts from zero after a laptop sleeps. Two offline clients editing the same path can overwrite each other because the API updates the current blob without a base-version compare-and-swap. Lost notifications leave devices permanently stale if there is no durable journal. A delete can race a delayed commit and garbage collection can remove a chunk that a version is about to reference. A single metadata database partition becomes hot for large shared folders.
 
-```json
-{
-  "upload_id": "upload-789",
-  "chunk_size": 4194304,
-  "missing_chunks": [],
-  "expires_at": "2026-10-13T08:00:00Z"
-}
+### Fix 1: Split the data plane from the control plane
+
+Clients split files into chunks, hash them, and ask an upload coordinator which chunks are missing. Missing chunks are uploaded directly to storage with short-lived signed URLs; chunks already present under the tenant dedup scope are skipped. This removes large bodies from application servers and enables resumability. Dropbox's Magic Pocket made the same separation at production scale: immutable encrypted blocks up to `4 MB` live in the storage system, while mutable file history is handled by a higher-level FileJournal-style metadata layer.
+
+### Fix 2: Make metadata commits transactional and versioned
+
+The metadata commit validates that every chunk in the manifest is durable, creates a `FileVersion`, updates `Node.current_version_id` with a compare-and-swap against `base_version_id`, appends a `ChangeEvent`, updates quota accounting, and records the idempotency result in one transaction. If the compare-and-swap fails, the server does not overwrite. It returns a conflict or creates a conflicted copy according to client policy.
+
+### Fix 3: Use a per-namespace journal and cursor reconciliation
+
+Push notifications are unreliable by design. They can be delayed, duplicated, dropped by mobile operating systems, or delivered before a client has network to fetch data. The durable source of truth is a per-namespace journal with monotonically increasing sequence numbers. Devices persist the last applied cursor after applying changes to their local index. When they reconnect, they ask for changes after that cursor; if the journal has compacted past it, they rebuild from a snapshot.
+
+### Fix 4: Treat storage reclamation as asynchronous safety-critical work
+
+A metadata delete tombstones a version; it does not delete chunks synchronously. Chunks referenced by expired versions enter a quarantine window, then mark-and-sweep verifies liveness before physical deletion or extent compaction. Dropbox's Magic Pocket compaction work shows why this distinction matters: immutable blobs inside closed volumes do not release capacity merely because metadata forgot them. Live blobs must be copied out before old volumes can be reclaimed.
+
+### Fix 5: Partition metadata by namespace, then split hot ranges deliberately
+
+Most user operations are local to one root or shared folder. Partitioning by `namespace_id` keeps directory uniqueness, version commits, and journal ordering single-shard for ordinary cases. Huge enterprise namespaces can outgrow one shard, so the metadata layer needs movable subranges and, for cross-subtree operations, small distributed transactions or a namespace-level sequencer. The design should evolve toward rebalancing and transactional key ranges rather than relying only on static shard counts.
+
+### Putting it together
+
+```mermaid
+flowchart LR
+    C["Desktop, mobile, and web clients"] --> G["API gateway"]
+    G --> A["Auth and permission service"]
+    G --> U["Upload coordinator"]
+    G --> M["Metadata service"]
+    U --> S[("Immutable chunk store")]
+    C --> S
+    M --> DB[("Strong metadata store")]
+    M --> J[("Namespace journal")]
+    DB --> O["Outbox publisher"]
+    J --> O
+    O --> K[("Durable event stream")]
+    K --> N["Notification service"]
+    K --> X["Search and scanners"]
+    K --> GC["GC and compaction workers"]
+    N --> C
+    S --> CDN["CDN and storage edges"]
+    CDN --> C
 ```
 
-### Register chunks
+A typical upload starts with the client hashing chunks and calling the upload coordinator. The coordinator returns signed URLs only for missing chunks, and the client uploads those chunks directly to the chunk store. The client then calls metadata commit with the ordered manifest and base version. The metadata service performs authorization, verifies chunk presence, updates `Node` and `FileVersion`, appends `ChangeEvent`, and inserts an outbox row atomically. Notification workers publish a lightweight hint; other clients fetch authoritative changes by cursor and then download manifests from storage edges or CDN.
 
-```http
-POST /v1/uploads/{upload_id}/chunks
+> **Key idea.** Each component traces back to a specific failure of the naive design.
 
-{
-  "chunks": [
-    {
-      "index": 0,
-      "hash": "sha256:...",
-      "size": 4194304
-    }
-  ]
-}
+## 6. Deep dives
+
+### 6.1 Chunked upload, deduplication, and the metadata commit
+
+**Question.** A client uploads all chunks for `report.pdf`, the commit response times out, and the user retries from a different network. How do we avoid duplicate versions, lost uploads, and references to missing chunks?
+<details><summary>Answer</summary>
+
+Separate chunk upload from namespace commit. Chunks are content-addressed and idempotent. The commit endpoint uses an idempotency key, verifies chunk durability, and performs a compare-and-swap on the file's base version in the same transaction that creates the file version and journal event.
+
+</details>
+
+The tempting upload design is `PUT /files/path` with the whole body. It is simple until the file is `100 GB`, the laptop sleeps at `99 GB`, and the API server has to decide whether a partially received body is a file. It also prevents useful deduplication: if a user edits one slide in a large presentation, the service receives almost the entire file again. Chunking fixes transfer economics, but only if the metadata protocol is precise about when bytes become a visible version.
+
+The client first chooses chunks, commonly fixed-size `4 MB` chunks because they are predictable, easy to parallelize, and align with Dropbox's published block design. Content-defined chunking can save bandwidth after an insertion near the beginning of a file because boundaries resynchronize, but it costs CPU and more complex client libraries. A practical service can start fixed-size, then introduce content-defined chunking for very large files or file types where bandwidth dominates CPU.
+
+Each chunk is named by a hash such as `sha256(bytes)`. The client sends the manifest to the upload coordinator, which checks `ChunkIndex` under the tenant's deduplication scope. Global dedup saves more storage, but it can leak whether some other user possesses known content. Tenant-scoped dedup is a safer default: it still avoids retransmitting chunks across a user's devices and shared folders without turning the storage system into an oracle for arbitrary files.
+
+The coordinator returns signed URLs for missing chunks. The storage layer verifies checksums while accepting bytes; a client-provided hash is only a claim. The chunk becomes `PRESENT` only after the storage system has enough durable replicas or erasure-coded fragments for the service's write policy. At exabyte scale, chunks should not each be an independent placement unit forever. The storage layer groups immutable chunks into larger extents or volumes for repair, erasure coding, and compaction.
+
+The commit is the semantic boundary. It runs as a metadata transaction: load the idempotency record, validate the request hash if the key was seen before, verify all chunk hashes are `PRESENT`, create a manifest and `FileVersion`, update the node with `WHERE current_version_id = :base_version_id`, append the next namespace `ChangeEvent`, update quota, and store the idempotency result. If the response is lost, the retry finds the same idempotency record and returns the same `version_id`. If another client already committed a newer current version, the compare-and-swap updates zero rows. The service can return `409 CONFLICT` with both versions or create `report (Alice's conflicted copy).pdf` as a new node, but it must not silently advance the original node over someone else's edit.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant U as Upload coordinator
+    participant S as Chunk store
+    participant M as Metadata service
+    participant D as Metadata DB
+    C->>U: Start upload with manifest and idempotency key
+    U->>D: Check chunk hashes under tenant scope
+    U-->>C: Signed URLs for missing chunks
+    C->>S: PUT missing chunks with checksums
+    S-->>C: Chunk durable
+    C->>M: Commit manifest with base_version_id
+    M->>S: Verify chunks are PRESENT
+    M->>D: Transaction: CAS node, create version, append event
+    D-->>M: Committed version_id and sequence
+    M-->>C: Success or cached idempotent result
 ```
 
-The service returns signed upload URLs only for chunks that are not already present.
+Compression fits between chunking and storage, but only with strict safety rules. Dropbox's Broccoli work showed that compressing in the block sync path can reduce median latency and wire bytes by more than `30%`, while Lepton showed specialized lossless JPEG recompression saving `22%` on existing images and multiple petabytes. The lesson is not to compress everything blindly. The client or edge should bypass already-compressed or encrypted data quickly, bound CPU and memory, use deterministic reversible transforms, and verify decompressed bytes against the original file hash before commit.
 
-### Commit an upload
+Signals worth watching: upload abandonment rate, chunk checksum failures, dedup hit ratio by tenant, idempotent commit replay rate, commit conflict rate, and bytes proxied through application servers.
 
-```http
-POST /v1/uploads/{upload_id}/commit
+> **Strong-answer criteria.** A senior answer separates byte durability from namespace visibility, uses content hashes for idempotent chunks, and makes the metadata commit the only user-visible mutation.
 
-{
-  "base_version_id": "version-41",
-  "chunks": [
-    {"index": 0, "hash": "sha256:..."},
-    {"index": 1, "hash": "sha256:..."}
-  ]
-}
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Upload whole files through the API and overwrite the path | Restarts are expensive, API servers carry huge bodies, and concurrent edits lose data |
+| Good | Chunk uploads directly to object storage, then update metadata | Resumability and scale improve, but retries and conflict races may still duplicate versions |
+| Great | Content-addressed chunks plus idempotent transactional commit with CAS and journal append | Retries, deduplication, conflict detection, and sync ordering are handled together |
+
+### 6.2 Sync journal, offline reconciliation, and conflicted copies
+
+**Question.** A laptop edits `budget.xlsx` on an airplane while a desktop renames the containing folder and edits the same file. What should happen when the laptop reconnects?
+<details><summary>Answer</summary>
+
+The laptop replays from its last namespace cursor to learn the authoritative rename and newer file version, uploads its chunks if needed, and attempts a commit against its original base version. The base-version CAS fails, so the server preserves the desktop version and stores the laptop edit as a conflicted copy or returns a conflict for the client to materialize.
+
+</details>
+
+Sync breaks when the server and client use paths as identity. A rename of `/Finance` to `/Planning` can look like a delete plus an add, while an offline edit to `/Finance/budget.xlsx` appears to target a path that no longer exists. Dropbox's Nucleus rewrite is strong production evidence for stable data models: the old sync engine's representation made moves, sharing, and correctness hard, so the rewrite centered on a stricter model with stable identifiers and better invariants. In this design, the client local index stores `node_id`, parent `node_id`, display name, current version, and last applied cursor. A move changes parent/name fields; it does not erase identity.
+
+The journal is per namespace because ordering matters within a folder tree but global ordering is unnecessary and expensive. Every mutation gets sequence `current_sequence + 1` in the same transaction that applies the mutation. A client that has cursor `100` asks for changes after `100`, applies events `101..N` in order, writes its local index, and only then persists cursor `N`. If the process crashes midway, it repeats from the last durable cursor. Event handlers are idempotent: applying `set node N7 current_version V12` twice yields the same index.
+
+Notifications are hints. Mobile push systems drop messages, desktops sleep, and notification workers can publish duplicates after retrying the outbox. The notification payload should be small: namespace id and maybe latest known sequence. The client still calls `/changes`. This design also fixes the classic outbox failure: if the database commit succeeds but publishing to Kafka fails, clients are not permanently stale because the journal row exists. A transactional outbox worker can publish later, and periodic polling covers the remaining gap.
+
+Conflicts are not exceptional; they are expected in an offline-first file system. Each edit carries `base_version_id`. If current equals base, the edit advances the original file. If current differs, the service preserves both. For ordinary binary files, the safest behavior is a conflicted copy named with actor and timestamp. For text or application-specific document formats, the client may offer a merge, but that should be an explicit higher-level feature. Silent last-writer-wins is unacceptable because it destroys user data while pretending sync succeeded.
+
+Folder conflicts need the same discipline. The metadata transaction enforces one active child per `(parent_node_id, normalized_name)`. If two offline devices create `notes.txt` under the same parent, one gets the intended name and the other becomes `notes (Bob's conflicted copy).txt`. If a delete races an edit, the edit should remain recoverable, often as a restored conflicted file under the nearest live parent or a recovery area. The exact UX can vary, but the invariant is stable: no committed user bytes disappear solely because a different client deleted a name.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Clean
+    Clean --> LocalDirty: Local edit from base V10
+    Clean --> RemoteDirty: Pull journal event V11
+    LocalDirty --> Uploading: Hash and upload chunks
+    Uploading --> CommitAttempt: Commit against base V10
+    CommitAttempt --> Clean: CAS succeeds and event applied
+    CommitAttempt --> Conflict: CAS fails because current is V11
+    RemoteDirty --> Clean: Apply ordered event and persist cursor
+    Conflict --> Clean: Create conflicted copy and persist cursor
 ```
 
-The commit atomically:
+Testing this protocol is as important as designing it. Dropbox's sync testing work argues for designing away invalid states, not merely detecting them after the fact. Randomized tests should generate offline edits, moves, deletes, duplicate names, case-only renames, permission revocations, crashes between upload and commit, and cursor expirations. The server should reject impossible states: missing parent, duplicate active names, folder cycles, cursor gaps, and a file version that references absent chunks.
 
-1. Validates all chunks.
-2. Creates the immutable version manifest.
-3. Updates the file's current version using compare-and-swap.
-4. Appends a change event.
-5. Updates quota accounting.
+Signals worth watching: end-to-end commit-to-visibility latency, cursor expiration frequency, conflict-copy creation rate, duplicate notification rate, local-index repair rate, and invariant violations found by model tests.
 
-### Retrieve changes
+> **Strong-answer criteria.** A senior answer treats push as a latency optimization, not correctness; uses stable node ids and cursors; and explains why conflicted copies are a data-preservation feature, not a bug.
 
-```http
-GET /v1/namespaces/{namespace_id}/changes?cursor=98127&limit=1000
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Last writer wins by path | Renames look like deletes, offline edits overwrite each other, and users lose data |
+| Good | Poll for changes and compare timestamps | Reconnection works sometimes, but clocks and path identity still create ambiguous histories |
+| Great | Per-namespace journal, stable node ids, base-version CAS, and conflicted copies | Clients can reconcile ordered history after disconnection while preserving every committed edit |
+
+### 6.3 Storage tier, erasure coding, garbage collection, and compaction
+
+**Question.** A user deletes a folder, the recovery window expires, and a GC worker sees chunk `H` with refcount zero. Is it safe to delete `H` immediately?
+<details><summary>Answer</summary>
+
+No. Reference counts are hints that can drift. The worker should quarantine the chunk, run mark-and-sweep from authoritative live versions and manifests, account for in-progress commits and replication lag, and only then let the storage tier delete or compact physical extents.
+
+</details>
+
+The naive storage lifecycle is seductive: increment a chunk refcount on commit, decrement it on delete, and delete when the count hits zero. That fails because the metadata and storage systems do not fail atomically together. A commit can upload chunks, crash before metadata commit, retry later, and still need those chunks. A metadata transaction can commit a manifest while a refcount update is delayed. A restore can race expiration. Replication and erasure-coding repair can lag behind metadata state. In a system holding an exabyte of user data, a false deletion is worse than a leak; leaked bytes cost money, deleted live bytes destroy trust.
+
+The storage tier should treat chunks as immutable content-addressed blobs grouped into larger physical extents. Replication is simple conceptually but expensive at this scale. Erasure coding reduces overhead by storing data and parity fragments across failure domains. For example, a `10+4` code stores `10` data fragments and `4` parity fragments, so storage overhead is `14 / 10 = 1.4×` before metadata, repair slack, and multi-region copies. That is far cheaper than `3×` replication for cold data, but reads and repairs are more complex. Hot chunks may still use replication or cache copies at edges for latency, then migrate to erasure-coded extents when cold.
+
+Garbage collection should follow the metadata lifecycle. A delete first tombstones nodes and versions so users can restore within the retention window. When a version expires, the system marks its manifest references as candidates for dereference. Candidate chunks enter `QUARANTINED` with a future timestamp rather than immediate deletion. During quarantine, any new commit can still reference the chunk by hash and move it back to `PRESENT` if policy permits.
+
+The authoritative safety pass is mark-and-sweep. Mark starts from live namespaces, non-expired versions, restore windows, legal holds, and in-progress upload sessions that have reached commit eligibility. It marks all manifests and chunks reachable from those roots. Sweep can delete only chunks that are unmarked, past quarantine, and not required by storage repair or region replication. Refcount estimates remain useful for prioritization, but they are not proof.
+
+Compaction is separate from logical liveness. Dropbox's Magic Pocket compaction write-up makes this concrete: immutable blobs remain inside closed volumes after delete. If an extent contains `70%` dead chunks and `30%` live chunks, deleting dead entries may not release a disk allocation. Compaction copies live chunks into new extents, verifies checksums, atomically updates physical placement indexes, waits through a safety window, and then frees the old extent. This creates write amplification, so the system should compact only when reclaimed space justifies the extra IO and repair risk.
+
+```mermaid
+sequenceDiagram
+    participant M as Metadata DB
+    participant Q as GC queue
+    participant G as GC worker
+    participant S as Chunk store
+    participant C as Compactor
+    M->>Q: Version expired after retention window
+    Q->>G: Candidate chunk hashes
+    G->>M: Mark live manifests and in-progress commits
+    G->>S: Quarantine unmarked chunks
+    S-->>G: Quarantine durable
+    G->>M: Recheck roots after safety delay
+    G->>S: Authorize deletion of still-unmarked chunks
+    S->>C: Extents with high dead-byte ratio
+    C->>S: Copy live chunks, verify, then free old extent
 ```
 
-Response:
+Safety also includes hash and encryption choices. A cryptographic hash collision is extremely unlikely with SHA-256, but a malicious client can lie about a hash by uploading different bytes to a signed URL. Storage must verify the actual bytes. Encryption metadata belongs with chunk placement because the same logical hash may need tenant-specific encryption domains; dedup scope and key scope must be designed together.
 
-```json
-{
-  "changes": [],
-  "next_cursor": 99127,
-  "has_more": false
-}
-```
+Signals worth watching: dead-byte ratio by extent, quarantine backlog, mark-and-sweep duration, compaction write amplification, repair backlog, refcount drift discovered by reconciliation, and any attempted read of a chunk in `DELETING` state.
 
-Other important endpoints:
+> **Strong-answer criteria.** A senior answer distinguishes logical deletion from physical reclamation, treats refcounts as advisory, and explains how erasure coding and compaction change the deletion path.
 
-```http
-GET    /v1/nodes/{node_id}
-GET    /v1/nodes/{node_id}/download
-PATCH  /v1/nodes/{node_id}
-DELETE /v1/nodes/{node_id}
-GET    /v1/nodes/{node_id}/versions
-POST   /v1/nodes/{node_id}/restore
-POST   /v1/shares
-DELETE /v1/shares/{share_id}
-```
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Delete a chunk immediately when a file is deleted | Restore, retries, and shared references break; live data can disappear |
+| Good | Keep refcounts and delete at zero after retention | Better, but crashes and delayed events can make counts wrong |
+| Great | Quarantine, mark-and-sweep from authoritative roots, then compact immutable extents | Safety is prioritized while still reclaiming physical space economically |
 
-Mutation APIs should accept idempotency keys because clients will retry after network failures.
+## 7. Variants
 
-## 6. Upload flow
+**10x scale.** At `10 EB` logical storage and hundreds of thousands of commits per second, the same split remains but every interface becomes more explicitly batched. Manifests move out of the metadata hot path, namespace partitions need automatic range movement, GC runs as a distributed dataflow job, and storage repair capacity becomes a first-class quota. The core invariants do not change: chunks are immutable, metadata commits are transactional, and cursors are per namespace.
 
-1. The client splits the file into chunks.
-2. It calculates a cryptographic hash for each chunk.
-3. It sends the chunk manifest to the upload coordinator.
-4. The coordinator checks which chunks already exist.
-5. The client uploads missing chunks directly to object storage using signed URLs.
-6. Object storage verifies checksums.
-7. The client asks the metadata service to commit the upload.
-8. The metadata service atomically creates a version and updates the namespace.
-9. A change event is written to the event stream.
-10. Other devices receive a notification and fetch the authoritative changes.
+**Multi-region active-active.** Immutable chunk storage can become active-active earlier than metadata because content hashes remove most write conflicts. Metadata writes are harder: two regions cannot both assign the next sequence for the same namespace without coordination. A practical design gives each namespace a home region, serves reads and downloads globally, and promotes a secondary only after fencing the old primary. Dropbox's disaster-readiness writing makes the same separation: block storage can be multi-homed sooner, while metadata failover requires phased active-passive discipline before active-active ambitions.
 
-### Why chunks?
+**Enterprise shared workspace.** A single company folder with millions of nodes can make `namespace_id` a hot partition. The design adds subtree partitioning, movable key ranges, and a logical namespace sequencer. Cross-subtree moves become small transactions that reserve the destination name, update parent links, and append one ordered journal event. Permissions also need careful caching because a top-level revocation invalidates many descendants.
 
-- Interrupted uploads can resume.
-- Editing part of a large file may upload only changed chunks.
-- Identical content can be deduplicated.
-- Chunks can be downloaded in parallel.
-- Large files do not need to pass through application servers.
+**End-to-end encrypted product mode.** If clients encrypt before upload with keys the server never sees, deduplication, malware scanning, previews, search, and server-side compression are reduced or lost. The byte plane still stores immutable chunks, and the metadata plane still commits versions and cursors, but chunk hashes may need to be over ciphertext, sharing requires key wrapping between users, and recovery workflows become user-key workflows rather than account workflows.
 
-A fixed 4 MB chunk size is straightforward and aligns with Dropbox's published block design; 4-8 MB is still a reasonable interview range. Content-defined chunking provides better delta detection when bytes are inserted near the beginning of a file, but costs more CPU and implementation complexity.
+## 8. The transferable pattern
 
-A strong interview answer can begin with fixed-size chunks, then introduce content-defined chunking if bandwidth optimization becomes a priority.
+This is the pattern of separating a large immutable data plane from a small strongly consistent control plane. The data plane is optimized for content addressing, direct transfer, caching, erasure coding, and asynchronous repair. The control plane is optimized for conditional updates, sequencing, idempotency, and user-visible invariants. Similar splits appear in video upload systems, backup systems, package registries, and photo storage services. The details differ, but the argument is the same: do not put giant immutable bytes inside the transaction path, and do not let eventually consistent blob state decide mutable user semantics.
 
-## 7. Download flow
+The sync side shares a pattern with any offline-first replicated application: stable identities, an ordered change log, base-version checks, and explicit conflict materialization. A Ticketmaster-like inventory system has a different data plane, but the control-plane lesson is related: when users race for scarce mutable state, correctness comes from conditional commits and fencing rather than from retrying blind writes. See [Ticketmaster](./ticketmaster-system-design.md) for a contrasting system where the scarce object is inventory rather than user file history.
 
-1. The client requests the current version or a specific historical version.
-2. The metadata service authenticates the user and checks permissions.
-3. It returns a short-lived signed URL or a manifest containing signed chunk URLs.
-4. The client downloads through the CDN.
-5. The client verifies chunk and full-file hashes.
-6. Popular encrypted chunks are cached at CDN edge locations.
+## Review
 
-Authorization must happen before signed URLs are issued. URLs should expire quickly and should be scoped to specific objects and methods.
+The design follows from one constraint: huge immutable bytes and small mutable metadata need different systems. Clients upload content-addressed chunks directly to storage, but no chunk becomes a user-visible file until a metadata transaction verifies durability, performs a base-version compare-and-swap, appends a namespace journal event, updates quota, and records idempotency. Devices synchronize by replaying per-namespace cursors because notifications are only hints. Offline conflicts preserve both versions through conflicted copies. The storage tier reclaims space only through retention, quarantine, mark-and-sweep, and compaction, because deleting a live chunk is far worse than temporarily leaking dead bytes.
 
-## 8. Synchronization protocol
+### Check your understanding
 
-Reliable synchronization is the hardest part of this design.
+1. Why should application servers not proxy normal file upload and download bodies?
+   <details><summary>Answer</summary>
 
-### Client state
+   At the estimated scale, upload ingress can reach hundreds of GB/s at peak. Proxying those bytes through application servers wastes CPU, memory, network capacity, and failure budget. Signed URLs let clients stream immutable chunks directly to storage while the application tier handles only authorization and metadata commits.
 
-Each client maintains:
+   </details>
 
-- A local index of file IDs, paths, versions, and hashes.
-- The last applied namespace cursor.
-- A durable queue of local changes.
-- Temporary state for partially completed transfers.
-- A local file watcher.
+2. Why is an idempotency key not enough to prevent sync conflicts?
+   <details><summary>Answer</summary>
 
-### Sync process
+   Idempotency makes transport retries safe by returning the same result for the same request. It does not prove the edit is still based on the current file version. The commit also needs a base-version compare-and-swap so stale offline edits become conflicts instead of overwrites.
 
-1. The file watcher detects a local change.
-2. The client waits briefly to coalesce repeated writes.
-3. The client calculates hashes and uploads changed chunks.
-4. The client commits against its known `base_version_id`.
-5. The server assigns the change a namespace sequence number.
-6. The notification service sends a lightweight "namespace changed" message.
-7. Devices call the changes API with their last cursor.
-8. Devices apply changes in sequence order and persist the new cursor.
+   </details>
 
-Notifications are only hints. They can be duplicated, delayed, or lost. The cursor-based change log is the source of truth.
+3. Why are push notifications insufficient as the source of truth for sync?
+   <details><summary>Answer</summary>
 
-For very large newly-created files, the system can reduce device-to-device latency by advertising a pre-commit, prefetchable block manifest to other authorized devices. The downloader fetches blocks while the uploader is still sending later chunks, then falls back to the committed change log if the speculative state expires.
+   Notifications can be lost, duplicated, delayed, or delivered while a client is offline. The per-namespace journal is durable and ordered, so clients use notifications only as hints and always reconcile by fetching changes after their last persisted cursor.
 
-### Reconnection
+   </details>
 
-When a client reconnects:
+4. Why is path-based identity dangerous for an offline file sync system?
+   <details><summary>Answer</summary>
 
-```text
-GET /changes?cursor=<last-durable-cursor>
-```
+   Paths change when folders are renamed or moved. An offline edit to an old path can be misread as an edit to a deleted file or a new file. Stable `node_id` values preserve identity across moves and make reconciliation unambiguous.
 
-If the cursor has expired because change logs were compacted, the server returns a specific `CURSOR_EXPIRED` error and the client performs a full metadata snapshot reconciliation.
+   </details>
 
-## 9. Conflict handling
+5. Why not delete chunks immediately when reference counts reach zero?
+   <details><summary>Answer</summary>
 
-Use optimistic concurrency control.
+   Reference counts can drift after crashes, delayed commits, restore races, and replication lag. Safe reclamation quarantines candidates, marks live data from authoritative metadata roots, rechecks after a safety delay, and then compacts physical extents if needed.
 
-Every upload identifies the version from which it was edited:
+   </details>
 
-```text
-base_version_id = V10
-```
-
-The metadata service commits with logic equivalent to:
-
-```sql
-UPDATE nodes
-SET current_version_id = :new_version
-WHERE node_id = :node_id
-  AND current_version_id = :base_version;
-```
-
-If no row is updated, another client committed first.
-
-Possible policies:
-
-- Preserve the remote version as canonical.
-- Store the local edit as `report (Alice's conflicted copy).pdf`.
-- Notify the user.
-- Optionally attempt an application-specific merge for collaborative document formats.
-
-Never silently overwrite one user's data with another's. Both versions should remain recoverable.
-
-Folder operations have related conflicts:
-
-- Concurrent rename: accept one and expose the other as a conflict.
-- Delete versus edit: retain the edited version, potentially as a restored or conflicted file.
-- Duplicate names: enforce uniqueness transactionally within each parent folder.
-
-## 10. Metadata consistency and partitioning
-
-File bytes are immutable, so object storage can be eventually consistent as long as a metadata version is not exposed before all referenced chunks are durable.
-
-Metadata requires stronger guarantees:
-
-- Creating or renaming a file must be atomic.
-- A folder must not expose two active children with the same normalized name.
-- Version commits must use compare-and-swap.
-- Permissions must be checked against current authoritative state.
-- Every committed mutation must appear in the change log exactly once logically.
-
-Partition metadata by `namespace_id`. This keeps operations within a user's root or shared folder on the same shard.
-
-Benefits:
-
-- Ordered changes within a namespace.
-- Efficient directory listings.
-- Most mutations are single-shard transactions.
-- Straightforward cursor generation.
-
-A very large enterprise namespace can become a hot partition. Mitigations include partitioning by subtree while maintaining a logical namespace-level event sequencer, or limiting shared-root size and encouraging multiple team spaces.
-
-## 11. Reliable event publication
-
-A dangerous failure mode is:
-
-1. The database commit succeeds.
-2. Publishing the sync event fails.
-3. Other clients never hear about the change.
-
-Use the transactional outbox pattern:
-
-```text
-Database transaction:
-- update node
-- create file version
-- append namespace change
-- insert outbox event
-- commit
-```
-
-An outbox worker publishes events to Kafka or another durable stream and marks them delivered. Consumers must be idempotent because publication can happen more than once.
-
-Consumers include:
-
-- Notification delivery.
-- Search indexing.
-- Audit logging.
-- Malware scanning.
-- Usage analytics.
-- Garbage collection.
-
-## 12. Storage and deduplication
-
-### Physical storage
-
-Store chunks in replicated object storage. The object key can derive from the content hash:
-
-```text
-chunks/{hash-prefix}/{sha256}
-```
-
-At exabyte scale, avoid treating every 4 MB chunk as an independent physical placement unit. Group immutable chunks into larger extents or buckets for replication, erasure coding, compaction, and disk-rebuild workflows.
-
-### Deduplication
-
-Two possible scopes:
-
-- **Per-user or per-tenant:** better privacy isolation, lower savings.
-- **Global:** maximum savings, but risks leaking whether another user possesses a known file.
-
-For a production design, tenant-scoped deduplication is often the safer default.
-
-Never trust a client-provided hash alone. The server or object-storage layer must verify the bytes against the declared hash.
-
-### Compression
-
-Lossless compression can reduce both storage cost and sync bandwidth, but it must be deterministic and verified. Compress only formats and sizes where CPU cost, latency, and memory bounds are acceptable; after compression, decode and compare bytes before committing the compressed representation. For already-compressed or encrypted data, skip compression quickly.
-
-### Garbage collection
-
-Deleting a version should not synchronously delete its chunks.
-
-1. Mark the version deleted.
-2. Retain it for the recovery window.
-3. Decrement chunk references when the version expires.
-4. Place unreferenced chunks into a quarantine state.
-5. Delete them after a safety delay.
-
-This prevents races with in-progress commits, restores, replication, and delayed events.
-
-Reference counts alone can drift after failures. Periodic mark-and-sweep reconciliation should verify them. In immutable extent-based stores, garbage collection only identifies dead chunks; a separate compaction process must copy live chunks into new extents before old extents release physical space.
-
-## 13. Caching and CDN
-
-### CDN
-
-Use the CDN for:
-
-- Public or authorized downloads.
-- Frequently accessed immutable chunks.
-- Range requests.
-- Geographic latency reduction.
-
-Immutable content hashes make cache invalidation simple: new content gets a new key.
-
-### Metadata cache
-
-Cache:
-
-- Node metadata.
-- Directory listings.
-- User quota information.
-- Permission summaries.
-
-Do not rely exclusively on cached authorization data for sensitive operations. Use short TTLs or explicit invalidation events, especially after access revocation.
-
-## 14. Availability and multi-region design
-
-A practical design:
-
-- Deploy stateless API, sync, and notification services in multiple regions.
-- Route uploads and metadata writes to a namespace's home region.
-- Replicate metadata synchronously across availability zones.
-- Replicate metadata asynchronously to disaster-recovery regions.
-- Replicate file chunks across regions according to durability and residency policies.
-- Serve downloads from nearby replicas and CDN edges.
-
-Active-active metadata writes across distant regions introduce difficult ordering and conflict problems. A per-namespace home region provides a simpler consistency model while still allowing globally distributed reads. File-content storage can be active-active sooner than metadata because immutable chunk reads and asynchronous replication have fewer ordering constraints than namespace mutations.
-
-During home-region failure:
-
-- Initially serve safe reads from replicas.
-- Promote a sufficiently caught-up secondary.
-- Fence the old primary before accepting writes.
-- Use recovery-point and recovery-time objectives to decide whether temporary write unavailability is preferable to possible conflicting writes.
-
-## 15. Security
-
-- Use TLS for all communication.
-- Encrypt data at rest using managed KMS keys.
-- Use per-tenant keys for enterprise isolation where required.
-- Issue short-lived, narrowly scoped signed URLs.
-- Store passwords with Argon2id or another approved password hash.
-- Use OAuth or session tokens with rotation and revocation.
-- Apply rate limits by account, IP, device, and endpoint.
-- Perform malware scanning and content policy enforcement.
-- Keep audit logs for sharing, permission changes, and downloads.
-- Support share-link expiration, revocation, and optional passwords.
-- Validate metadata to prevent path traversal and unsafe filenames.
-- Enforce quotas on storage, versions, requests, and shared-link traffic.
-- Implement data-residency and deletion workflows for compliance.
-
-End-to-end encryption is possible, but it weakens server-side search, deduplication, malware scanning, previews, and account recovery. Treat it as a deliberate product mode rather than adding it implicitly.
-
-## 16. Important failure cases
-
-| Failure | Handling |
-|---|---|
-| Client retries upload creation | The idempotency key returns the existing upload |
-| Chunk upload is interrupted | Resume only missing chunks |
-| Chunk is stored but commit fails | Garbage collector removes it after quarantine |
-| Commit succeeds but response is lost | Idempotent commit returns the committed version |
-| Event publishing fails | Transactional outbox retries |
-| Notification is lost | Client polls using its durable cursor |
-| Events arrive twice | Idempotent consumers and version checks |
-| Two clients edit simultaneously | Optimistic concurrency and conflicted copy |
-| Client cursor is too old | Full metadata snapshot reconciliation |
-| Permission is revoked after URL issuance | Very short URL TTL; proxy highly sensitive downloads |
-| Metadata region fails | Fenced failover to a replicated region |
-| Hash collision or dishonest client | Verify hashes server-side and use SHA-256 or stronger |
-
-## 17. Observability
-
-Track:
-
-- Upload and download throughput.
-- Chunk deduplication ratio.
-- Sync notification latency.
-- End-to-end change propagation latency.
-- Change-log consumer lag.
-- Metadata transaction latency and conflicts.
-- Upload abandonment rate.
-- Object replication backlog.
-- Cursor expiration and full-resync frequency.
-- Quota accounting drift.
-- Garbage-collection backlog.
-- Authorization failures and anomalous share-link traffic.
-
-A valuable service-level indicator is:
-
-```text
-Time from successful commit on device A
-to visible metadata on device B
-```
-
-Sync correctness also needs randomized and model-based tests that explore offline edits, concurrent moves, deletes, partial transfers, retry races, and platform-specific filesystem behavior. Track invariant violations such as orphaned nodes, duplicate active child names, and cursor gaps.
-
-## 18. Major trade-offs
-
-### Whole-file storage versus chunking
-
-- Whole files are simpler.
-- Chunking enables resumability, deduplication, and delta transfer.
-- Chunking adds manifests, reference tracking, and garbage-collection complexity.
-
-### Fixed-size versus content-defined chunks
-
-- Fixed-size chunks are fast and predictable.
-- Content-defined chunks produce better deltas after insertions.
-- A hybrid design can use fixed chunks initially and content-defined chunking for larger files.
-
-### Strong versus eventual metadata consistency
-
-- Strong consistency prevents lost updates and namespace anomalies.
-- Eventual consistency provides higher cross-region write availability.
-- Per-namespace strongly consistent writes are a good compromise.
-
-### Global versus tenant-scoped deduplication
-
-- Global deduplication saves more storage.
-- Tenant-scoped deduplication provides better isolation and fewer information leaks.
-
-### Push versus polling
-
-- Push minimizes latency.
-- Polling provides reliability.
-- Use push as a hint and cursor-based polling as the authoritative mechanism.
-
-
-## 19. Lessons from production systems
-
-### Magic Pocket: immutable blocks plus higher-level metadata
-
-Dropbox's Magic Pocket stores file content as immutable encrypted blocks up to 4 MB, while mutable file history lives in a separate FileJournal-style metadata layer. This directly supports the design here: keep object storage simple and immutable, and put versioning, conflict detection, sharing, and cursor ordering in strongly consistent metadata.
-
-### Magic Pocket compaction: deletes are not physical reclamation
-
-Dropbox's 2026 Magic Pocket write-up emphasizes that immutable blobs remain inside closed volumes after delete; garbage collection marks dead blobs, but compaction must rewrite live blobs into new volumes before old capacity is reusable. This changes the storage design from "decrement refcount and delete" to an asynchronous GC plus compaction pipeline with safeguards against write amplification.
-
-### Nucleus: stable data models matter more than clever sync logic
-
-Dropbox rewrote its desktop sync engine as Nucleus because the classic engine's data model made scale, sharing, and correctness hard; one cited issue was representing moves as delete/add pairs and lacking stable identifiers preserved across moves. The `node_id` and version-based design here is therefore not just convenience: it prevents path-based ambiguity and makes offline reconciliation testable.
-
-### Testing sync: design away invalid states
-
-Dropbox's Nucleus testing strategy made the protocol stricter so clients could not even transiently accept impossible states such as a file without its parent directory. This maps to concrete invariants in this design: commits must preserve parent existence, unique names, acyclic folder graphs, monotonic cursors, and recoverable conflict copies, then randomized tests should generate offline/concurrent edit sequences to break those invariants.
-
-### Streaming Sync: pipeline large-file propagation
-
-Dropbox's Streaming Sync reduced multi-client sync latency by letting authorized downloaders prefetch blocks from not-yet-committed uploads, approaching a 2x best-case improvement and showing about 25% improvement in one published two-machine test. For this design, expose speculative blocklists only as hints with expiration and fallback to the durable committed change log.
-
-### Broccoli: compress before syncing when it pays
-
-Dropbox's Broccoli work used a modified Brotli encoder in the block sync path and reported more than 30% reductions in median latency and data on the wire. Add compression as a negotiated client/server capability with quick bypass for incompressible data, strict CPU/memory limits, and byte-for-byte verification before storing compressed chunks.
-
-### Lepton: specialized lossless compression can save petabytes
-
-Dropbox's Lepton recompressed JPEGs losslessly, reporting 22% savings on existing JPEG images, 16 billion images encoded, and multiple petabytes saved. The lesson is to apply format-specific, reversible transformations only where determinism and safety are proven; generic compression alone leaves large savings untapped at exabyte scale.
-
-### Edgestore: metadata wants a strongly consistent abstraction
-
-Dropbox built Edgestore as a strongly consistent, read-optimized, horizontally scalable metadata store over MySQL, serving millions of queries per second with five-nines availability. This supports the document's separation between content blobs and metadata, and argues for a metadata API that hides sharding, caching, and replication details from feature teams.
-
-### Panda: shard splitting is not a long-term scaling plan
-
-Dropbox introduced Panda, a petabyte-scale transactional key-value layer between Edgestore/filesystem systems and sharded MySQL, to support ACID transactions, rebalancing, incremental capacity expansion, and distributed transactions. In this design, very large namespaces and metadata hot spots should be handled by movable key ranges and transaction support, not only by doubling shards or manually splitting databases.
-
-### Disaster readiness: content and metadata fail over differently
-
-Dropbox's disaster-readiness work notes that Magic Pocket block storage was active-active/multi-homed earlier, while metadata required a phased active-passive path toward active-active because ordering and state transitions are harder. The design should set separate RTO/RPO targets for chunks and metadata, drill failover regularly, and fence old primaries before accepting metadata writes in a promoted region.
-
-## 20. Recommended interview presentation
-
-A clear 45-minute sequence is:
-
-1. Clarify requirements and scale.
-2. Separate metadata from file content.
-3. Draw the high-level architecture.
-4. Explain chunked, resumable uploads.
-5. Deep-dive into cursor-based synchronization.
-6. Explain optimistic conflict detection.
-7. Cover metadata partitioning and consistency.
-8. Discuss durability, multi-region failover, and security.
-9. Finish with bottlenecks and trade-offs.
-
-The central design insight is:
-
-> Store file bytes as immutable chunks, keep namespace and version metadata strongly consistent, and synchronize devices through an ordered, cursor-based change log. Push notifications improve latency, but clients always reconcile against the durable log.
-
-## Further reading: curated engineering blogs
+## Sources and further reading
 
 | Source | Article | Why it matters |
 |---|---|---|

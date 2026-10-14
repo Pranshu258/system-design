@@ -1,349 +1,355 @@
-# Production Distributed Cache
+# Distributed Cache System Design
+
+A distributed cache stores frequently read application objects close to compute so that the authoritative database or service is not asked the same question millions of times per second. This design covers a regional, general-purpose key-value cache with TTLs, invalidation, replication, hot-key handling, and origin protection; it is not a durable database, search index, queue, or cross-key transaction system.
 
 ## 1. Requirements
+### 1.1 Functional requirements
+- Support cache-aside reads and explicit `GET`, `SET`, `ADD`, `REPLACE`, `DELETE`, `MGET`, TTL, and atomic counter operations.
+- Let callers express freshness needs with versions, compare-and-swap, `min_origin_version`, and per-namespace stale-serving policies.
+- Partition data across many cache nodes, rebalance with bounded disruption, and route either through SDKs or a proxy tier.
+- Protect the origin during misses, cold starts, node loss, and hot-key bursts using leases, coalescing, admission control, and throttled refill.
+- Integrate with database writes or change-data-capture streams so committed origin changes invalidate or supersede cached values.
+- Expose per-namespace hit rate, origin amplification, hot keys, evictions, refill latency, invalidation lag, and consistency probes.
 
-### Functional requirements
+### 1.2 Non-functional requirements
+- **Low latency.** A cache hit must add only low-single-digit milliseconds regionally and sub-millisecond server processing, otherwise clients will bypass it for simple reads.
+- **Origin safety.** Miss traffic must be shaped because the database is provisioned for the expected hit rate, not for the full read rate.
+- **Bounded staleness.** The cache may be eventually consistent, but stale data must be limited by versions, tombstones, TTLs, or explicit bypass paths for sensitive reads.
+- **Elastic partitioning.** Node additions, removals, and replacements must move only a small fraction of keys and must not cause a full-cluster cold miss storm.
+- **Predictable memory.** Capacity planning must use resident bytes, including keys, metadata, fragmentation, replication, tombstones, and allocator slack, not just value payload bytes.
+- **Operational isolation.** Namespaces need quotas and failure policies so one tenant's hot key, large values, or low hit rate does not evict or overload everyone else.
 
-1. Support `GET`, `SET`, `ADD`, `REPLACE`, `DELETE`, multi-get, TTL, and atomic counters.
-2. Provide optional compare-and-swap and small per-key atomic operations.
-3. Distribute data across nodes and rebalance with limited disruption.
-4. Replicate hot data for availability.
-5. Enforce namespaces, quotas, and item-size limits.
-6. Offer cache-aside clients and optional write-through/invalidation integration.
-7. Expose hit rate, evictions, hot keys, and per-tenant usage.
+### 1.3 The binding constraint
+The cache is deliberately not the source of truth, yet the database is provisioned assuming that the cache absorbs most reads. That tension dominates the design. If the cache returns stale values, the product can be wrong; if the cache loses too many values or allows many clients to refill the same value at once, the origin can collapse. “Just delete on write and refill on miss” works at small scale but fails when a read miss races a database write, when a popular key expires everywhere at once, or when a node loss turns millions of formerly cached reads into origin reads.
 
-### Non-functional requirements
+That constraint forces three families of mechanisms: version fencing and leases to stop stale fills from resurrecting old values, stampede and hot-key controls to keep miss traffic below origin capacity, and partition/failure machinery that treats node loss as a controlled degradation rather than a database denial-of-service event.
 
-- Sub-millisecond server processing and low-single-digit millisecond regional latency.
-- Millions of operations per second per cluster.
-- Graceful degradation during node loss and traffic spikes.
-- No requirement for durable storage by default; origin remains authoritative.
-- Predictable memory use and tenant isolation.
-- Avoid stale or resurrected values beyond documented consistency bounds.
+## 2. Back-of-the-envelope estimation
+Use illustrative numbers so the consequences are visible. Suppose the product serves `50M` cache operations per second at peak, with `95%` reads. That is `50M × 0.95 = 47.5M` reads per second and `2.5M` writes, deletes, increments, or invalidations per second. At a `90%` read hit rate, the origin still receives `47.5M × 0.10 = 4.75M` read misses per second. If hit rate slips to `85%`, origin reads become `47.5M × 0.15 = 7.125M` per second. The five-point hit-rate drop adds `7.125M - 4.75M = 2.375M` origin reads per second. That is not a dashboard curiosity; it decides whether a database tier survives a cache incident.
 
-This is a general application cache, not a durable database. Range queries, arbitrary scans, and multi-key ACID transactions are out of scope.
+For memory, assume `20TB` of logical cached values and replication factor `2`, so raw replicated payload is `20TB × 2 = 40TB`. Small-object caches pay heavily for keys, expiration metadata, hash tables, allocator size classes, connection buffers, and fragmentation. With a `30%` overhead factor, resident memory is `40TB × 1.30 = 52TB`. If we target `75%` occupancy to leave room for rebalancing and allocator slack, provisioned memory must be `52TB / 0.75 = 69.33TB`. With `128GB` usable per node, the cluster needs `69.33TB × 1024GB/TB / 128GB = 554.6`, so about `560` nodes before adding spare capacity. Rounding to `600` nodes leaves room for failures and uneven shards.
 
-## 2. Scale assumptions and capacity
+Bandwidth matters for routing choices. With `1KB` average returned value size, read-hit payload is `47.5M × 1KB = 47.5GB/s` before protocol and TCP overhead. The write-like path is `2.5M × 1KB = 2.5GB/s` of primary payload; with one replica, it becomes roughly `5GB/s`. These numbers favor a binary protocol, persistent connections, pipelining, and avoiding a central data-path control plane. They also explain why full per-key metrics are impractical; hot-key detection needs sampling or sketches.
 
-Assume:
+> **Key idea.** The cache can be disposable from a durability perspective but not from an operational perspective: a small hit-rate drop or a cold shard can add millions of reads per second to an origin that was never sized for them.
 
-- 50 million requests/second peak, 95% reads.
-- 20 TB logical cached values.
-- 1 KB average and 1 MB maximum item.
-- Replication factor two: 40 TB raw value memory.
-- 75% target memory occupancy to leave room for metadata and fragmentation.
-- 600 cache nodes with roughly 128 GB usable memory each.
-- 90% target hit rate; a 5-point drop on the 47.5 million reads/second adds roughly 2.4 million origin reads/second.
-- Payload bandwidth is about 47.5 GB/s for 1 KB read hits, plus about 5 GB/s of replicated write payload before protocol overhead.
+## 3. API design
+**Question.** If a client times out after a miss fill, retries, and races an invalidation from a newer database write, what makes the retry safe?
+<details><summary>Answer</summary>
 
-Memory overhead can exceed 30% for keys, expiration, allocator classes, and hash tables: 40 TB replicated payload becomes about 52 TB resident, and at 75% occupancy needs about 70 TB provisioned. Capacity planning must use resident bytes, not payload bytes.
+The fill must carry a lease or version fence from the cache miss and an origin commit version from the database read. The cache accepts it only if the lease is still valid and the fill is not older than a tombstone or existing entry version. A retry without those conditions can overwrite a newer delete or value with stale data.
 
-## 3. High-level architecture
+</details>
 
-```mermaid
-flowchart LR
-    A[Applications / SDK] --> R[Routing: Config + Hash Ring]
-    R --> P[Primary Cache Nodes]
-    P --> S[Replica Cache Nodes]
-    P --> W[(Optional WAL / Warm Snapshot)]
-    O[Origin Database / Service] --> I[Invalidation Stream]
-    I --> P
-    CP[Control Plane] --> CFG[(Consensus Metadata)]
-    CP --> R
-    CP --> P
-    P --> HH[Hot-Key Replicas / Near Cache]
+```http
+GET /v1/cache/{namespace}/{key}?min_origin_version=123
+PUT /v1/cache/{namespace}/{key}
+If-Match: "cache-version-or-*"
+Idempotency-Key: "request-id"
+
+DELETE /v1/cache/{namespace}/{key}?origin_version=124
+POST /v1/cache/{namespace}:mget
+POST /v1/cache/{namespace}/{key}:increment
+POST /v1/cache/{namespace}/{key}:lease-fill
+GET /v1/namespaces/{namespace}/stats
+GET /v1/namespaces/{namespace}/consistency-probes
 ```
 
-Clients can route directly for the lowest latency, while a proxy mode simplifies operations and security. The control plane never sits on the normal data path.
+The SDK should not collapse misses and transport failures into one result. A miss means the cache confidently does not have an acceptable value; an error means the caller must decide whether to bypass to origin, serve stale, retry another replica, or fail closed. Return types should look like `Hit(value, cache_version, origin_version, expires_at)`, `Miss(lease_token?)`, `Stale(value, origin_version)`, `Moved(config_epoch, target)`, `ConditionFailed`, `Throttled`, and `Error`.
 
-## 4. Data model and protocol
+Versions are part of the API because retries are otherwise unsafe. `min_origin_version` lets a read-after-write caller reject a cached value older than the write it just committed. `If-Match` and compare-and-swap protect per-key cache mutations, not the database; they are useful for counters, locks with fencing, and careful write-through flows. `lease-fill` is separate from `PUT` because a miss fill has different acceptance rules: it must present the lease token issued on miss, the origin version observed during the database read, and the TTL chosen by policy. The cache may reject a lease fill even if the key is absent, because an invalidation tombstone with a higher origin version is a real state.
+
+`MGET` is required because many application pages fetch dozens of independent keys. It should return partial results rather than failing the whole batch, and the SDK should coalesce misses by key before going to origin. Administrative APIs are intentionally narrow: namespace stats and consistency probes are allowed, but wildcard scans and global flushes are dangerous in multi-tenant caches.
+
+## 4. Data model
+Start with the obvious entity: a `CacheEntry` keyed by namespace and key bytes. A value, TTL, and expiration timestamp are enough for a toy cache. The first failure is stale resurrection. A reader can miss, read an old database snapshot, then a writer commits a newer value and deletes the cache key; when the slow reader finally fills, it recreates the old value. The entry therefore needs an `origin_version`, and the cache also needs a `Tombstone` that says “do not accept fills older than this version” even when no value is present.
+
+The second failure is duplicate refill. If one thousand requests miss the same key, one thousand database reads may follow. A `Lease` records the short right to fill a key after a miss. The cache can hand one caller a lease token while telling the rest to wait, serve stale, or retry after a small delay. A lease is not a distributed lock for correctness of the database; it is an origin-protection and stale-fill-fencing mechanism inside the cache.
+
+The third failure is uneven ownership. A flat hash directly onto node IDs makes node replacement move too many keys and gives the control plane no clean unit for migration. Introduce `VirtualShard` and `ShardAssignment`. Keys hash to many more virtual shards than physical nodes; the control plane maps those shards to primaries and replicas with a `config_epoch`. Data-plane requests include or learn the epoch, so an old owner can return `MOVED` instead of accepting writes after it has been fenced.
+
+The fourth failure is tenant interference. A cache that stores entries only by key has no way to enforce quotas, stale policy, item size, or invalidation behavior. A `NamespacePolicy` owns the default TTL, maximum item size, compression threshold, memory quota, hot-key policy, stale-on-error policy, and consistency mode. Namespace is part of the key material so two tenants cannot collide and so per-tenant eviction can be fair.
 
 ```text
-Namespace
+NamespacePolicy
 - namespace_id
-- quota_bytes
-- default_ttl
-- max_item_size
-- eviction_policy
-- consistency_mode
+- quota_resident_bytes
+- default_ttl_seconds
+- max_item_bytes
+- stale_on_error: disabled | bounded | always_for_immutable
+- consistency_mode: best_effort | versioned | bypass_required
+- compression_threshold_bytes
+- hot_key_policy
 
 CacheEntry
 - namespace_id
+- key_hash
 - key_bytes
 - value_bytes
-- version
-- created_at
-- expires_at
-- flags
+- cache_version
 - origin_version
+- created_at_ms
+- expires_at_ms
+- flags: compressed, negative, stale_eligible
+- lease_epoch_seen
 
-ShardAssignment
-- virtual_shard
+Tombstone
+- namespace_id
+- key_hash
+- origin_version
+- expires_at_ms
+- reason: delete | invalidate | namespace_flush
+
+Lease
+- namespace_id
+- key_hash
+- lease_token
+- issued_at_ms
+- expires_at_ms
+- holder_hint
+- config_epoch
+
+VirtualShard
+- shard_id
 - primary_node
 - replica_nodes
 - config_epoch
+- state: serving | copying | draining | fenced
+
+HotKeyRecord
+- namespace_id
+- key_hash
+- observed_qps
+- replica_pool
+- near_cache_ttl_ms
+- updated_at_ms
 ```
 
-Use a compact binary protocol with request IDs and pipelining:
+`CacheEntry`, `Tombstone`, and `Lease` live on the cache nodes that own the virtual shard. They are in memory by default; optional warm snapshots or flash tiers are accelerators, not sources of truth. `NamespacePolicy` and `VirtualShard` assignments live in a small strongly consistent metadata store because wrong routing can corrupt cache semantics even though values are disposable. Hot-key records can be approximate and eventually consistent because a missed hot-key optimization hurts latency, not correctness. The transactional database stores only authoritative business entities and their commit versions; it should not store cache leases or cache residency state.
 
-```text
-Get(namespace, key, min_version?)
-Set(namespace, key, value, ttl, condition?, request_id)
-Delete(namespace, key, expected_version?)
-Increment(namespace, key, delta, initial, ttl)
-MultiGet(namespace, keys)
+> **Key idea.** The data model is mostly metadata for failure control: versions stop stale resurrection, leases stop duplicate refill, epochs stop split-brain ownership, and namespace policies stop one workload from consuming the cache's safety margin.
+
+## 5. High-level design
+The simplest design is an SDK that hashes each key to a cache node. On hit, it returns the value. On miss, the application reads the database and writes the value back with a TTL. Database writes delete the cache key.
+
+```mermaid
+flowchart LR
+    App["Application"] --> Cache["Cache node chosen by hash"]
+    Cache --> App
+    App --> DB[("Authoritative database")]
+    App --> Cache
 ```
 
-Responses distinguish miss, expired, condition failure, moved shard, throttling, and server failure. A miss is normal; a transport failure must not be disguised as a miss.
+This design looks fine until real load arrives. First, a read miss can race a database write and refill a stale value after the writer deletes the key. Second, popular keys expire or disappear in bursts, so many clients stampede the database. Third, one hot key can saturate one cache node even while the cluster is mostly idle. Fourth, node loss or rebalancing turns a slice of the keyspace cold and moves traffic to the origin. Fifth, clients need routing changes, quota enforcement, and failover behavior without every service reimplementing cache operations differently.
 
-## 5. Core APIs
+### Fix 1: Versioned invalidation and lease fills
+On a miss, the cache may issue a short lease token. The application reads the origin and returns the value with the origin commit version. The cache accepts the fill only if the lease is current and no entry or tombstone has a higher origin version. Database writes publish invalidations with their commit version, and cache nodes store short tombstones when deleting. Facebook's memcache leases exist for exactly this class of race: a miss grants one client a temporary right to fill, and stale or duplicate fills can be rejected instead of overwriting newer state.
 
-```http
-GET /v1/cache/{namespace}/{key}
-PUT /v1/cache/{namespace}/{key}
-If-Match: "version"
+### Fix 2: Request coalescing and origin budgets
+Every SDK coalesces concurrent misses for the same key inside the process. Proxies or cache nodes coalesce across processes for keys known to be expensive. If no fresh value exists, the system can serve a bounded stale value for namespaces that allow it, probabilistically refresh before TTL, or throttle refills to an origin budget. Discord saw a related pattern with hot channels overloading single Cassandra partitions; the fix was not merely more database nodes, but a Rust data service in front that coalesced identical concurrent reads and controlled access to the backing store. A cache needs the same shape of protection.
 
-{
-  "value": "base64...",
-  "ttl_seconds": 300
-}
+### Fix 3: Virtual shards, epochs, and routing proxies
+Keys map to virtual shards, and virtual shards map to primaries and replicas at a configuration epoch. Direct SDK routing is fastest, but a proxy tier like Meta's mcrouter becomes valuable at large scale because it centralizes connection pooling, prefix routing, replicated pools, warmup, shadow traffic, and cross-cluster failover while preserving a memcached-compatible client protocol. The control plane updates shard assignments; data nodes and proxies enforce epochs so an old owner cannot continue accepting mutations after migration.
+
+### Fix 4: Hot-key replication and near caches
+Adding ordinary shards does not split a single key. Once a key crosses a QPS threshold, the system can replicate it to a read pool, let proxies fan reads across replicas, and allow short-lived client near-cache entries with versioned invalidation. Counters need a different treatment: if exact immediate totals are not required, split them into partial counters and aggregate asynchronously. Hot-key records are detected with sampling or count-min sketches because full per-key metrics at tens of millions of QPS would themselves become a scalability problem.
+
+### Fix 5: Gutter pools and controlled warmup
+When a cache node fails, the tempting fallback is to treat its keys as misses. That is safe for durability but dangerous for the origin. A better path promotes a replica when configured, sends some traffic to a small gutter pool for temporary caching of missed keys, and rate-limits cold refill. Facebook's memcache paper uses gutter pools for this reason: failed cache servers should not translate directly into a thundering herd against MySQL. Warm snapshots, flash tiers, or recent WAL segments can reduce cold start, but the important rule is gradual admission back into the main cache.
+
+### Putting it together
+```mermaid
+flowchart TD
+    App["Application SDK with single-flight"] --> Proxy["Optional routing proxy"]
+    App --> Ring["Local shard map and epoch"]
+    Ring --> Primary["Cache primary for virtual shard"]
+    Proxy --> Primary
+    Primary --> Replica["Replica or hot-key pool"]
+    Primary --> Tomb["Entry, lease, and tombstone metadata"]
+    Primary --> Gutter["Gutter pool during failure"]
+    App --> Origin[("Authoritative origin database or service")]
+    Origin --> CDC["Committed change stream"]
+    CDC --> Inv["Invalidation consumers"]
+    Inv --> Primary
+    Control["Control plane"] --> Meta[("Consensus metadata")]
+    Control --> Proxy
+    Control --> Ring
+    Control --> Primary
 ```
 
-```http
-DELETE /v1/cache/{namespace}/{key}
-POST   /v1/cache/{namespace}:mget
-POST   /v1/cache/{namespace}/{key}:increment
-GET    /v1/namespaces/{namespace}/stats
+A normal read starts in the SDK. It checks a tiny near cache only if the namespace allows it, then routes by virtual shard and epoch to a proxy or directly to the primary. The primary returns a hit if the entry satisfies TTL and `min_origin_version`. On miss, it may issue a lease. The SDK coalesces local waiters, one caller reads the origin, and the lease fill is accepted only if no newer tombstone or entry exists. Database writes commit to the origin first, then a CDC consumer sends versioned invalidations to cache primaries. The control plane owns `NamespacePolicy` and `VirtualShard` metadata; cache nodes own entries, leases, and tombstones.
+
+> **Key idea.** Each component traces back to a specific failure of the naive design: leases for stale fills, coalescing for stampedes, hot pools for single-key overload, epochs for ownership changes, and gutter/warmup paths for node loss.
+
+## 6. Deep dives
+### 6.1 The invalidation race and version fencing
+**Question.** A reader misses key `K`, reads value `v1` from the database, then a writer commits `v2` and invalidates `K`; the reader's fill arrives last. What prevents the cache from serving `v1` again?
+<details><summary>Answer</summary>
+
+The invalidation carries the database commit version for `v2` and leaves a short tombstone. The stale fill carries the reader's lease token and the origin version for `v1`. The cache rejects the fill because `v1.origin_version < tombstone.origin_version`, even if the key currently has no value.
+
+</details>
+
+The common cache-aside recipe says “write the database, then delete the cache.” Deleting is safer than overwriting because a concurrent reader may have fetched an older database value. But deletion alone does not close the race. Imagine the cache misses at time `t1`, the reader starts a database read and sees version `10`, a writer commits version `11` at `t2`, the writer deletes the cache key at `t3`, and the slow reader fills version `10` at `t4`. The cache is now wrong until TTL. This is especially painful because it happens only under concurrency, so a system can pass ordinary tests and still fail during write bursts.
+
+The fix is to make cache state monotonic with respect to origin versions. Every authoritative row or object needs a commit version: a database log sequence number, updated-at timestamp with a total-order tie breaker, entity version, or CDC offset that can be compared for one key. A delete or invalidation is not just removal; it records a tombstone such as “do not accept fills for `K` below version `11` until this tombstone expires.” A fill is conditional: accept only if the lease token is valid and `fill.origin_version >= max(existing.origin_version, tombstone.origin_version)`. A cache entry may disappear due to eviction, but a recent tombstone must survive long enough to cover the maximum expected stale-fill window.
+
+```mermaid
+sequenceDiagram
+    participant R as Reader
+    participant C as Cache primary
+    participant D as Origin database
+    participant W as Writer
+    R->>C: GET K
+    C-->>R: Miss plus lease L
+    R->>D: Read K
+    D-->>R: v1 at version 10
+    W->>D: Commit v2
+    D-->>W: version 11
+    W->>C: Invalidate K at version 11
+    C-->>W: Store tombstone version 11
+    R->>C: Lease fill K v1 version 10 with L
+    C-->>R: Reject stale fill
 ```
 
-SDKs should expose explicit result types: `Hit(value, version)`, `Miss`, and `Error`. They implement deadlines, bounded retries, circuit breakers, and request coalescing.
+Leases and versions solve different halves of the problem. The lease suppresses duplicate fills and gives the cache a way to reject very late fills. The version fence decides which value is newer when events reorder. Facebook's memcache lease mechanism is the classic production example: a cache miss can return a lease token, and the cache accepts the subsequent set only if the token remains valid. Meta's later Polaris work shows why the story does not end with having a protocol. They measured consistency from the client's point of view by watching invalidations, querying cache replicas, and retrying across time windows so they could report external consistency SLOs rather than merely asserting that invalidation consumers were healthy.
 
-## 6. Cache-aside read flow
+There are edge cases. If the origin cannot provide comparable versions per key, the cache can use delete hold-offs after invalidation and rely on short TTLs, but the guarantee is weaker and timing-dependent. If the invalidation stream lags, old values may remain visible; TTL bounds the damage, while consistency probes detect the lag. If tombstones are evicted under memory pressure, stale resurrection becomes possible again, so tombstones need a protected memory budget or admission priority for recently written keys. If a namespace serves permission or balance data, even bounded staleness may be unacceptable; those reads should bypass the cache or require synchronous invalidation before success is returned.
 
-1. The application asks the cache for a key.
-2. The SDK hashes namespace/key to a virtual shard and sends `GET` to its primary or an allowed replica.
-3. On a hit, the node verifies expiration and returns the value/version.
-4. On a miss, one caller acquires a short single-flight lease or local coalescing slot.
-5. That caller reads the authoritative origin and populates the cache with bounded TTL and jitter.
-6. Waiters reuse the result rather than stampeding the origin.
+Uber's CacheFront illustrates a storage-integrated version of the same idea. By moving caching into Docstore's stateless query engine, Uber could centralize point-read caching, CDC invalidation, timestamp-based deduplication, invalidation markers, and per-request bypass for strong-consistency flows. The lesson is not that every application cache must live in the storage service, but that correctness improves when invalidation, bypass, and version comparison are first-class mechanisms rather than optional SDK folklore.
 
-At Facebook scale this is often implemented as a lease: a miss returns a short token, and the cache accepts the fill only with that token, so a slow reader cannot overwrite a newer value after an invalidation.
+Signals worth watching: invalidation lag by namespace, rejected stale fills, tombstone evictions, cache-vs-origin sampled version mismatches, and the age distribution of values served under stale-on-error.
 
-Negative caching can protect the origin for nonexistent values but needs a short TTL. Serve-stale-on-error is useful only for data explicitly marked safe to be stale.
+> **Strong-answer criteria.** A senior answer names the read-miss/write/stale-fill sequence, distinguishes lease fencing from origin-version fencing, and explains how tombstones survive deletion long enough to reject old fills.
 
-## 7. Write and invalidation strategies
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Delete the cache after every database write | It still allows a slow miss fill to recreate the pre-write value. |
+| Good | Add TTLs and maybe double-delete after a delay | It reduces the window but depends on timing and does not prove the fill is newer. |
+| Great | Use leases, origin versions, invalidation tombstones, and consistency probes | It makes fills conditional on monotonic versions and measures whether the guarantee holds in production. |
 
-### Cache-aside
+### 6.2 Stampedes, hot keys, and controlled refill
+**Question.** A celebrity profile key expires while 200,000 requests per second are reading it, and the origin can safely handle only 5,000 reads per second for that object family. What should happen in the next second?
+<details><summary>Answer</summary>
 
-Write the database, then delete the cache key. Deletion is safer than overwriting because a concurrent reader may have fetched an older database value. The remaining race is handled with origin versions or delayed second invalidation.
+Most callers should not go to origin. The SDK and proxy coalesce identical misses, one or a small bounded number of lease holders refresh the value, eligible callers receive stale data or wait briefly, and the hot key may be served from replicated pools or near caches once refreshed.
 
-### Write-through
+</details>
 
-The cache synchronously invokes or participates with the origin, improving read freshness but coupling availability and requiring clear commit ordering.
+A cache stampede is a capacity bug disguised as a correctness-neutral miss. If a key expires and every caller independently asks the database for the same replacement, the cache amplifies traffic exactly when it should be absorbing it. This can happen on natural TTL boundaries, deployments that flush a namespace, cold starts, failovers, or negative-cache entries expiring for a popular nonexistent object. The failure is nonlinear: a hot key that was one cache lookup per request becomes one database lookup per request.
 
-### Change-data-capture invalidation
+The first line of defense is request coalescing. Inside each process, the SDK keeps a single-flight map from key to in-flight origin read. The first thread does the work; waiters attach to the same future. At the proxy or cache-node layer, leases provide cross-process coalescing: one caller receives a lease and others get a response that says “someone is filling this key; wait, use stale if allowed, or retry after this delay.” This is cheap, precise, and works even before the system has detected that the key is globally hot.
 
-The origin emits committed changes to an ordered stream. Consumers delete or update keys carrying `origin_version`. Nodes reject invalidations older than the entry's version, preventing reordered events from deleting newer data.
+The second line is avoiding synchronized expiration. TTL jitter spreads expirations by adding random variation, for example storing a nominal `300s` value with an actual TTL selected from `270s` to `330s`. Probabilistic early refresh goes further: as a value approaches expiration, a small fraction of readers refresh it early while most readers still receive the current value. The refresh probability rises with age and observed QPS. This converts a cliff into a slope, which is exactly what an origin budget needs.
 
-The double-delete pattern can reduce a specific read/write race but is timing-dependent; versioned invalidation is more rigorous. If the cache cannot retain full versions for deleted entries, use short delete hold-offs/tombstones so a tardy stale fill is rejected instead of resurrecting old data.
+The third line is deciding what to serve while refreshing. For immutable or low-risk data, stale-while-revalidate gives the best user experience and the lowest origin load: serve the old value for a bounded grace period while one refresher updates it. For security-sensitive data, stale serving may be forbidden; those requests should wait within a short deadline or bypass to a strongly consistent path. Negative caching protects the origin from repeated reads of nonexistent objects, but its TTL must be short because creating the object should become visible quickly.
 
-## 8. Expiration, eviction, and stampede control
+Hot keys need special machinery because partitioning alone cannot split one key. Detection should use sketches, sampling, or proxy counters rather than full-cardinality metrics. Once a key crosses a threshold, the primary can publish a `HotKeyRecord`, and routing proxies can read from a replicated hot-key pool. For very hot read-mostly keys, SDK near caches with tiny TTLs, such as `50ms` or `250ms`, can remove large amounts of network traffic while keeping staleness bounded. Netflix EVCache exposes a production version of this topology-aware thinking: clients know server groups and zones, use retries and fallbacks, support client-side caching, and accept that ordinary EVCache replication is best effort rather than a convergence guarantee.
 
-Expiration combines:
+Counters and mutable hot keys are harder. A global exact counter incremented on every request is a single-key write bottleneck. If exact instantaneous totals are not required, split the counter into shards such as `K:counter:0..N-1`, increment a shard chosen by client or hash, and aggregate asynchronously. If exactness is required, the cache is the wrong place to absorb arbitrary write load; it can cache reads of the authoritative counter but should not pretend to provide linearizable global increments across replicas.
 
-- Lazy removal on access.
-- Periodic sampling of expiration buckets.
-- A timing wheel for near-term TTLs.
+Discord's Cassandra experience is a useful sibling lesson even though it is not a generic cache system. Hot channels overloaded single partitions, and Discord put a Rust data service in front that coalesced identical concurrent reads. The transferable point is that coalescing belongs near the access path, not as an afterthought in every caller. A distributed cache should make duplicate suppression a default client/proxy behavior because the origin capacity assumption depends on it.
 
-Add TTL jitter so popular entries do not expire together. Eviction runs before memory is exhausted and may use sampled LRU, LFU with aging, or segmented policies. Protect tiny hot items from one-time scans using an admission policy such as TinyLFU.
+Signals worth watching: lease waiters per key, stale-while-revalidate responses, early-refresh rate, hot-key top-N by sampled QPS, origin reads per cache miss, and retry-after responses emitted by the cache.
 
-Stampede controls include per-process single flight, distributed leases for extremely expensive values, probabilistic early refresh, and stale-while-revalidate. Lease holders have short timeouts; a failed refresher must not block all readers.
+> **Strong-answer criteria.** A senior answer separates duplicate miss suppression, expiration smoothing, stale policy, and single-key scaling; it also states when exact mutable hot keys cannot be solved by ordinary caching.
 
-## 9. Consistency and concurrency
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Let every miss read the database and rely on autoscaling | The origin may be stateful, shard-limited, or already provisioned for the expected hit rate. |
+| Good | Add TTL jitter and process-local single-flight | It removes many accidental stampedes but misses cross-process bursts and hot-key read saturation. |
+| Great | Combine leases, coalescing, probabilistic early refresh, stale-while-revalidate, hot-key pools, near caches, and per-namespace origin budgets | It controls both miss storms and single-key throughput while preserving explicit freshness choices. |
 
-Within one primary, operations on a key are serialized. `ADD`, counters, and compare-and-swap are atomic per key. There is no cross-key atomicity.
+### 6.3 Partitioning, node loss, and warm recovery
+**Question.** One cache node holding 1/600 of the cluster's primary keyspace dies during peak traffic. Why is treating all its keys as ordinary misses still dangerous?
+<details><summary>Answer</summary>
 
-Replication may be:
+Because 1/600 of `47.5M` read QPS is about `79,167` reads per second before considering hot shards, and those reads may hit the origin suddenly. The system should promote replicas or use gutter pools, throttle refill, and warm gradually rather than converting node loss into an origin spike.
 
-- Asynchronous: lowest write latency, possible loss/staleness on failover.
-- Quorum/synchronous: better failover consistency, higher latency.
+</details>
 
-Use monotonically increasing versions or origin commit versions. A promoted replica increments the shard epoch; old primaries are fenced before accepting writes. Clients include `config_epoch` and retry explicit `MOVED` responses.
+Consistent hashing is often introduced as the solution to distributed caching: add or remove a node and only a fraction of keys move. That is necessary but incomplete. Moving “only” `1/600` of a `47.5M` read-per-second workload is still about `47,500,000 / 600 = 79,166.7` reads per second of potentially cold traffic. If the failed node had a few hot virtual shards, the spike can be much worse. The partitioning design must therefore be paired with failure-mode design.
 
-For security-sensitive revocation, bypass an eventually consistent cache or use synchronous invalidation and short TTLs. The cache's consistency mode must match the data.
+Virtual shards give the control plane a manageable unit. Instead of hashing directly to physical nodes, the system hashes to thousands or tens of thousands of virtual shards and assigns each shard to a primary and one or more replicas across failure domains. A node failure marks its shards unavailable at a new `config_epoch`. If replicas are enabled, the control plane promotes a replica after fencing the old primary. If replicas are not enabled for a namespace, the routing layer may send misses to a gutter pool and apply origin budgets while entries refill.
 
-## 10. Partitioning and routing
-
-Map keys to thousands of virtual shards using a stable hash:
-
-```text
-virtual_shard = hash(namespace_id || key) mod V
+```mermaid
+stateDiagram-v2
+    [*] --> Serving
+    Serving --> Copying: add node or rebalance
+    Copying --> Draining: checksum and delta catch-up complete
+    Draining --> Serving: epoch switch
+    Serving --> Fenced: owner lost or demoted
+    Fenced --> [*]
 ```
 
-The control plane assigns virtual shards to physical nodes based on memory and failure domain. This is easier to rebalance than moving arbitrary consistent-hash ranges.
+Epochs are the split-brain guard. Every shard assignment has a `config_epoch`, and cache mutations include the epoch the client or proxy believes is current. If a request reaches an old owner, the old owner must reject with `MOVED` or `STALE_EPOCH`. During migration, the new owner copies entries, while deltas are dual-written or replayed from a short log. Because this is a cache, the system can also choose cold migration for low-value namespaces, but that choice must be explicit and rate-limited because every uncopied key becomes an origin read.
 
-During migration:
+Routing proxies become more attractive as the fleet grows. Direct clients save a hop, but every client library must implement ring updates, connection pooling, retry policy, replicated reads, hot-key routing, and warmup rules. Meta's mcrouter shows the opposite trade-off: make routing an operable tier with route handles, online reconfiguration, shadow traffic, prefix routing, and replicated pools. The proxy tier costs latency and must scale horizontally, but it keeps failure policy consistent across services and can protect origins even when some clients are old.
 
-1. Mark the shard `COPYING` at a new config epoch.
-2. Stream existing entries while dual-writing new mutations or logging deltas.
-3. Compare checksums/sample counts.
-4. Switch ownership atomically in metadata.
-5. Keep the old owner forwarding briefly, then discard its shard.
+Gutter pools are a practical admission that failover is not always clean. When a primary fails and its ordinary replacement is cold, routing a subset of misses to a small temporary cache prevents repeated origin reads for the same keys. Gutter entries have short TTLs and are discarded when the main shard recovers or warms. This does not preserve all hit rate, but it converts repeated misses into temporary hits and buys time for controlled refill. Warm snapshots or flash tiers can improve this further. Meta's McDipper demonstrated that flash-backed caches can dramatically reduce RAM needs for some pools, but flash is a different latency tier with checksums, compression, Bloom filters, and tombstone concerns; it should not be silently mixed into the hottest RAM path.
 
-Because data is a cache, cold migration can also accept misses and refill, but rate-limit this choice to protect the origin.
+Rebalancing has a similar origin-risk shape. Adding nodes should not cause clients to immediately treat all moved keys as absent. A careful migration marks shards `COPYING`, streams entries to the new owner, records deltas or dual-writes mutations, samples counts or checksums, then switches the epoch. The old owner forwards briefly before discarding. For TTL-heavy small-object workloads, storage layout matters during this process. Twitter's Pelikan and Segcache work emphasizes that metadata, fragmentation, delayed expiration, and maintenance work on latency-sensitive threads can dominate cache behavior. A rebalance plan that copies only value bytes in an estimate will understate memory and CPU pressure.
 
-## 11. Storage and memory management
+Signals worth watching: cold-miss QPS after node loss, gutter hit rate, refill throttling, shard movement bytes, stale-epoch errors, replica promotion time, and origin read amplification during rebalances.
 
-Use an in-memory hash table plus slab/arena allocation to reduce fragmentation. Store small metadata inline and large values in size-class arenas. Enforce maximum key/value sizes before allocation.
+> **Strong-answer criteria.** A senior answer quantifies the miss spike from node loss, uses epochs or fencing for ownership changes, and includes a warmup path that protects the origin rather than merely restoring cache capacity.
 
-Optional local NVMe extends capacity for colder objects, but it changes tail latency and complicates eviction. It is best treated as a separate tier for large or cooler objects, with checksums, admission control, and Bloom filters to avoid unnecessary device reads. Optional warm snapshots or a short WAL reduce cold-start origin load; they do not turn the cache into the source of truth.
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Hash keys across nodes and let failed-node keys miss | It ignores the absolute origin QPS created by even a small percentage of a large cluster. |
+| Good | Use consistent hashing and replicas | It limits movement and improves availability but still needs fencing, warmup, and overload controls. |
+| Great | Use virtual shards, epochs, proxy-aware routing, promoted replicas, gutter pools, throttled refill, and warm migration | It treats partitioning as an origin-protection problem, not just a load-balancing problem. |
 
-Compression saves memory and network for large values but costs CPU. Apply it above a threshold and store the codec flag per entry.
+## 7. Variants
+**10x scale.** At `500M` operations per second, the architecture remains the same shape but the routing and measurement choices become stricter. Full per-key anything is impossible; sketches and sampled tracing are mandatory. A proxy tier may be deployed hierarchically by region or service group to avoid connection explosion. Hot-key pools and near caches become default for high-QPS namespaces. The origin budget must be enforced automatically because a five-point hit-rate drop would add `23.75M` origin reads per second under the earlier read mix.
 
-## 12. Hot keys and hot shards
+**Strong freshness namespace.** Permissions, entitlement, and money-adjacent reads should not use ordinary best-effort cache semantics. They can require `min_origin_version`, short TTLs, synchronous invalidation before write success, or complete bypass after a user's own write. The data model stays, but namespace policy changes: stale-on-error is disabled, tombstone retention is longer, and consistency probes page on much smaller version mismatch rates.
 
-A single celebrity key can saturate one primary even with ample cluster capacity. Mitigations:
+**Integrated storage-service cache.** If many microservices repeatedly cache the same database entities, move cache-aside logic into the storage or query service, like Uber's CacheFront. Applications call the storage API, and the storage tier owns CDC invalidation, lease fills, bypass flags, and origin budgets. The cache nodes may still be Redis, Memcached, or a custom store, but the correctness protocol becomes centralized rather than copied across services.
 
-- Replicate read-only hot keys to more nodes or replicated pools with per-client replica selection.
-- Use short-lived SDK near caches with versioned invalidation.
-- Request coalescing and response caching in proxies.
-- Detect hot keys with sampling/sketches rather than full per-key metrics.
-- Split hot counters into sharded partial counters when exact immediate totals are unnecessary.
+**Tag or prefix invalidation.** Content and configuration systems often need to purge by tag, tenant, hostname, or prefix. A single global purge index becomes a bottleneck and a blast-radius risk. Cloudflare's Instant Purge points toward local indexes near the cached data: each cache machine maintains enough metadata to remove its own matching entries quickly. For this application cache, tag indexes should be scoped by namespace and shard, with quotas because indexes consume resident memory just like values.
 
-Adding ordinary shards does not solve a single-key bottleneck. Hot-key replication must preserve invalidation and bounded staleness.
+## 8. The transferable pattern
+This is the reusable pattern of a non-authoritative accelerator in front of an authoritative but capacity-limited system. The accelerator is allowed to forget, but forgetting is not free because the backing system cannot absorb all demand. The design therefore revolves around conditional refill, duplicate suppression, failure warmup, and explicit staleness policy. The same pattern appears in CDN purge systems, storage-service read caches, search result caches, and rate-limited external API memoization.
 
-## 13. Reliability and failure handling
+The closest sibling problems are systems where a fast path and a correctness path have different guarantees. In [Ticketmaster](./ticketmaster-system-design.md), the reservation layer must protect scarce inventory from oversell while absorbing bursts. In [News Feed](./news-feed-system-design.md), fanout and cache materialization accelerate reads but must tolerate stale or missing derived data. In all of them, the senior move is to stop saying “cache it” as a feature and instead define the invalidation, refill, and failure contracts.
 
-| Failure | Handling |
-|---|---|
-| Cache node fails | Promote fenced replica or treat entries as misses |
-| Retry reaches old owner | Epoch check returns `MOVED` |
-| Replica is stale at promotion | Document possible lost writes; use quorum mode where unacceptable |
-| Entire cache restarts | Admission limits, jittered refill, origin protection |
-| Invalidation consumer lags | Alert; versions and TTL bound staleness |
-| Large tenant fills memory | Namespace quota and fair eviction |
-| Hot key overloads node | Extra read replicas, near cache, coalescing |
-| Cache timeout | Circuit breaker; explicit fallback policy |
-| Corrupt snapshot | Ignore and warm from origin |
-| Control plane outage | Nodes continue with last assignment; reconfiguration pauses |
+## Review
+The design starts from the uncomfortable fact that a cache is not authoritative but the origin depends on it for survival. Capacity math shows that a small hit-rate loss produces millions of extra origin reads, so the architecture cannot be only a hash ring and TTLs. The final system uses namespace policies, virtual shards, epochs, cache entries with origin versions, tombstones, leases, SDK/proxy coalescing, hot-key replication, near caches, versioned invalidation, gutter pools, and controlled warmup. The deepest correctness issue is the read-miss/write/stale-fill race; the deepest scalability issue is that misses and hot keys concentrate load instead of distributing it; the deepest reliability issue is that node loss must be handled as an origin-protection event.
 
-Origin capacity is part of cache reliability. Shed optional traffic, serve approved stale values, and recover gradually after widespread misses.
+### Check your understanding
+1. Why is “write database, then delete cache” not sufficient by itself?
+   <details><summary>Answer</summary>
 
-## 14. Multi-region design
+   A reader can miss before the write, read the old database value, then fill after the writer deletes the cache. Without an origin-version tombstone or equivalent fence, the stale fill resurrects the old value until TTL.
 
-Run independent regional cache clusters near applications. The authoritative database or change stream distributes versioned invalidations. Do not synchronously replicate ordinary cache writes across continents; the latency cost defeats caching.
+   </details>
+2. Why does a cache node loss threaten the origin if the cache is not durable anyway?
+   <details><summary>Answer</summary>
 
-Region-local keys include tenant and schema/version prefixes. A regional outage shifts traffic to another region whose cache may be cold, so prewarm critical keys and rate-limit failover. For globally immutable data, CDN or cross-region cache fill is safe. For mutable data, use origin versions and accept a stated staleness window.
+   The lost entries are safe to forget, but their traffic does not disappear. It becomes miss traffic against the origin, which was sized assuming a high hit rate. Replicas, gutter pools, and throttled refill reduce that sudden amplification.
 
-## 15. Security and tenant isolation
+   </details>
+3. What is the difference between a lease token and an origin version?
+   <details><summary>Answer</summary>
 
-- Mutual TLS and workload identities; no unauthenticated public cache.
-- Namespace-scoped authorization and unguessable tenant separation.
-- Encrypt network traffic, snapshots, and spill disks.
-- Quotas for memory, QPS, bandwidth, item size, and connections.
-- Never put credentials or highly sensitive plaintext in shared caches without application encryption.
-- Scrub values from logs and sampled diagnostics.
-- Audit namespace configuration and bulk flush operations.
-- Disable dangerous wildcard scans and global flush for normal tenants.
+   A lease token limits who may fill after a miss and suppresses duplicate refill. An origin version proves freshness relative to database commits and invalidation tombstones. Production-grade fills usually need both.
 
-Cache poisoning is prevented by authenticating writers and including schema/version and tenant in keys.
+   </details>
+4. Why does adding more shards not fix a single hot key?
+   <details><summary>Answer</summary>
 
-## 16. Observability
+   A single key hashes to one shard, so ordinary partitioning cannot split its read load. The system needs hot-key replication, proxy fanout, near caches, stale serving, or a different data model such as sharded counters.
 
-Track:
+   </details>
+5. When should a namespace bypass the cache rather than serve stale data?
+   <details><summary>Answer</summary>
 
-- Hit, miss, stale, and error rates by namespace and operation.
-- Latency percentiles split by server, network, and origin fallback.
-- Resident bytes, logical bytes, allocator fragmentation, and eviction rate.
-- Expiration rate, TTL distribution, and rejected allocations.
-- Hot keys/shards, replication lag, and failover count.
-- Rebalance bytes and duration.
-- Invalidation lag and version regressions.
-- Consistency SLOs such as `N nines of writes consistent within M minutes`, verified by sampled cache-vs-origin probes.
-- Origin request amplification during incidents.
+   Bypass is appropriate when stale reads are unsafe, such as permission revocation, balances, or a read-after-write flow requiring a specific minimum version. The namespace policy should make this explicit instead of relying on callers to remember.
 
-A high hit rate can hide poor value: measure saved origin latency/cost and ensure errors are not counted as misses.
+   </details>
 
-## 17. Operational safeguards
-
-Roll out client hashing and protocol changes compatibly. Configuration changes carry epochs and staged activation times. Provide per-namespace flush, but require confirmation and rate-limit refill afterward. Capacity automation adds nodes before eviction pressure becomes severe.
-
-Chaos tests should remove primaries, delay invalidations, restart a cluster cold, and overload one key while verifying the origin remains protected.
-
-## 18. Major trade-offs
-
-### Direct clients versus proxies
-
-Direct routing minimizes hops but distributes topology logic. Proxies centralize policy and connection pooling but add latency and a scaling tier.
-
-### TTL versus explicit invalidation
-
-TTL is simple and bounds staleness. Invalidation improves freshness but can lag or be reordered. Production systems usually combine versioned invalidation with TTL as a safety net.
-
-### Replication versus origin fallback
-
-Replicas improve hit availability but double memory. Cheap, resilient origins may prefer misses; expensive origins justify replicas.
-
-### LRU versus LFU/admission
-
-LRU adapts quickly but scan pollution evicts hot data. LFU/admission preserves frequently reused entries but needs aging and more metadata.
-
-### Availability versus freshness
-
-Serving stale data maintains availability but is unsafe for permissions or balances. Make stale fallback a per-namespace policy.
-
-## 19. Lessons from production systems
-
-### Facebook Memcache: leases, pools, and gutter fallback
-
-Facebook's NSDI memcache work shows that at billions of requests per second, stampedes and failover behavior dominate the design. Cache misses should return a short lease token so only one reader fills the value, stale fills are fenced, and overloaded or failed nodes can spill misses to a small gutter pool instead of stampeding MySQL. This maps directly to the single-flight lease in the read path and the origin-protection controls in cold-start and failure handling.
-
-### Meta mcrouter: make routing an operable tier
-
-Meta's mcrouter treats the memcached protocol router as a programmable production tier: connection pooling, prefix routing, replicated pools, shadow traffic, online reconfiguration, and route-handle composition. For this design, proxy mode should not be described as merely simpler security; it is where large deployments centralize routing policy, hot-key replication, warmup/shadow testing, and cross-cluster failover while preserving client protocol compatibility.
-
-### Meta Polaris: consistency needs an external SLO
-
-Meta's Polaris work is a reminder that versioned invalidation is not enough unless the system can prove it is working. Polaris watches invalidation events, queries cache replicas as a client, retries at multiple timescales to avoid false positives, and reports metrics like `99.99999999% consistent within five minutes`. This design should expose a similar sampled consistency probe, plus tracing around the race window between fills, invalidations, evictions, and failover.
-
-### Meta McDipper: flash caches are a different tier
-
-McDipper replaced some RAM-heavy memcache pools with flash and reportedly cut servers in some pools by up to 90% while keeping more than 90% of gets sub-millisecond. The mechanism matters: checksums, optional Bloom filters, compression, encryption, and arenas, plus delete hold-offs to stop stale fills after invalidations. In this design, NVMe should be reserved for colder or larger objects and isolated from the low-latency RAM tier.
-
-### Netflix EVCache: topology-aware clients and best-effort replication
-
-EVCache wraps memcached with discovery, client-managed server groups, zone-aware reads, cross-zone mirroring, retries, fallbacks, compression, client-side caching, and write-only mode during maintenance. It also explicitly makes no convergence or consistency guarantee. For this design, multi-AZ replication can improve availability, but freshness-sensitive namespaces still need origin versions, bypass options, and documented staleness windows.
-
-### Uber CacheFront: integrate caching with the storage service
-
-Uber's Docstore CacheFront moved caching into the stateless query engine rather than every microservice owning Redis and invalidation code. It started with point reads, served more than 40 million reads/second, and later scaled past 150 million reads/second by combining Redis, CDC via Flux, timestamp-based deduplication, invalidation markers, and per-request bypass for strong-consistency flows. This supports offering write-through/invalidation integration as a first-class storage-service feature, not only SDK boilerplate.
-
-### Cloudflare Instant Purge: index invalidation near the data
-
-Cloudflare moved from lazy purge records to active purge backed by CacheDB, a Rust/RocksDB sidecar on each cache machine, with local indexes for tags, hostnames, and prefixes. Purges can take effect in under 150 ms P50 globally while saving about 10x storage versus retaining lazy purge history. For application caches with tag or namespace invalidation, keep indexes scoped near the cached data rather than building one global purge index.
-
-### Twitter Pelikan and Segcache: metadata dominates small-object caches
-
-Twitter's Pelikan work calls out production issues that generic Redis/Memcached deployments can hide: unbounded fragmentation, maintenance work on latency-sensitive threads, dangerous flush commands, weak observability, and poor protocol extensibility. Segcache further shows that for TTL-heavy small objects, metadata and delayed expiration can waste a large fraction of memory; segment-structured storage reduced footprint by up to 60% for representative workloads. This design's quotas and capacity math should therefore budget resident bytes and choose storage engines by workload shape, not just API compatibility.
-
-## 20. Recommended interview presentation
-
-1. Clarify that the origin remains authoritative and define allowed staleness.
-2. Estimate QPS, memory including overhead, hit rate, and origin amplification.
-3. Draw SDK routing, virtual shards, replicas, control plane, and invalidations.
-4. Walk through cache-aside reads and database-write invalidation races.
-5. Deep-dive into TTL, eviction, stampede prevention, and hot keys.
-6. Explain epochs, failover, and shard migration.
-7. Cover cold-start protection and regional independence.
-8. Finish with freshness/availability and memory/replication trade-offs.
-
-The central design insight is:
-
-> Treat the cache as disposable but operationally dangerous: partition by stable virtual shards, serialize per-key mutations at a fenced primary, combine TTL with versioned invalidation, and protect the origin from stampedes, hot keys, and cold restarts.
-
-
-## Further reading: curated engineering blogs
-
+## Sources and further reading
 | Source | Article | Why it matters |
 |---|---|---|
 | Meta / USENIX | [Scaling Memcache at Facebook](https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala) | Canonical design for leases, regional pools, gutter fallback, and origin protection at billion-QPS cache scale. |

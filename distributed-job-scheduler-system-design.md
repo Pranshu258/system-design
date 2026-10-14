@@ -1,404 +1,409 @@
-# Production Distributed Job Scheduler
+# Distributed Job Scheduler System Design
+
+A distributed job scheduler accepts work that should run now, later, on a recurring calendar, or after other work completes, and it dispatches that work to worker pools. This design focuses on the control plane: durable scheduling, dispatch, retries, leases, cron, and workflow state. It does not try to make arbitrary external side effects exactly once, and it treats payload execution, sandbox internals, and business logic as worker concerns.
 
 ## 1. Requirements
 
-### Functional requirements
+### 1.1 Functional requirements
 
-1. Submit immediate, delayed, recurring, and dependency-based jobs.
-2. Dispatch work to heterogeneous worker pools using resource and placement constraints.
-3. Support retries, timeouts, cancellation, priorities, rate limits, and deadlines.
-4. Prevent two healthy workers from concurrently owning the same attempt.
-5. Expose status, progress, logs, history, and searchable metadata.
-6. Support cron schedules with explicit time zones and daylight-saving behavior.
-7. Handle workflows/DAGs and fan-out/fan-in dependencies.
-8. Provide dead-lettering and manual replay.
+- Let clients create immediate, delayed, recurring, and DAG-based jobs with retries, deadlines, timeouts, priorities, and placement constraints.
+- Dispatch ready jobs to heterogeneous workers while respecting tenant quotas, worker capacity, pool labels, and rate limits.
+- Provide run status, attempt history, progress, cancellation, manual retry, dead-lettering, and searchable metadata.
+- Guarantee that an accepted job is durably recorded and will be attempted at least once unless explicitly canceled or blocked by policy.
+- Ensure a single logical job run is not intentionally executed by two active workers at the same time, even when schedulers or workers crash.
+- Define cron behavior precisely for time zones, daylight-saving transitions, misfires, catch-up, and skipped occurrences.
 
-### Non-functional requirements
+### 1.2 Non-functional requirements
 
-- Schedule tens of millions of jobs per day with second-level dispatch latency.
-- Remain available across machine and availability-zone failures.
-- Never lose an accepted job within the home-region quorum; cross-region disaster recovery has an explicit RPO unless writes are synchronously replicated across regions.
-- Provide at-least-once execution; clearly define idempotency expectations.
-- Isolate tenants and prevent starvation.
-- Scale the control plane independently from worker execution.
+- **Schedule fidelity.** The system should start most jobs close to their scheduled time because users experience scheduler delay as missed invoices, stale exports, or late workflows.
+- **Durability.** Once the API acknowledges a job, the authoritative metadata must survive machine and availability-zone failure inside the home region.
+- **At-least-once execution.** The scheduler must prefer retrying ambiguous work over silently losing it, while exposing idempotency and fencing so applications can make retries safe.
+- **No concurrent ownership.** A run should have at most one valid owner epoch at a time, because overlapping attempts can corrupt downstream systems even if every individual worker is healthy.
+- **Tenant isolation.** One tenant's midnight cron burst or retry storm must not starve other tenants or exhaust shared queue memory.
+- **Rebuildability.** Ready queues, in-memory timer heaps, and workflow actors are accelerators; the durable store must be sufficient to reconstruct them after failure.
 
-Exactly-once side effects are out of scope because the scheduler cannot atomically commit arbitrary external work. It provides fencing and idempotency tools instead.
+### 1.3 The binding constraint
 
-## 2. Scale assumptions and capacity
+The binding constraint is that a job must run at its intended time, at least once, and never concurrently with itself, across worker crashes and network partitions, while exactly-once external side effects are impossible for the scheduler to guarantee. If a worker charges a credit card and dies before reporting success, the scheduler cannot know whether retrying repeats the charge. If it does not retry, it can lose the job. That ambiguity shapes the design more than raw throughput does.
 
-Assume:
+The consequence is a control plane built around durable intent, reconstructable dispatch hints, renewable leases, monotonically increasing fencing tokens, and explicit idempotency contracts. Timing data must be indexed well enough to find due work without melting a hot `now` partition. Ownership must survive pauses and partitions without letting zombie workers complete stale attempts. Cron and DAG semantics must be written down rather than implied by whatever retry happened first.
 
-- 100 million job runs/day: about 1,160/second average and 20,000/second peak.
-- 10 million recurring definitions.
-- 5 million simultaneously running attempts.
-- 200,000 worker nodes across many pools.
-- 1 KB average job metadata and 20 state transitions per run.
-- 30 days of searchable hot history and one year archived.
+## 2. Back-of-the-envelope estimation
 
-```text
-100M runs/day x 20 transitions x 300 bytes
-= about 600 GB/day of unreplicated event history
-```
+Use illustrative numbers to size the shape of the system, not to claim a universal workload. Suppose the service handles `100M` job runs per day. The average arrival rate is `100,000,000 / 86,400 = 1,157.4` runs per second. A 20x daily burst gives about `23,148` runs per second, which we can round to `25k` peak run creations per second for headroom. This means a single database partition or a single ready queue cannot be the path to readiness; the system needs sharded writes and many dispatch partitions.
 
-Payloads and logs belong in object storage; queue rows contain references. Large scheduled bursts, such as midnight cron jobs, matter more than average throughput.
+Each run might produce state events for creation, ready, dispatch, start, heartbeats or progress snapshots, retry, and terminal state. If the durable event stream stores `20` events per run at about `300` bytes each, hot event history is `100M × 20 × 300 = 600,000,000,000` bytes, about `600 GB` per day before replication and indexes. Thirty days of hot searchable event metadata would be about `18 TB` unreplicated. That pushes large payloads, logs, and result blobs out of the transactional store and into object storage, leaving compact state rows and event records in the scheduler store.
 
-## 3. High-level architecture
+Now assume `10M` recurring definitions. If just `10%` fire at the top of the hour, that is `1M` due occurrences in a narrow window. Spread over one minute, the creation pressure is `1,000,000 / 60 = 16,667` runs per second before retries and DAG expansion. If all hourly schedules are indexed only by `next_fire_time`, every timer owner hammers the same key range around the current time. The scheduler needs time buckets plus hash shards, and it should smear eligible work across virtual partitions instead of making the current minute a global hot partition.
 
-```mermaid
-flowchart LR
-    C[Clients / Workflow Service] --> API[Job API]
-    API --> DB[(Sharded Job Store)]
-    API --> OUT[(Transactional Outbox)]
-    OUT --> BUS[(Durable Event Log)]
-    T[Timer / Cron Shards] --> DB
-    T --> BUS
-    BUS --> Q[Ready Queue Partitions]
-    S[Scheduler Fleet] --> Q
-    S --> M[Worker Membership / Capacity]
-    S --> W[Worker Agents]
-    W --> HB[Lease / Heartbeat Service]
-    HB --> DB
-    W --> OBJ[(Payloads and Logs)]
-    R[Reconciler] --> DB
-    R --> Q
-    API --> IDX[(History Search Index)]
-```
+Worker scale has a different implication. With `5M` simultaneously running attempts and a `30` second heartbeat interval, the heartbeat write rate is `5,000,000 / 30 = 166,667` heartbeats per second if every heartbeat is durably written. That is too much for the same transaction path that owns state transitions. Heartbeats should update a compact lease record, be coalesced, or be written only when progress changes, while terminal transitions remain strongly consistent.
 
-The durable job store is authoritative. Ready queues accelerate dispatch but are reconstructable hints; if a queue/log is chosen as the initial write buffer, the client acknowledgment must match its replication durability. Schedulers decide placement; workers execute untrusted or isolated workloads.
+> **Key idea.** The numbers say the hard part is not accepting an API call; it is indexing due work, smoothing calendar bursts, and keeping ownership state small and strongly consistent while execution progress is noisy and huge.
 
-## 4. Data model and state machine
+## 3. API design
 
-```text
-JobDefinition
-- job_id
-- tenant_id
-- command_or_handler
-- payload_uri
-- schedule
-- timezone
-- retry_policy
-- timeout
-- priority
-- constraints
-- revision
+**Question.** What makes a client retry safe when the API response is lost after the job was committed?
+<details><summary>Answer</summary>
 
-JobRun
-- run_id
-- job_id
-- scheduled_for
-- state
-- remaining_dependencies
-- attempt_count
-- deadline
-- idempotency_key
-- version
+The client supplies an idempotency key scoped to the tenant and operation. The scheduler stores the normalized request hash and the created identifiers in the same transaction as the job. A retry with the same key and equivalent request returns the original `job_id` and `run_id`; a retry with a different request is rejected as a conflict.
 
-Attempt
-- attempt_id
-- run_id
-- number
-- worker_id
-- lease_epoch
-- lease_expires_at
-- started_at / finished_at
-- result_uri
-- failure_class
-
-Dependency
-- parent_run_id
-- child_run_id
-- condition: SUCCESS | COMPLETION
-
-StateEvent
-- run_id
-- sequence
-- from_state / to_state
-- actor
-- timestamp
-```
-
-Core run transitions:
-
-```text
-SCHEDULED -> READY -> DISPATCHED -> RUNNING -> SUCCEEDED
-                     |             |-> RETRY_WAIT -> READY
-                     |             |-> FAILED
-                     |             |-> TIMED_OUT
-                     |             |-> CANCELED
-                     |-> READY (lease expires before start)
-```
-
-Every transition uses compare-and-swap on `version` and appends a state event in the same transaction.
-
-## 5. Core APIs and worker protocol
+</details>
 
 ```http
 POST /v1/jobs
-Idempotency-Key: client-uuid
-
+Idempotency-Key: client-generated-uuid
 {
   "handler": "generate-invoice:v3",
-  "payload_uri": "obj://payloads/...",
+  "payload_uri": "obj://payloads/tenant-a/abc",
   "run_at": "2026-10-13T09:00:00Z",
   "timeout_seconds": 900,
-  "retry": {"max_attempts": 5, "backoff": "exponential"},
+  "retry_policy": {"max_attempts": 5, "backoff": "exponential_jitter"},
   "constraints": {"pool": "finance", "cpu": 2, "memory_mb": 4096}
+}
+
+POST /v1/schedules
+{
+  "cron": "0 9 * * MON-FRI",
+  "timezone": "America/Los_Angeles",
+  "dst_policy": "skip_missing_run_once_on_repeated",
+  "misfire_policy": "coalesce",
+  "handler": "send-digest:v2"
+}
+
+POST /v1/workflows
+{
+  "nodes": [{"name": "extract", "handler": "etl-extract:v4"}],
+  "edges": [{"from": "extract", "to": "load", "condition": "SUCCESS"}],
+  "failure_policy": "block_dependents"
+}
+
+POST /v1/runs/{run_id}:cancel
+POST /v1/runs/{run_id}:retry
+GET  /v1/runs/{run_id}
+GET  /v1/runs?tenant_id=...&state=FAILED&cursor=...
+GET  /v1/runs/{run_id}/events?after_sequence=...
+```
+
+The API returns `202 Accepted` for work that has been durably recorded but not completed. Status is a resource, not a synchronous response, because the scheduler cannot know when a worker will start or whether a retry will be needed. List APIs use cursors over a stable sort key instead of offsets; offset pagination over a changing run table skips or duplicates rows during heavy state churn.
+
+Cancellation is deliberately a request, not an immediate fact. If a worker completes at the same time a client cancels, only one conditional state transition wins. The API can report `CANCEL_REQUESTED`, then `CANCELED` if the worker cooperates or the lease is revoked, or `SUCCEEDED` if the completion committed first. That is less pretty than pretending cancellation is instant, but it matches the real race.
+
+Worker protocol calls also carry ownership data:
+
+```http
+POST /internal/attempts/{attempt_id}:heartbeat
+{
+  "run_id": "run_123",
+  "worker_id": "worker_9",
+  "lease_epoch": 42,
+  "progress": {"percent": 63}
+}
+
+POST /internal/attempts/{attempt_id}:complete
+{
+  "run_id": "run_123",
+  "lease_epoch": 42,
+  "result_uri": "obj://results/run_123/attempt_3"
 }
 ```
 
-```http
-POST   /v1/jobs/{job_id}:pause
-POST   /v1/jobs/{job_id}:resume
-POST   /v1/runs/{run_id}:cancel
-POST   /v1/runs/{run_id}:retry
-GET    /v1/runs/{run_id}
-GET    /v1/runs?tenant_id=...&state=FAILED
-GET    /v1/runs/{run_id}/events
-```
+The non-obvious field is `lease_epoch`. A timestamp says when a lease seems expired; an epoch says which owner is still authorized. Every mutation from a worker includes it, and stale epochs are rejected even if an old worker resumes after a long pause.
 
-Workers use a bidirectional gRPC stream:
+## 4. Data model
 
-```text
-Register(capabilities, pool, resources)
-Offer(attempt_id, lease_epoch, payload_ref, deadline)
-Accept(attempt_id, lease_epoch)
-Heartbeat(attempt_id, lease_epoch, progress)
-Complete(attempt_id, lease_epoch, result_ref)
-```
+Start with the obvious entity: a `JobDefinition` says what to run. That is enough for an immediate one-shot job, but it cannot represent a specific occurrence of a recurring job or a retry with its own deadline. So we add `JobRun`, one row per logical scheduled occurrence. A daily report has one definition and many runs, each with a distinct `scheduled_for` and terminal outcome.
 
-Every worker mutation includes the lease epoch. A stale worker receives an explicit fenced error.
+A run still is not enough once workers crash. If run state just says `RUNNING worker_7`, then a second scheduler cannot tell whether `worker_7` is slow, partitioned, dead, or done but unable to report. We add `Attempt`, a numbered execution try with `lease_epoch`, `lease_expires_at`, and `worker_id`. Retries create new attempts or new epochs, and terminal transitions validate the current epoch.
 
-## 6. Job submission flow
+Recurring jobs need a way to prevent duplicate occurrence creation. That requires a uniqueness constraint on `(job_id, scheduled_for)` for logical cron runs. The timer can scan overlapping windows and safely race with another timer owner because only one insert wins. The scheduler may publish duplicate ready messages, but the run row remains unique.
 
-1. The API authenticates the tenant, validates limits and schedule syntax, and stores large payloads separately.
-2. In one transaction it inserts the definition/run, idempotency record, audit event, and outbox record.
-3. Immediate jobs enter `READY`; future jobs enter `SCHEDULED`.
-4. An outbox publisher emits ready events to the appropriate queue partition.
-5. The client receives the stable job/run ID. A retry with the same key and equivalent request returns it; a different request is rejected.
+DAGs introduce a different failure. A child cannot just wait for a parent status in memory, because the dependency event may be consumed twice or the workflow engine may restart. We add `DependencyEdge` plus a durable processed marker keyed by `(parent_run_id, child_run_id, condition)`. The child stores `remaining_dependencies`; an idempotent transition decrements it exactly once per satisfied edge.
 
-The outbox closes the gap between committing a job and publishing it. A reconciler periodically scans authoritative `READY` rows without active dispatch records and republishes them.
-
-## 7. Timers, cron, and delayed jobs
-
-Partition timers by a hash of `job_id` and time bucket. Each timer shard owns a renewable, fenced lease and scans an indexed window such as:
+Finally, debugging and reconciliation need history. A mutable status row tells us where a run is now, but not why it got there. `StateEvent` is appended in the same transaction as important state transitions. Search indexes are derived from these events; they are not authoritative for scheduling.
 
 ```text
-WHERE shard = ? AND next_fire_time <= now + lookahead
+JobDefinition
+- job_id, tenant_id, handler, payload_uri, schedule_spec, timezone
+- retry_policy, timeout_seconds, priority, constraints
+- misfire_policy, dst_policy, revision, paused
+
+JobRun
+- run_id, job_id, tenant_id, scheduled_for, state
+- remaining_dependencies, attempt_count, deadline_at
+- business_idempotency_key, version, next_action_at
+
+Attempt
+- attempt_id, run_id, attempt_number, worker_id
+- lease_epoch, lease_expires_at, started_at, finished_at
+- result_uri, failure_class, last_progress_digest
+
+DependencyEdge
+- parent_run_id, child_run_id, condition
+- processed, processed_at
+
+TimerShard
+- shard_id, owner_id, owner_epoch, lease_expires_at
+- bucket_start, bucket_width_seconds
+
+OutboxEvent
+- event_id, aggregate_type, aggregate_id, event_type
+- partition_key, payload, created_at, published_at
+
+StateEvent
+- run_id, sequence, from_state, to_state
+- actor_type, actor_id, timestamp, reason
 ```
 
-Near-term timers enter a hierarchical timing wheel or priority heap; far-future timers remain in the database. On firing, a conditional transaction creates a uniquely keyed run `(job_id, scheduled_for)` and computes the next occurrence.
+The authoritative rows live in a strongly consistent, sharded transactional store, partitioned by tenant plus hashed job or workflow identifiers so large tenants can spread across virtual shards. The ready queue lives in a durable log or persistent queue partitioned by pool, priority band, and virtual shard. Payloads, logs, and large results live in object storage behind immutable references and checksums. Search attributes and event text go to a search index after commit, but search lag never affects scheduling decisions.
 
-Cron definitions store the original expression, IANA time zone, and explicit daylight-saving policy:
+> **Key idea.** The data model separates intent, logical occurrence, physical attempt, and derived dispatch hints; that separation is what lets the system retry ambiguous work without inventing exactly-once execution.
 
-- Missing local time: skip or run at the next valid instant.
-- Repeated local time: run once or twice.
-- Misfire: catch up, coalesce to one run, or skip.
+## 5. High-level design
 
-For non-idempotent cron jobs, prefer fail-closed behavior: skipping or operator-controlled catch-up is usually safer than accidentally double-launching. Clock skew is bounded with synchronized clocks, but database compare-and-swap—not local time alone—prevents double creation.
+The simplest design is one database table and a poller. The API inserts jobs with `run_at`. A scheduler process repeatedly runs `SELECT * FROM jobs WHERE run_at <= now AND state = 'SCHEDULED' LIMIT 100`, marks rows running, sends them to workers, and updates status when workers finish.
 
-## 8. Dispatch and placement
+```mermaid
+flowchart LR
+    C["Client"] --> API["API server"]
+    API --> DB[("Jobs table")]
+    P["Single poller"] --> DB
+    P --> W["Worker"]
+    W --> DB
+```
 
-Ready queues are partitioned by pool and priority band. Scheduler instances consume partitions under leases and maintain a soft cache of worker capacity. For workflow-heavy workloads, sticky ownership of a workflow shard can keep related state transitions local, but ownership must be rebuildable from the database after failure.
+That design breaks in predictable ways. The due-time query becomes a hot range around `now`. A crash after committing the job but before enqueueing it can strand work. A paused worker can resume after its lease expired and overwrite a newer attempt. Queue memory can fill during a burst, causing both enqueue and dequeue to fail. Cron and DAG state held in process memory disappears during failover and creates duplicates or stuck children.
 
-Placement filters by:
+### Fix 1: Make the store authoritative and queues reconstructable
 
-- Required runtime, labels, region, and compliance zone.
-- CPU, memory, GPU, and ephemeral disk.
-- Tenant concurrency and rate limits.
-- Affinity/anti-affinity and data locality.
-- Deadline and priority.
+Accepted jobs are committed to the job store before acknowledgment. Ready queues are dispatch accelerators, not the source of truth. The API writes an outbox record in the same transaction as the job, and an outbox publisher emits ready events to queue partitions. If publishing fails, the row remains visible to a reconciler that scans for `READY` work without a live dispatch record and republishes it. Slack hit the danger of relying on bounded queue memory when Redis filled and even dequeue needed memory to move jobs into an in-flight list; the transferable lesson is that a durable buffer and reconstructable queues keep admission and recovery from depending on volatile queue state.
 
-Then it scores eligible workers by remaining capacity, locality, fragmentation, and recent failure rate. The scheduler creates an `Attempt` and transitions `READY -> DISPATCHED` before offering it. If the worker does not accept promptly, the offer expires and the run is requeued.
+### Fix 2: Index due work by bucket and shard, not by a global clock edge
 
-Use deficit round robin or weighted fair queuing across tenants, with reserved capacity for critical classes and per-namespace quotas so one tenant or job type cannot monopolize shared queues. Aging prevents low-priority starvation.
+Delayed and recurring work is stored with `next_action_at`, `time_bucket`, and `timer_shard`. Timer owners lease shards and scan bounded windows such as `bucket = 2026-10-13T09:00Z AND shard = 17`. Near-horizon work can be cached in a timing wheel or heap, but future truth remains in the store. Airbnb Dynein makes the same split between immediate queue semantics and durable delayed scheduling, while Meta FOQS shows why durable delay metadata and active partition discovery matter when consumers cannot poll every possible queue.
 
-## 9. Execution, leases, retries, and cancellation
+### Fix 3: Use attempts, leases, and fencing tokens for ownership
 
-After accepting, the worker starts an isolated process/container and transitions the attempt to `RUNNING`. It renews a short lease and reports progress. Missing heartbeats cause the attempt to become lost; after a grace period the reconciler increments the lease epoch and retries.
+A scheduler does not merely set `state = RUNNING`; it creates an attempt with a renewable lease and a monotonically increasing epoch. Workers heartbeat and complete using that epoch. If the lease expires, a reconciler can create a new epoch and retry. If the old worker later wakes up, its completion is rejected because the epoch is stale. This protects against zombie workers, not just dead ones.
 
-Retries distinguish:
+### Fix 4: Treat workflows and cron as durable state machines
 
-- Transient infrastructure or retryable application errors.
-- Permanent validation/application failures.
-- Scheduler cancellation and deadline expiration.
+Cron creates uniquely keyed logical occurrences, and each definition declares what to do with missed, repeated, and nonexistent local times. DAGs use dependency counters and idempotent edge processing rather than in-memory callbacks. Netflix Maestro's redesign is relevant here: dual state across workflow tables, engine tables, and external queues produced races and stuck executions, so the engine moved toward a single source of truth plus rebuildable in-memory actors.
 
-Backoff uses exponential delay plus jitter and respects a maximum attempts/elapsed-time budget. Cancellation is cooperative first: mark `CANCEL_REQUESTED`, notify the worker, then terminate after a grace period. A completion racing with cancellation wins only through a documented conditional transition.
+### Putting it together
 
-Worker code receives `run_id`, `attempt_id`, and a stable business idempotency key. For side effects, it should use an idempotency table or transactional inbox in the destination system.
+```mermaid
+flowchart TD
+    C["Client"] --> API["Job API and idempotency gate"]
+    API --> JS[("Authoritative job store")]
+    API --> OB[("Transactional outbox")]
+    OB --> PUB["Outbox publisher"]
+    PUB --> RQ[("Ready queue partitions")]
+    TS["Timer shard owners"] --> JS
+    TS --> RQ
+    WF["Workflow edge consumers"] --> JS
+    WF --> RQ
+    SCH["Scheduler fleet"] --> RQ
+    SCH --> JS
+    SCH --> MEM["Worker membership and capacity"]
+    SCH --> WK["Worker agents"]
+    WK --> OBJ[("Payloads logs and results")]
+    WK --> JS
+    REC["Reconciler"] --> JS
+    REC --> RQ
+    JS --> IDX[("Search and history index")]
+```
 
-## 10. Workflow and dependency handling
+A one-shot delayed request enters through the API idempotency gate. The payload is stored by reference, the run is inserted as `SCHEDULED`, and an outbox event records that a timer shard should notice it. When the bucket becomes due, the timer owner conditionally transitions the run to `READY` and publishes a queue hint. A scheduler consumes the hint, re-reads the run, creates an attempt with epoch `1`, and offers it to a worker. The worker heartbeats with epoch `1` and either completes, fails, or times out. If any hint is lost, the reconciler can reconstruct it from the authoritative rows.
 
-A DAG submission validates acyclicity and creates dependency edges. Each child stores `remaining_dependencies`. When a parent reaches a terminal state, an idempotent dependency consumer records that edge as processed and atomically decrements the counter if the edge condition is satisfied. If a required `SUCCESS` edge cannot be satisfied because the parent failed or was canceled, the child is marked `SKIPPED`/`BLOCKED` (or failed according to workflow policy) rather than waiting forever. The child becomes `READY` exactly when all required edges are processed and their conditions hold.
+> **Key idea.** Each component traces back to a specific failure of the naive design.
 
-For massive fan-out, do not transact across all children. Emit partitioned parent-completion events and use batched conditional updates. A workflow aggregator computes summary state from durable child transitions. Compensation is application-defined; the scheduler must not pretend arbitrary steps can be rolled back.
+## 6. Deep dives
 
-## 11. Consistency and concurrency
+### 6.1 Finding due work without a hot `now` partition
 
-Strong consistency is required for:
+**Question.** Ten million cron definitions exist, and one million of them are due at 09:00. How do we find them on time without every scheduler scanning the same database range?
+<details><summary>Answer</summary>
 
-- Run state transitions.
-- Attempt ownership and lease epochs.
-- Uniqueness of scheduled occurrences and idempotency keys.
-- Dependency counters.
+Store future work in indexed time buckets with hash shards and lease ownership. Timer owners scan only their shard windows, create unique occurrences with conditional writes, and publish ready hints. Ready queues use active partition discovery and virtual shards so consumers do not poll empty partitions or overload the current minute.
 
-Queue delivery, search indexing, logs, and progress are eventually consistent. Queue messages are hints containing IDs; consumers re-read authoritative state and ignore obsolete messages.
+</details>
 
-Fencing is essential. A lease timestamp alone fails if a paused scheduler resumes. Monotonically increasing `lease_epoch` values let the database, worker, and downstream resource reject stale owners.
+The naive query is attractive because it is readable: `WHERE next_fire_time <= now ORDER BY next_fire_time LIMIT 100`. It works in a prototype and fails exactly when users need the scheduler most. Midnight, top-of-hour, and business-day starts concentrate millions of rows around the same key range. Adding more pollers makes the hot range hotter; every poller competes for the same index pages and returns overlapping candidates unless the database supports expensive skip-locked semantics at scale.
 
-## 12. Partitioning and storage
+The fix is to make due work partitionable before it is due. Each scheduled item stores a bucket such as minute or five-second bucket, plus a hash shard derived from `job_id` or `tenant_id/job_id`. A timer owner leases `(bucket, shard)` ranges for the near horizon. Its scan is bounded: one shard, one bucket range, one owner epoch. If the owner crashes, another owner takes over after the shard lease expires and scans the same window with overlap. Duplicate detection comes from the uniqueness key on `(job_id, scheduled_for)` and conditional state transitions, not from trusting that scans never overlap.
 
-Shard job/run rows by `tenant_id` plus hashed `job_id` to distribute large tenants. Keep a run and its attempts/events together. Separate indexes serve `(state, next_action_time, shard)` scans without globally querying all jobs.
+Bucket width is a trade-off. A one-minute bucket reduces index cardinality but creates larger bursts inside the owner. A one-second bucket gives precise scans but more buckets to manage and more shard metadata. A practical design uses coarse durable buckets and a near-horizon timing wheel inside each timer owner. The database answers, "which items may fire soon for this shard?" The in-memory wheel answers, "which of these should fire in the next few milliseconds?" If the timer process dies, it loses only the cache; the next owner reloads from the durable bucket.
 
-Ready queues partition by execution pool and priority, with virtual partitions for rebalancing. Timer buckets partition by fire time and hash. Very large tenants get namespace-level capacity reservations and many virtual shards; small tenants can share shards without losing quota isolation. Payloads, results, and logs use immutable object keys and checksums.
+The ready queue needs the same anti-hotspot thinking. Partitioning only by priority sends the 09:00 burst to a small number of partitions. Partition by execution pool, priority band, and virtual shard. Consumers discover active partitions rather than polling every possible one. Meta FOQS is a useful production reference: it combines persistent priority and delay metadata with leases, ack/nack, active-topic discovery, and in-memory ready indexes so consumers find active work without scanning every shard. That maps directly to a job scheduler where many partitions are empty most of the day and a few become hot during cron bursts.
 
-Move terminal event histories to columnar object-storage files after the hot period. Keep compact status rows online and index selected fields in a search engine. Search is never authoritative for scheduling.
+Airbnb Dynein reinforces the separation of concerns. Immediate jobs can use queue semantics, while jobs scheduled months out belong in a delayed scheduler store until they approach execution. If all future work is inserted directly into an immediate queue, the queue becomes both a timer database and a dispatch buffer, which makes long delay, rebalancing, and recovery harder. The scheduler should keep the durable future in a store optimized for indexed time scans and publish to immediate queue partitions only when work is near ready.
 
-## 13. Reliability and failure handling
+A subtle failure appears during catch-up after an outage. Suppose a timer shard was down for ten minutes. If it blindly publishes all missed jobs at once, it can produce a retry storm worse than the outage. The timer should respect tenant concurrency, deadline, and misfire policy while catching up. Some jobs need every missed occurrence; some should coalesce to one run; some should skip because duplicate external effects are more dangerous than lateness. That policy belongs on the schedule definition, not in the timer owner's accident of implementation.
 
-| Failure | Handling |
-|---|---|
-| API response lost after commit | Idempotency key returns original job |
-| Outbox publish fails | Publisher retries; reconciler republishes |
-| Ready message duplicated | Conditional state transition ignores obsolete message |
-| Scheduler crashes after dispatch | Attempt lease expires; fenced retry |
-| Worker completes after lease loss | Stale epoch rejects completion |
-| Worker dies after external side effect | Retry may repeat; handler idempotency is required |
-| Timer owner fails | New fenced owner scans overlap window |
-| Queue unavailable | Accepted jobs remain in authoritative store |
-| Search index lags | Status lookup reads job store |
-| Poison job repeatedly crashes workers | Retry budget, quarantine, and dead-letter queue |
-| Zone fails | Replicated metadata elects owners in another zone |
+Signals worth watching: timer lag by shard, oldest due item age, due-scan rows examined per run emitted, active partition count, ready queue age by tenant and pool, and the fraction of occurrences created by reconciler rather than the normal timer path.
 
-Run continuous invariants: no `RUNNING` attempt with an expired unhandled lease, no `READY` job absent from reconciliation, and no child with a negative dependency count.
+> **Strong-answer criteria.** A senior answer must avoid a global `now` scan, explain why duplicate scans are safe, and separate durable future scheduling from immediate dispatch queues.
 
-## 14. Multi-region design
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Every scheduler polls `next_fire_time <= now` from one index. | More schedulers amplify the hot range and duplicate work. |
+| Good | Partition timers by time bucket and hash shard. | It spreads scans, but still needs lease ownership and duplicate-safe occurrence creation. |
+| Great | Use bucketed durable scans, near-horizon timing wheels, active ready partitions, unique occurrence keys, and catch-up policy. | It handles bursts, crashes, and outage recovery without losing the due-time contract. |
 
-Assign each tenant or job to a home region for state transitions and timer ownership. Stateless APIs route writes home; workers may run elsewhere if latency and data policy permit. Metadata replicates synchronously across availability zones and asynchronously to a disaster-recovery region by default; choose synchronous cross-region writes only for tenants that require zero regional data loss and can accept the added latency/availability trade-off.
+### 6.2 Leases, heartbeats, and fencing against zombie workers
 
-During regional failure:
+**Question.** A worker pauses for two minutes during a garbage-collection stop, its lease expires, and the job is retried elsewhere. The old worker then resumes and reports success. What prevents two completions or two external writes?
+<details><summary>Answer</summary>
 
-1. Stop or fence old-region lease issuance.
-2. Verify replication position against the accepted recovery-point objective and disclose/reconcile any acknowledged home-region writes beyond that point.
-3. Promote the secondary and increment regional epochs.
-4. Reconstruct ready queues and timer windows from authoritative rows.
-5. Treat old workers as stale until they re-register.
+The scheduler can prevent stale control-plane mutations with monotonically increasing fencing tokens. The resumed worker's completion includes the old `lease_epoch` and is rejected. External side effects require the destination to check the same fencing token or an idempotency key; otherwise the scheduler can only provide at-least-once execution, not exactly-once side effects.
 
-Active-active ownership of one run is avoided. Globally submitted jobs can be routed by tenant home while read APIs use replicas.
+</details>
 
-## 15. Security and isolation
+A lease timeout alone is not enough. It tells the scheduler when it may give up on an owner, but it does not stop the old owner from acting later. Network partitions, process pauses, overloaded hosts, and asymmetric packet loss all create zombies: workers that are no longer authorized but still running. If the only rule is "complete before `lease_expires_at`," a worker with a skewed clock or delayed packets can overwrite a newer attempt.
 
-- Authenticate users and workers with short-lived identities and mutual TLS.
-- Authorize job types, worker pools, payloads, cancellations, and replay separately.
-- Encrypt metadata, payloads, results, and logs with KMS-managed keys.
-- Run workloads in sandboxed containers or microVMs with least-privilege service accounts.
-- Keep secrets out of job payloads; inject scoped secret references at execution.
-- Enforce tenant quotas for submissions, concurrency, CPU time, storage, and retries.
-- Validate handler allowlists and prevent arbitrary control-plane command injection.
-- Audit definition changes, dispatch, cancellation, secret access, and manual retries.
+The core protocol is compare-and-swap around an epoch. When a scheduler dispatches an attempt, it writes `lease_epoch = 42`, `worker_id = worker_a`, and `lease_expires_at = now + duration` under the run's current version. The worker receives epoch `42`. Every heartbeat, progress update, cancellation acknowledgement, and completion includes epoch `42`. The store accepts the mutation only if the run is still in a compatible state and the attempt still has epoch `42`. If the lease expires and a reconciler retries the run, it moves ownership to epoch `43`. From that moment, epoch `42` is fenced.
 
-## 16. Observability
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant D as Job store
+    participant A as Worker A
+    participant B as Worker B
+    S->>D: Create attempt epoch 42
+    S->>A: Offer attempt epoch 42
+    A->>D: Heartbeat epoch 42
+    Note over A: Pause or partition
+    S->>D: Lease expired so fence epoch 42 and create epoch 43
+    S->>B: Offer retry epoch 43
+    B->>D: Complete epoch 43
+    A->>D: Complete epoch 42
+    D-->>A: Reject stale epoch
+```
 
-Track:
+The lease duration should be short enough to meet recovery objectives but long enough to avoid false loss under ordinary pauses. Heartbeats can be frequent, but the authoritative lease record should stay compact. For millions of running attempts, writing every progress tick as a full event is wasteful. Coalesce heartbeat writes, store a last-seen timestamp and progress digest, and append durable events only for meaningful state transitions or sampled progress.
 
-- Submission rate, validation failures, and idempotent replays.
-- Schedule-to-ready, ready-to-dispatch, and dispatch-to-start latency.
-- Queue depth and oldest age by pool, priority, and tenant.
-- Running attempts, lease renewals, lost workers, and fenced stale writes.
-- Success, retry, timeout, cancellation, and dead-letter rates by job type.
-- Timer lag, cron misfires, and reconciler repairs.
-- Worker resource utilization and placement failures.
-- Regional replication lag and failover readiness.
+Fencing must propagate to resources that can be corrupted by stale workers. The job store can reject a stale `Complete`, but it cannot undo a stale worker's direct call to a payment API, data warehouse, or email service. The worker SDK should pass a stable `business_idempotency_key`, `run_id`, `attempt_id`, and `lease_epoch` to handler code. Downstream systems that support conditional writes can store the highest accepted epoch and reject lower epochs. Systems that support idempotency keys can deduplicate repeated calls. Systems that support neither must be treated as at-least-once side-effect targets, and job owners must choose retry policies accordingly.
 
-The primary SLI is deadline attainment or schedule-to-start latency, not merely API uptime. Synthetic jobs should verify submission through execution and result retrieval.
+This is where the design has to be honest. "Exactly once" is sometimes achievable inside one database transaction, but a generic scheduler cannot atomically commit its attempt state with arbitrary external effects. Temporal's durable execution model and Cadence-style workflow histories help code resume after process failure, but activities still need idempotency or compensation. Dropbox ATF states the same contract directly: at-least-once callbacks, idempotent user code, and no concurrent task execution. That is a stronger product contract than vague exactly-once language because it tells users where the boundary is.
 
-## 17. Capacity protection and operations
+Cancellation uses the same protocol. Marking a run `CANCEL_REQUESTED` notifies the current owner. If the worker completes with the current epoch before the cancellation transition fences it, success may win. If cancellation increments the epoch first, later completion is stale. The API should expose this race rather than hiding it: cancellation is best effort until a terminal state is committed.
 
-Admission control rejects or delays workloads beyond tenant quotas. Per-handler circuit breakers can pause jobs when a dependency is failing, avoiding a retry storm. Backpressure should be visible as queue age and admission delay, not hidden as unbounded database/Redis memory growth. Operators need safe controls to pause a definition, drain a pool, reduce concurrency, quarantine a version, replay dead letters, and inspect every state transition.
+Signals worth watching: expired leases per pool, stale epoch rejections, completion-after-cancel races, heartbeat write latency, retry-after-side-effect incidents, and workers whose local execution time continues long after their lease is fenced.
 
-Deploy scheduler changes gradually because placement bugs have fleet-wide blast radius. Version worker protocols and allow mixed-version operation during rollout.
+> **Strong-answer criteria.** A senior answer must distinguish lease expiry from fencing, include a stale-worker sequence, and state clearly that downstream side effects need idempotency or their own fencing.
 
-## 18. Major trade-offs
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Use a lease expiration timestamp and trust workers to stop. | Paused or partitioned workers can resume and mutate state. |
+| Good | Require heartbeats and retry after missed heartbeats. | It detects likely failure but does not fence stale completions. |
+| Great | Use CAS state transitions, monotonically increasing epochs, stale mutation rejection, and downstream idempotency or fencing. | It preserves control-plane ownership and makes side-effect ambiguity explicit. |
 
-### At-least-once versus exactly-once execution
+### 6.3 Cron semantics and DAG workflows
 
-At-least-once survives worker ambiguity. Exactly-once external effects require cooperation from the destination, so expose stable idempotency keys and fencing instead of making an impossible promise.
+**Question.** A workflow has an hourly cron trigger, a daylight-saving transition, and a child task that depends on a parent succeeding. The scheduler was down for three hours. Which runs exist, and which children become ready?
+<details><summary>Answer</summary>
 
-### Push versus worker polling
+The answer must come from explicit schedule and workflow policy. Cron definitions declare time zone, daylight-saving behavior, and misfire policy such as skip, catch up, or coalesce. DAG children become ready only through durable, idempotent dependency-edge processing; if a required parent success can no longer happen, the child is blocked, skipped, or failed according to workflow policy.
 
-Push gives low latency and informed placement. Polling is simpler through firewalls and naturally applies backpressure. A long-lived worker stream with server offers combines both.
+</details>
 
-### Database timers versus timing wheels
+Cron looks simple until local time becomes part of the contract. A schedule such as `0 2 * * *` in `America/Los_Angeles` has days where 02:00 does not exist and days where an hour repeats. If the scheduler stores only the next UTC instant, users cannot tell whether the system skipped intentionally, fired twice intentionally, or did whatever the library happened to do. The definition should store the original expression, IANA time zone, daylight-saving policy, and a revision. The occurrence row should store the resolved `scheduled_for` instant and the local-time label that produced it.
 
-Database indexes are durable but expensive at high frequency. Timing wheels are efficient but volatile. Keep future truth in the database and cache only the near horizon.
+Misfire policy matters even more during outages. Google SRE's distributed cron chapter highlights that some jobs tolerate skipped launches better than duplicate launches. Payroll, billing, newsletters, and destructive maintenance are examples where fail-closed behavior may be safer than automatic catch-up. Other jobs, such as hourly metrics rollups, may need every missed occurrence. A third class can coalesce: if three hourly refreshes were missed, run once for the latest state. The scheduler should not make this a hidden global setting. It belongs on the schedule, and unsafe catch-up should require explicit opt-in.
 
-### Central versus decentralized scheduling
+The occurrence creation protocol is conditional. For each due local occurrence, the timer tries to insert `(job_id, scheduled_for)` with the schedule revision and policy result. If two timer owners race, one insert wins. If the policy says coalesce, the scheduler creates or updates a single catch-up run keyed by the coalescing window. If the policy says skip, it appends a state event explaining the skipped occurrence so users see an intentional decision rather than a missing row.
 
-Central schedulers optimize placement but can bottleneck. Partitioned schedulers by pool retain global policy within a manageable domain.
+Workflows add a separate state machine. A naive DAG engine keeps an in-memory count of unfinished parents and enqueues children when callbacks arrive. That fails when callbacks are duplicated, the engine restarts, or a parent reaches a terminal state that can never satisfy the edge condition. The durable model stores dependency edges and a child `remaining_dependencies` count. When a parent reaches `SUCCEEDED`, an edge consumer records that this parent-child edge was processed and conditionally decrements the child. When the counter reaches zero, the child transitions to `READY`. Duplicate parent completion events are harmless because the processed marker already exists.
 
-### Strict priority versus fairness
+Failure edges need equal care. If a child requires `SUCCESS` and the parent becomes `FAILED` after exhausting retries, the child should not sit forever with `remaining_dependencies = 1`. The workflow policy decides whether to mark it `BLOCKED`, `SKIPPED`, or `FAILED`, or whether to run a compensation path. A completion condition can also be `COMPLETION` rather than `SUCCESS` for cleanup tasks. This distinction is what turns a job scheduler into a workflow engine rather than a pile of callbacks.
 
-Strict priority can starve tenants. Weighted fair queues with reserved emergency capacity provide predictable isolation.
+```mermaid
+stateDiagram-v2
+    [*] --> WaitingForParents
+    WaitingForParents --> Ready: all required edges processed
+    WaitingForParents --> Blocked: required success impossible
+    WaitingForParents --> Skipped: workflow policy skips child
+    Ready --> Dispatched
+    Dispatched --> Running
+    Running --> Succeeded
+    Running --> RetryWait: retryable failure
+    RetryWait --> Ready: backoff elapsed
+    Running --> Failed: retry budget exhausted
+    Running --> Canceled
+```
 
-## 19. Lessons from production systems
+Long-lived workflows also need versioning. If handler `load:v2` is replaced by `load:v3` while a month-long workflow is in progress, replaying decisions against new code can change behavior. Cadence and Temporal popularized code-driven durable workflows with histories, signals, resets, and versioning APIs; the scheduler does not have to become a full durable execution runtime, but it should at least pin handler revisions for submitted runs and define how in-flight workflows migrate.
 
-### Dropbox ATF: callback contracts and no-concurrent-task ownership
+Netflix Maestro's experience is the cautionary tale for workflow state split across too many places. When authoritative state, engine-local state, and queues can disagree, the system produces stuck workflows and lost executions. This design keeps workflow truth in the job store and treats actors, caches, and queues as rebuildable. On restart, a workflow shard reloads active runs and dependency state from durable rows, not from whatever messages happened to remain in a queue.
 
-Dropbox's Async Task Framework was built for 10,000 tasks/second from the start, was serving about 9,000 scheduled tasks/second, and targeted 95% of tasks beginning within five seconds of their scheduled time. Its most transferable idea is the explicit user contract: at-least-once execution, idempotent callbacks, terminal-state signaling by user code, and no concurrent execution of the same task. This design should expose the same contract in the API and worker SDK instead of burying retries and fencing as implementation details.
+Signals worth watching: cron misfires by policy, skipped occurrence counts, duplicate occurrence insert conflicts, children blocked by failed dependencies, negative or inconsistent dependency counters, workflow shard reload time, and in-flight workflow revisions during deployments.
 
-### Slack: durable buffers prevent queue-memory deadlock
+> **Strong-answer criteria.** A senior answer must define cron local-time and misfire semantics, make occurrence creation idempotent, and model DAG dependencies as durable state transitions rather than callbacks.
 
-Slack's older Redis-backed queue failed badly when Redis filled: enqueue stopped, and even dequeue required enough memory to move jobs into an in-flight list. Slack inserted Kafka ahead of Redis through a stateless Kafkagate service, preserving application interfaces while adding a durable write buffer for bursts. This scheduler should treat bounded in-memory queues as dispatch accelerators only; accepted jobs need durable storage/logging before client acknowledgment, and queue age should trigger backpressure before memory exhaustion.
+| Level | Approach | Why |
+|---|---|---|
+| Bad | Store only the next UTC fire time and enqueue children from memory. | DST, outages, and restarts create invisible skips, duplicates, and stuck children. |
+| Good | Store cron time zones and dependency counters. | It improves correctness but still needs explicit misfire policy and idempotent edge processing. |
+| Great | Persist local-time policy, unique occurrences, skipped-run events, edge processed markers, failure propagation, and workflow versioning. | It makes calendar and DAG behavior explainable after failures. |
 
-### Meta FOQS: persistent priority queues with leases and active-topic discovery
+## 7. Variants
 
-FOQS is a sharded-MySQL, multitenant priority queue with namespace/topic isolation, `deliver_after`, lease duration, ack/nack, delayed redelivery, and active-topic discovery. Meta also uses prefetch buffers and in-memory ready indexes to avoid scanning every shard on dequeue. This maps directly to ready-queue partitions: keep priority/delay metadata durable, let consumers lease work, and use active partition/topic discovery so workers do not poll every possible queue.
+**10x scale.** At `1B` runs per day, the average creation rate is `1,000,000,000 / 86,400 = 11,574` runs per second and a 20x burst is about `231k` runs per second. The architecture stays the same, but every logical partition becomes many virtual partitions, ready queues move toward log-structured storage with aggressive batching, heartbeat writes must be coalesced, and tenant-level admission control becomes mandatory rather than protective. Search and history pipelines need asynchronous compaction because raw event volume would be about `1B × 20 × 300 = 6 TB` per day before replication.
 
-### Meta Async: delay tolerance, time shifting, and batching
+**Multi-region active-passive.** Keep each tenant's scheduling state in a home region replicated across zones, with asynchronous disaster recovery to another region unless the tenant pays the latency and availability cost of synchronous cross-region quorum writes. During failover, increment a regional epoch, stop accepting stale worker completions from the old region, rebuild ready queues from the job store, and disclose any acknowledged writes beyond the replication point. Active-active ownership of the same run is avoided because it turns lease fencing into a global consensus problem.
 
-Meta's Async platform moved beyond simple FIFO priority because large use cases and peak-hour load could starve smaller or more urgent work. It classifies work by delay tolerance and uses queues, time shifting, and batching to move tolerant work away from peaks while preserving urgent workloads. The scheduler should therefore make deadline/delay tolerance a first-class placement signal and expose coalescing/batching policies for tenants that can trade latency for efficiency.
+**Tenant with strict no-duplicate side effects.** For payroll-like jobs, configure cron misfires as skip or operator-reviewed catch-up, require downstream idempotency keys, and make retry budgets conservative. The scheduler can still be at least once internally, but product defaults should fail closed when duplicate external effects are worse than late execution. Google distributed cron's skipped-versus-duplicate framing belongs directly in this variant.
 
-### Airbnb Dynein: separate immediate queues from durable delayed scheduling
+**Workflow platform instead of job scheduler.** If users want Cadence or Temporal-style durable code execution, the job scheduler becomes the activity execution substrate, not the whole product. Add workflow histories, deterministic replay rules, signals, queries, reset points, and versioning APIs. The attempt, lease, queue, and worker placement machinery stays useful, but orchestration decisions move into a durable workflow engine.
 
-Airbnb's Dynein wraps SQS for immediate jobs and uses a separate delayed scheduler for jobs that may be months or years in the future, with an inbound SQS queue buffering scheduler ingestion spikes. This supports the database-plus-near-horizon timing-wheel split: durable future triggers remain in a scheduler store, immediate execution uses queue semantics, and an inbound buffer smooths write spikes without losing jobs.
+## 8. The transferable pattern
 
-### Google distributed cron: prefer fail-closed for non-idempotent schedules
+This system has the same reusable shape as many reliable asynchronous systems: commit intent first, publish reconstructable hints second, let workers lease work, and make every externally visible mutation conditional on a version or fencing token. The queue is not the truth; it is a fast way to discover work whose truth lives somewhere more durable. That pattern also appears in ticket inventory reservations, payment outboxes, webhook delivery, and notification fan-out; see [Ticketmaster](./ticketmaster-system-design.md) for another design where leases and expiration protect scarce resources.
 
-Google SRE's distributed cron chapter emphasizes that some cron jobs tolerate skipped runs but not double launches, such as payroll or newsletters. Their lesson is to track launch state consistently and often prefer skipping over duplicate launch when ambiguity remains. This design should require explicit misfire and idempotency policy per cron definition, with operator-visible skipped launches rather than automatic duplicate catch-up for unsafe jobs.
+The second transferable lesson is honesty about boundaries. A scheduler can provide durable orchestration and no-concurrent ownership in its own state machine, but external side effects require cooperation from the external system. When that cooperation is unavailable, the product should expose policy choices: skip, retry, coalesce, compensate, or ask an operator. Pretending every failure can be hidden behind exactly-once language is how systems create duplicate charges, duplicate emails, and mysterious stuck workflows.
 
-### Netflix Maestro: keep authoritative state single and rebuild fast caches
+## Review
 
-Netflix redesigned Maestro's engine after dual state in Conductor tables plus Maestro tables and external queues created race conditions, stuck jobs, and lost executions. The new engine keeps the database as source of truth, rebuilds in-memory flow state after failure, partitions flow groups, and uses generation IDs for ownership. This reinforces the design choice that queues, heaps, and actor state are caches; the database must be sufficient to rebuild ownership and continue workflows safely.
+The design starts from the binding constraint: jobs must be durably attempted at their intended time without concurrent ownership, while arbitrary side effects remain at least once. That forces an authoritative job store, transactional outbox, reconstructable ready queues, bucketed timer shards, conditional occurrence creation, attempt leases, fencing epochs, and explicit idempotency keys. Scale estimates point to the real pressure points: calendar bursts, hot due-time ranges, large event history, and heartbeat volume. Cron and DAG support are treated as durable state machines with declared policies for DST, misfires, dependency failure, and workflow versioning. The resulting architecture is less about a clever queue and more about making every ambiguous failure recoverable, explainable, and fenced.
 
-### Uber Cadence: code-driven durable workflows need versioning and operations
+### Check your understanding
 
-Uber Cadence treats workflows as code in native languages, adding schedules, signals, cancellation, retries, searchable attributes, UI inspection, rate limits, hot-shard detection, failover, resets, versioning, and replay/shadow testing. For this scheduler, DAG support should not stop at dependency counters: long-lived workflows need version-safe replay, operator reset from a safe point, searchable checkpoints, and compatibility rules for in-flight runs during deployments.
+1. Why are ready queues treated as reconstructable hints rather than the source of truth?
+   <details><summary>Answer</summary>
 
-### Temporal: durable execution is an application model, not exactly-once side effects
+   A queue can drop, duplicate, reorder, or become unavailable during bursts. If accepted jobs live only in the queue, a queue failure can lose work or block recovery. Keeping the job store authoritative lets a reconciler rebuild ready messages and lets consumers ignore obsolete duplicates by re-reading current state.
 
-Temporal frames durable execution as crash-proof progress by virtualizing execution across process failures. That is useful for workflow code, but it does not eliminate the need for idempotent activities and external side-effect coordination. This scheduler should distinguish durable orchestration state from side-effect correctness: it can reliably resume a workflow decision, but handlers still need idempotency keys, transactional inbox/outbox patterns, or fenced downstream writes.
+   </details>
 
-### Google Borg: placement is an optimization and isolation problem
+2. Why does a lease expiration timestamp not by itself prevent concurrent execution?
+   <details><summary>Answer</summary>
 
-Borg runs hundreds of thousands of jobs across clusters up to tens of thousands of machines, combining admission control, task packing, overcommitment, machine sharing, and process-level isolation. A job scheduler at this scale should not only dequeue work; it must model resource requests, pack tasks to reduce fragmentation, spread correlated failures, and expose simulation/analysis tools before changing fleet-wide placement policy.
+   Expiration lets the scheduler decide when to retry, but it does not stop the old worker from resuming after a pause or partition. A monotonically increasing fencing epoch is needed so stale heartbeats and completions are rejected, and downstream systems need idempotency or their own fencing for side effects.
 
-## 20. Recommended interview presentation
+   </details>
 
-A clear 45-minute sequence is:
+3. What design consequence follows from `10M` cron definitions with `1M` due at 09:00?
+   <details><summary>Answer</summary>
 
-1. Clarify job types, latency, retry semantics, and side-effect guarantees.
-2. Estimate run/transition rates, concurrent attempts, and burst patterns.
-3. Draw the authoritative store, outbox, ready queues, schedulers, and workers.
-4. Walk through submission, dispatch, heartbeat, completion, and retry.
-5. Deep-dive into cron timers and fencing tokens.
-6. Explain idempotency and why execution is at least once.
-7. Cover fair scheduling, dependency counters, and reconciliation.
-8. Finish with regional failover, sandboxing, and trade-offs.
+   A global `next_fire_time <= now` scan would create a hot range. The scheduler needs time buckets plus hash shards, leased timer ownership, near-horizon caches, and partitioned ready queues so due work is spread before the burst arrives.
 
-The central design insight is:
+   </details>
 
-> Keep job state authoritative in a strongly consistent store, use queues as rebuildable dispatch accelerators, and combine renewable leases with monotonically increasing fencing epochs so failures can cause retries without allowing stale owners to mutate state.
+4. When should a missed cron occurrence be skipped instead of caught up?
+   <details><summary>Answer</summary>
 
-## Further reading: curated engineering blogs
+   It should be skipped when a duplicate or late external effect is worse than a missing run, such as payroll, billing, or one-time newsletters. The schedule definition should declare this misfire policy, and skipped occurrences should be recorded as visible events.
+
+   </details>
+
+5. Why does a DAG child need durable dependency-edge processing instead of an in-memory callback from its parent?
+   <details><summary>Answer</summary>
+
+   Parent completion messages can be duplicated, lost, or replayed after a workflow engine restart. A processed marker per edge and a conditional decrement of `remaining_dependencies` make readiness idempotent and allow failure policies to mark children blocked or skipped when required success becomes impossible.
+
+   </details>
+
+## Sources and further reading
 
 | Source | Article | Why it matters |
 |---|---|---|
