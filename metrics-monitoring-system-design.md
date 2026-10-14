@@ -120,7 +120,8 @@ Block
 
 Rollup
 - series_id, resolution, window_start, count, sum, min, max
-- first_value, last_value, counter_increase, reset_count, histogram_sketch
+- first_value, first_timestamp, last_value, last_timestamp
+- counter_increase, reset_count, gap_markers, histogram_buckets_or_sketch, input_revision
 
 AlertRule
 - tenant_id, rule_group_id, rule_id, revision, expression, interval, for_duration
@@ -201,8 +202,8 @@ flowchart TD
     QP --> R["Reducers and cache"]
     UI["Dashboards"] --> QF
     AE["Rule evaluators"] --> QF
-    AE --> AS[("Alert state store")]
-    AE --> AM["Alert Manager"]
+    AE --> AS[("Fenced alert state and outbox")]
+    AS --> AM["Alert Manager"]
     AM --> N["Pager, chat, email"]
 ```
 
@@ -242,9 +243,11 @@ stateDiagram-v2
 
 The publication protocol matters more than the object format. A worker writes all chunk and index objects under content-addressed or unique temporary object keys, verifies checksums, and only then publishes a manifest record. Readers discover blocks through manifests, never by listing objects. If the worker crashes halfway through upload, no manifest points at the partial block. If compaction creates a bad output, the input blocks remain referenced until the manifest swap succeeds and a retention window passes, so rollback is possible.
 
+The manifest must also record recoverable input offsets. Advancing a consumer offset after a local WAL append does not permit deleting the replicated log: log retention must cover all accepted samples until durable blocks or replicated recovery state cover those offsets. Head-to-block handoff uses an explicit coverage boundary so readers neither miss samples nor count both copies; replicas of the same series are deduplicated rather than summed. Compaction conditionally replaces the exact input-manifest revision, and readers pin that revision until completion. Late correction blocks invalidate affected rollups, including adjacent counter boundaries, before those rollups can claim to include the correction.
+
 Compaction has two jobs that fight each other. It improves query performance by reducing the number of blocks touched for a time range, and it reduces cost by creating downsampled data for older windows. But compaction can also create write amplification and recovery delays. Pinterest's Goku experience is a useful warning: bootstrap and recovery bandwidth can dominate availability when many hosts try to reload large in-memory datasets from shared storage. This design therefore treats WAL replay length, block-download concurrency, and head warm-up time as capacity metrics. A node should be able to rebuild a shard from recent blocks plus bounded log replay within the freshness SLO, or the shard is too large.
 
-Late and out-of-order data complicate the clean block story. A small out-of-order window can be buffered in the head and merged before block cut. Data that arrives after a block is published should go to a small correction block or be rejected according to policy; rewriting old blocks on every late sample would make object storage behave like a database. For counters, corrections are especially sensitive because a reset-aware rate over a window depends on first and last values and reset boundaries.
+Late and out-of-order data complicate the clean block story. A small out-of-order window can be buffered in the head and merged before block cut. Enforce supported timestamp/retention limits before durable acceptance; once accepted, a late sample must survive replay even if its block closes while ingestion lags. Use correction blocks rather than silently rejecting acknowledged data or rewriting old objects on every late sample. For counters, corrections also affect neighboring rate boundaries and derived rollups.
 
 Signals worth watching: ingest-log lag, WAL replay duration, head memory by tenant and shard, block cut latency, compaction backlog, object upload failures, compression ratio, and the age of the oldest unpublished block.
 
@@ -269,21 +272,24 @@ The inverted index is what makes dimensional metrics useful. A query such as `su
 
 The naive fix is to scale storage. That misses the failure. A cardinality explosion is not just more bytes; it is more active objects. A billion stable series sampled every 15 seconds can be sharded and compressed. A metric that creates a new series per request makes the active set churn so fast that the head cannot compact efficiently, the catalog cannot keep up, and query planning becomes a metadata scan. Grafana Mimir's billion-active-series testing is instructive because it showed how much CPU and memory are needed even for controlled high cardinality; default redundancy can turn 1 billion logical active series into 3 billion ingested series before long-term deduplication. Accidental cardinality deserves admission control, not heroic storage scaling.
 
-The system treats series creation as a governed operation. Metric descriptors can define allowed labels, denied labels, owner, expected type, max series, and max new label values per hour. The gateway computes the canonical label set, looks up or creates the series through a catalog admission path, and allocates head memory only after the catalog approves. If the series exists, ingestion can continue even when the tenant is temporarily over a new-series budget. If it is new and violates policy, the gateway rejects it or applies a predeclared relabel rule such as dropping `pod_uid` or normalizing a path template.
+The system treats series creation as a governed operation. Metric descriptors can define allowed labels, denied labels, owner, expected type, max series, and max new label values per hour. The gateway computes the canonical label set, looks up or creates the series through a catalog admission path, and allocates head memory only after the catalog approves. Admission atomically consumes the relevant quotas with series creation, or uses bounded preallocated quota grants; concurrent gateway checks alone can oversubscribe the limit. If the series exists, ingestion can continue even when the tenant is temporarily over a new-series budget. If it is new and violates policy, the gateway rejects it or applies an approved relabel rule only if that preserves series identity. Dropping a distinguishing label from independent counters does not aggregate them: it can create conflicting same-timestamp values or interleave resets. Combine such sources explicitly, reset-aware and before dropping identity, or reject them.
 
 ```mermaid
 sequenceDiagram
     participant Agent
     participant Gateway
     participant Catalog
+    participant Log as Replicated ingest log
     participant Head
     participant Owner as Metric owner
     Agent->>Gateway: "write batch with labels"
     Gateway->>Gateway: "sort, normalize, hash labels"
     Gateway->>Catalog: "lookup or admit series"
     Catalog-->>Gateway: "known series_id"
-    Gateway->>Head: "append sample"
+    Gateway->>Log: "append admitted samples"
+    Log-->>Gateway: "quorum durable"
     Gateway-->>Agent: "202 accepted"
+    Log->>Head: "ingest worker replays samples"
     Gateway->>Catalog: "admit new high-cardinality series"
     Catalog-->>Gateway: "reject: label growth limit"
     Gateway-->>Agent: "429 or 400 with rejected series count"
@@ -294,7 +300,7 @@ The response code depends on policy. A syntactically invalid label or denied lab
 
 The index itself should be partitioned by tenant and label space, with compressed postings lists and caches for hot matchers. High-cardinality labels are not always wrong. A Kubernetes `pod` label or customer shard label may be necessary for debugging. The governance question is whether the label has bounded lifecycle ownership and whether queries need it. Cloudflare's Prometheus operations emphasize metric ownership and lifecycle control for exactly this reason. Datadog's architecture separates point storage from tag indexing because tag lookup has different scaling behavior than appending samples. Uber's M3 makes retention and rollup policies first-class so expensive dimensionality can be managed by policy rather than one global knob.
 
-There is a trade-off between rejecting, rewriting, and aggregating. Rejecting preserves backend health but loses some data. Rewriting labels, such as templating `/users/123` to `/users/:id`, preserves aggregate signal but can hide a debugging dimension. Pre-aggregation at the agent or gateway can keep totals while refusing per-user series, but it changes query semantics. The safest design makes these choices explicit per metric descriptor and owner, with defaults that reject unbounded dimensions.
+There is a trade-off between rejecting, rewriting, and aggregating. Rejecting preserves backend health but loses some data. Templating paths at instrumentation time before recording observations can retain an aggregate signal while removing a debugging dimension. Relabeling already-emitted independent series is not the same operation; it needs explicit type-aware aggregation to avoid collisions. The safest design makes these choices explicit per metric descriptor and owner, with defaults that reject unbounded dimensions.
 
 Signals worth watching: active series by tenant and metric, new series per minute, top labels by value count, postings-list memory, catalog admission latency, rejected new series, series churn, and queries that match unusually many postings.
 
@@ -321,7 +327,9 @@ The naive query path lets every request use the same pool. It works until a user
 
 Rollups are where many metrics systems lie accidentally. A gauge can often be downsampled with count, sum, min, and max. A counter cannot be downsampled safely by averaging raw values because counters reset, wrap, and jump. A correct rollup for counters stores reset-aware increase over the window, first value, last value, reset count, and enough boundary information to combine adjacent windows. Histograms need bucket or sketch data that can be merged; storing only p95 for each minute cannot produce a correct p95 for an hour because percentiles are not generally composable.
 
-For example, a 5-minute rollup for `requests_total` should not store only the last counter value. If a process restarts halfway through the window, the rate over that window is the sum of positive deltas before and after the reset, not `last - first`. When combining twelve 5-minute windows into an hour, the query engine can sum `counter_increase` values and divide by elapsed time, while checking boundary gaps and reset metadata. That is why retention policy is part of the data model, not a background compression trick.
+For a nonnegative counter that resets to zero, define an observed pair contribution as `b - a` when `b >= a`, and `b` when `b < a`. For samples `100, 110, 5, 15`, the observed increase is `10 + 5 + 10 = 25`, not just the sum of positive differences (`20`). Unobserved increments before the reset cannot be recovered. Each rollup stores contributions strictly between its own samples, plus first/last values and timestamps. Merging windows adds each cross-window pair once: `[100,110]` and `[120,130]` contain internal increases `10 + 10`, but need the boundary `120 - 110 = 10` to recover `30`. A reset across that boundary uses the same reset rule. Empty windows and staleness markers must preserve gaps rather than imply continuous observation.
+
+These summaries support aligned observed-increase queries, not every raw PromQL query exactly. Prometheus `rate` and `increase` also extrapolate to range boundaries; arbitrary sub-window queries, `irate`, and staleness-sensitive expressions may need raw samples or must return explicitly approximate/unsupported results after raw retention expires. Apply reset handling per source series before aggregating across sources. Cumulative histogram snapshots likewise need reset-aware bucket/count/sum differences before merging across time; summing cumulative snapshots double-counts observations. Only compatible bucket schemas or explicitly compatible sketches can merge, with their approximation documented. Gauge `sum/count` gives a sample-weighted average, not automatically a time-weighted one.
 
 ```mermaid
 flowchart LR
@@ -336,13 +344,13 @@ flowchart LR
     R --> M["Reducer"]
     M --> U
     M --> E
-    E --> A[("Alert state store")]
-    E --> N["Alert Manager"]
+    E --> A[("Fenced alert state and outbox")]
+    A --> N["Alert Manager"]
 ```
 
-Alert evaluation has a lifecycle independent of query serving. Rule groups are assigned to evaluators by tenant and group ID. An evaluator holds a renewable lease with a fencing token; if it pauses past the lease and another evaluator takes over, stale writes from the old evaluator are rejected. The evaluator stores `pending_since`, `last_success_at`, and the rule revision durably. That protects `for` semantics across restarts. Without durable pending state, a 10-minute alert might never fire if the evaluator restarts every nine minutes.
+Alert evaluation has a lifecycle independent of query serving. Rule groups are assigned to evaluators by tenant and group ID. An evaluator holds a renewable lease with a fencing token; if it pauses past the lease and another evaluator takes over, stale writes from the old evaluator are rejected. The evaluator stores `pending_since`, `last_success_at`, and the rule revision durably. A restart retains pending progress only if no scheduled evaluation was lost beyond a documented scheduling-jitter allowance. This design resets pending continuity on a query error or missed evaluation beyond that allowance, preserves already-firing incidents as unknown rather than resolved, and raises evaluator-health signals. Rule revisions that change semantics reset pending state. Persisting `pending_since` alone is not proof that a condition held throughout an outage.
 
-Notification delivery is at-least-once. Alert Manager deduplicates by alert fingerprint, groups related alerts, applies silences and inhibition, and retries receiver calls with stable notification IDs. Exactly-once paging through external chat and pager APIs is not realistic, so receivers must tolerate duplicates. The stronger guarantee is that the monitoring system will not intentionally send notifications from two alert owners at once; fencing and single-owner leases provide that.
+Notification delivery is at-least-once. A fenced transaction stores each alert-state transition and a notification outbox record together; evaluators never send directly after an unfenced state read. Alert Manager accepts only those committed transitions, rejects stale transition revisions, deduplicates by alert fingerprint, groups, silences, inhibits, and retries with stable notification IDs. This closes the crash gap between saving firing state and notifying. A state-store fence cannot revoke an external call already in flight, so owner changes can still overlap delivery attempts; external receivers must deduplicate where supported. Leases alone do not guarantee exactly-once or non-overlapping pages.
 
 Degradation policy should be explicit. Dashboards may show partial data with warnings when one historical shard is slow. Alerts should usually fail closed for monitoring-system errors: an evaluation error increments an alerting-health metric and can page the platform team if it persists. Absence alerts need special care because missing samples can mean the service is down, the agent is disconnected, the ingest path is delayed, or the query path is broken. Good absence alerts include freshness checks from the ingest log and head, not only a query that returns an empty vector.
 
@@ -360,7 +368,7 @@ Signals worth watching: query fan-out width, samples decoded per query, alert ev
 
 **10x scale.** At 10 billion active series and roughly `10B ÷ 15 = 666.7M` samples per second, the architecture stays recognizable but the isolation becomes stricter. Large tenants get dedicated ingest cells, catalog partitions, and query schedulers. Shuffle sharding limits blast radius. Agents perform more pre-aggregation, metric descriptors are required before new high-volume metrics launch, and global dashboards rely heavily on recording rules and rollups rather than raw fan-out.
 
-**Multi-region active-active.** Agents write to the nearest healthy region, and critical tenants may dual-write with the same batch IDs. Query frontends prefer local data and federate missing regions through a tree. Alert notifications still need single-owner semantics: a consensus-backed lease chooses one alerting region per tenant or rule group, with fencing tokens preventing duplicate pages during partitions. Ingestion favors availability; paging favors a single writer.
+**Multi-region active-active.** Agents write to the nearest healthy region, and critical tenants may dual-write with the same batch IDs. Query frontends prefer local data and deduplicate replicated samples when federating regions. A consensus-backed lease fences alert-state and outbox commits per rule group; committed notification IDs handle delivery retries but cannot prevent every duplicate external page during partitions. Ingestion favors availability; alert-state transitions favor a single writer.
 
 **Regulated regional residency.** Some tenants cannot move raw labels or samples across regions. The same head, block, and catalog design is deployed per region, but global queries can only use approved aggregates or anonymized rollups. Alert rules that include regulated labels run inside the region, and notification payloads are filtered so labels do not leak into external systems.
 
@@ -425,3 +433,4 @@ The design starts from the fact that metrics ingestion is write-heavy but cardin
 | Datadog | [Evolving our real-time timeseries storage again: Built in Rust for performance at scale](https://www.datadoghq.com/blog/engineering/rust-timeseries-engine/) | Describes separating real-time point storage from tag indexing and redesigning the hot engine for high-cardinality, bursty workloads. |
 | Pinterest | [Improving Efficiency Of Goku Time Series Database at Pinterest (Part — 1)](https://medium.com/pinterest-engineering/improving-efficiency-of-goku-time-series-database-at-pinterest-part-1-7659b94796f4) | Highlights short-term/long-term storage separation, compaction, smart routing, and recovery-time bottlenecks. |
 | Cloudflare | [How Cloudflare runs Prometheus at scale](https://blog.cloudflare.com/how-cloudflare-runs-prometheus-at-scale/) | Gives operational lessons from hundreds of Prometheus instances, billions of series, and practical cardinality governance. |
+| Prometheus | [Query functions](https://prometheus.io/docs/prometheus/latest/querying/functions/) | Defines counter reset handling, rate extrapolation, histogram behavior, and rate-before-aggregation semantics. |

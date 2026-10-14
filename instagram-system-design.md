@@ -83,7 +83,7 @@ Publish is a second transaction because a post is a social object, not just a fi
 
 Read APIs use cursors instead of offsets. A feed can change between page one and page two because new posts arrive, ranking features update, and deletions happen. The cursor encodes a signed feed session, candidate watermark, last score and ID, model version, served-ID-set reference, and expiration. It does not grant access; each page still filters blocks, deletion, private-account state, age/regional policy, and story expiration before issuing media URLs.
 
-Delete APIs create tombstones and invalidation events. They cannot synchronously purge every CDN edge and feed inbox before responding. The promise is stronger where it matters: canonical metadata immediately denies URL renewal and read hydration, while asynchronous workers remove stale projections and issue emergency CDN purge for severe policy takedowns.
+Delete APIs create tombstones and invalidation events. They need not synchronously purge every byte cache or feed inbox, but access revocation must fence the serving authorization path before success is reported. Canonical metadata denies hydration and token renewal, and the edge rejects new byte requests under revoked grants as described below. Purging cached objects is asynchronous cleanup, not the authorization mechanism. Content already downloaded, and requests authorized before the fence, cannot be recalled.
 
 ## 4. Data model
 
@@ -105,7 +105,7 @@ FollowEdge(follower_id, followee_id, state, created_at, version)
 BlockEdge(blocker_id, blocked_id, created_at)
 
 MediaAsset(media_id, owner_id, upload_id, source_object_key, state,
-           width, height, duration_ms, content_hash, policy_state, version)
+           width, height, duration_ms, content_hash, policy_state, version, reference_count)
 MediaRendition(rendition_id, media_id, format, width, height, bitrate,
                object_key, checksum, storage_tier, created_at)
 
@@ -146,7 +146,7 @@ The client uploads bytes directly to object storage through presigned, resumable
 
 ### Fix 2: Immutable media delivery through cache hierarchy
 
-Derived media objects are immutable and versioned, so clients and CDNs can cache them aggressively. Public media uses long shared TTLs. Private media uses short-lived signed URLs or edge-validated cookies, but the bytes still come from CDN where possible. Facebook's photo stack measured browser, edge, origin, and Haystack layers, with only a small fraction of requests reaching backend storage. That lesson changes the design goal: optimize cache hit ratio and origin shielding before adding more storage servers.
+Derived media objects are immutable and versioned, so CDN object caches can use long shared TTLs independently of access grants. Even currently public media needs an edge policy gate if it can later become private or be taken down. Private media additionally requires a viewer-scoped grant. Short-lived signatures limit exposure but do not alone revoke existing URLs. Facebook's photo caching work motivates cache hierarchy and origin shielding; the authorization protocol here is this design's proposal, not an attribution to that stack.
 
 ### Fix 3: Sharded metadata with an outbox
 
@@ -158,7 +158,7 @@ Ordinary authors are pushed into follower inboxes because it makes read latency 
 
 ### Fix 5: Final authorization before media URL issuance
 
-Every read path hydrates canonical metadata before returning a playable media URL. The checks include post deletion, moderation state, account status, follow state, block state, story expiration, close-friends membership, and regional policy. A stale feed inbox entry may waste CPU, but it must not leak bytes. On uncertainty for private media, the system fails closed.
+Every read path hydrates canonical metadata before returning a playable media URL. The checks include post deletion, moderation state, account status, follow state, block state, story expiration, close-friends membership, and regional policy. The CDN repeats grant/policy validation before serving bytes, including cache hits; direct origin access is denied. A stale inbox reference or copied URL is not proof of current access. On uncertain authorization, serving fails closed.
 
 ### Putting it together
 
@@ -204,7 +204,7 @@ There is no published post. Upload completion creates a `MediaAsset` in `PROCESS
 
 The tempting design is to let `POST /posts` accept a file and publish as soon as the upload finishes. That works for small photos in a toy system, but video breaks it. A 25 MB mobile upload can pause for minutes, transcode can take longer than the request timeout, decoders can crash on malformed files, and safety classifiers can reach a different decision than the MIME type suggests. If the post becomes visible before this work completes, followers can request media that does not exist, see unmoderated content, or cache a rendition that later should never have been served.
 
-The production mechanism is a small state machine around `MediaAsset`: `INITIATED -> UPLOADING -> UPLOADED -> PROCESSING -> READY` or `REJECTED`. Upload URLs are scoped to one user, one upload session, byte ranges, content length, and expiration. Completion verifies every part checksum and the total hash before moving to `UPLOADED`. The workflow consumes an outbox event, probes the file, strips unsafe metadata, normalizes orientation, creates deterministic rendition keys, computes perceptual hashes, and runs safety classifiers. Each job is idempotent: writing `media/{media_id}/{version}/w640.avif` twice with the same checksum is harmless, and a compare-and-set on `MediaAsset.version` prevents an older retry from overwriting a newer rejection.
+The production mechanism is a small state machine around `MediaAsset`: `INITIATED -> UPLOADING -> UPLOADED -> PROCESSING -> READY` or `REJECTED`. Upload URLs are scoped to one user, session, part, size, and expiration. Completion verifies parts and total checksum, pins an immutable source object version, and commits `UPLOADED` with its workflow outbox event. A still-valid upload URL must not overwrite the source that was scanned. The workflow probes, normalizes, creates renditions, and runs safety classifiers. Outputs use write-once versioned or content-addressed keys, so a stale worker cannot overwrite published bytes; metadata CAS on the attempt/version rejects stale success reports. Deterministic naming alone does not make nondeterministic encoders safe to retry.
 
 ```mermaid
 stateDiagram-v2
@@ -214,13 +214,13 @@ stateDiagram-v2
     UPLOADED --> PROCESSING: "Workflow claimed"
     PROCESSING --> READY: "Renditions and policy pass"
     PROCESSING --> REJECTED: "Transcode or safety fails"
-    READY --> ATTACHED: "Post commit references media"
-    READY --> EXPIRED: "Unattached draft timeout"
+    READY --> READY: "Atomic publish adds reference"
+    READY --> EXPIRED: "Timeout and reference_count is zero"
+    READY --> REJECTED: "Later policy denial"
     REJECTED --> [*]
-    ATTACHED --> [*]
 ```
 
-Publication is then a conditional metadata transaction, not a media operation. The post service reads the media rows with a consistency level strong enough for the owner to observe the latest state, verifies `owner_id = author_id`, `state = READY`, `policy_state = ALLOW`, and `not expired`, then commits `Post`, `PostMedia`, idempotency, and an outbox event. A minimal image rendition or low video ladder can make the asset ready while premium variants continue, but the allowed set must be explicit: a post should never point to the unvalidated source object as a fallback.
+Publication is then a conditional metadata transaction, not a media operation. It locks or conditionally updates every referenced media row, checks ownership, `READY`, `ALLOW`, and draft expiry, adds durable references, and commits `Post`, `PostMedia`, idempotency, and outbox together. Expiration and policy updates serialize on those same rows; a strong read followed by a separate post insert would still race draft GC. Keep these rows in the author's transactional shard or use a real distributed transaction. Story publication follows the same protocol. Readiness and attachment are separate: an asset can remain `READY` while referenced by both a post and a story, and expiration requires zero references. A validated minimal rendition may permit publication before premium variants finish; the unvalidated source is never a serving fallback.
 
 Failure modes are mostly about races. The user may delete a draft while processing is running; processors should still finish or stop safely, but a final compare-and-set should not resurrect an expired asset. The workflow may publish output and crash before updating state; a retry sees deterministic output keys and continues. A moderation model may later reclassify the media; that creates a policy update event and invalidates serving, but it does not mutate cached bytes. A client may reuse an idempotency key with different media IDs; the idempotency table must reject the mismatch.
 
@@ -249,7 +249,7 @@ The naive storage design treats each thumbnail, photo, poster, and video segment
 
 Facebook's Haystack lesson is that photo-serving systems can drown in metadata operations. Haystack packed many photos into large append-only files and kept tiny offset metadata in memory, avoiding repeated filesystem metadata lookups. An Instagram-like system does not need to literally copy that implementation if it uses modern object storage, but it should preserve the shape: immutable blobs, compact indexes, checksums, tombstones, and compaction. Small renditions should not require expensive per-file metadata work on every miss.
 
-The serving path is a hierarchy. The app returns a rendition manifest and an authorization token; the client asks its local cache, then an edge CDN, then a regional origin cache, then hot media storage, and only then warm storage. Facebook's photo caching work measured exactly why this matters: most requests should be absorbed before they reach backend storage. For public immutable media, object URLs can carry long TTLs because edits create new metadata or new media versions rather than mutating bytes. For private media, the cache key should represent the encrypted or immutable object, while authorization is short-lived and checked at the edge or before URL issuance.
+The serving path is a hierarchy. The app returns a rendition manifest and grant; the client asks its local cache, edge CDN, regional origin cache, hot storage, then warm storage. Facebook's photo caching work motivates absorbing most requests before backend storage. Long CDN object TTLs are separate from grant validity: the edge checks access before using a shared immutable-object cache key. Bytes already in a viewer's local cache are outside server revocation control.
 
 ```mermaid
 flowchart LR
@@ -263,7 +263,7 @@ flowchart LR
 
 Hot-to-warm tiering follows media lifecycle. New uploads, recent posts, and viral media stay in hot replicated storage because they need high read throughput and low tail latency. Cooled originals and old renditions move to erasure-coded warm storage. Facebook's f4 warm BLOB system showed that immutable blobs can be stored more cheaply with erasure coding while preserving user-visible reads. The handle seen by metadata does not change; only the storage tier behind it changes. A cache miss for warm media may be slower, but the CDN can refill and shield repeated reads.
 
-Private media creates the hardest trade-off. If every private photo is served through the app tier, correctness is easy and bandwidth cost is terrible. If private photos use public long-lived URLs, cost is good and privacy is terrible. The middle ground is short-lived signed URLs or cookies, edge authorization, and final metadata checks before issuing or refreshing tokens. A leaked URL expires quickly and can be scoped to a rendition class. For severe takedowns, the metadata service immediately denies renewal and a purge pipeline removes hot CDN entries, but normal deletion does not wait for every edge to confirm before the UI hides the post.
+Private media creates the hardest trade-off. Issuance-time authorization and short-lived signed URLs alone leave a replay window after removal; CloudFront's documented signature expiry, for example, is not a check of this application's follow graph. To meet this design's stronger promise, bind grants to viewer, resource, and authorization versions, cap story grants at `expires_at`, and validate them on every byte request at the edge. The edge uses the current authorization authority or a registered revocable lease; a revocation fences lease holders or waits for their leases to expire before reporting enforcement, and disconnected holders stop serving at lease expiry. Origins accept requests only from this protected path. Purges reclaim caches but cannot substitute for access checks, because an old URL could refill a purged object. This is a proposed protocol, not a claim that ordinary CDN signatures implement it.
 
 Deletion is also a metadata-first operation. The post is tombstoned, URL renewal stops, search/feed projections are invalidated, and media enters a conservative garbage-collection workflow. Physical bytes are deleted only after checking references from posts, stories, drafts, archives, messages, legal holds, and safety retention. Derived renditions are regenerable; originals may have stricter retention or export requirements.
 
@@ -282,7 +282,7 @@ Signals worth watching: CDN hit ratio by surface, origin cache hit ratio, warm-s
 **Question.** A private account removes a follower after a post was already copied into that follower's feed inbox. Can the follower still open the media?
 <details><summary>Answer</summary>
 
-No. Feed inbox entries are only candidate references. The read path hydrates canonical post and graph metadata, sees that the follow edge is no longer active or a block exists, and suppresses the item without issuing a media URL.
+Newly authorized reads are denied after the removal fence. The feed suppresses the stale reference, and the edge rejects reuse of an older grant under the revoked relationship version. Issuance-time checks alone would not stop replay of a previously issued URL. Already downloaded bytes cannot be recalled.
 
 </details>
 
@@ -426,3 +426,6 @@ The design starts from the constraint that media bytes dominate cost while metad
 | Meta Engineering | [How Instagram suggests new content](https://engineering.fb.com/2020/12/10/web/how-instagram-suggests-new-content/) | Covers suggested-post seed selection, cold start, value models, and “Feels Like Home” constraints. |
 | Meta Engineering | [Journey to 1000 models: Scaling Instagram’s recommendation system](https://engineering.fb.com/2025/05/21/production-engineering/journey-to-1000-models-scaling-instagrams-recommendation-system/) | Shows model registry, launch automation, criticality, and stability SLOs for large ML fleets. |
 | Meta Engineering | [Introducing Immortal Objects for Python](https://engineering.fb.com/2023/08/15/developer-tools/immortal-objects-for-python-instagram-meta/) | Explains Instagram's Python/Django serving model and memory-efficiency work at scale. |
+| AWS | [CloudFront signed URLs](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-signed-urls.html) | Defines signature validity and request-time expiry; does not provide application relationship revocation. |
+| AWS | [Restrict access to an S3 origin](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html) | Prevents direct origin requests from bypassing the CDN access path. |
+| AWS | [Uploading objects with presigned URLs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/PresignedUrlUploadObject.html) | Warns that a PUT can replace an existing key, motivating immutable source versions and write-once published outputs. |

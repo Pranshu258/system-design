@@ -10,7 +10,7 @@ A distributed job scheduler accepts work that should run now, later, on a recurr
 - Dispatch ready jobs to heterogeneous workers while respecting tenant quotas, worker capacity, pool labels, and rate limits.
 - Provide run status, attempt history, progress, cancellation, manual retry, dead-lettering, and searchable metadata.
 - Guarantee that an accepted job is durably recorded and will be attempted at least once unless explicitly canceled or blocked by policy.
-- Ensure a single logical job run is not intentionally executed by two active workers at the same time, even when schedulers or workers crash.
+- Give each logical run at most one valid control-plane owner; reject stale workers' state updates even when attempts physically overlap after a pause or partition.
 - Define cron behavior precisely for time zones, daylight-saving transitions, misfires, catch-up, and skipped occurrences.
 
 ### 1.2 Non-functional requirements
@@ -24,7 +24,7 @@ A distributed job scheduler accepts work that should run now, later, on a recurr
 
 ### 1.3 The binding constraint
 
-The binding constraint is that a job must run at its intended time, at least once, and never concurrently with itself, across worker crashes and network partitions, while exactly-once external side effects are impossible for the scheduler to guarantee. If a worker charges a credit card and dies before reporting success, the scheduler cannot know whether retrying repeats the charge. If it does not retry, it can lose the job. That ambiguity shapes the design more than raw throughput does.
+The binding constraint is that accepted work needs durable, at-least-once attempts with one valid owner, despite worker crashes and network partitions. Start time is an SLO, not a hard guarantee through an outage. A lease cannot prevent a paused old process from resuming concurrently with a retry, and the scheduler cannot guarantee exactly-once arbitrary external effects. If a worker charges a credit card and dies before reporting success, the scheduler cannot know whether retrying repeats the charge. If it does not retry, it may leave work incomplete. That ambiguity shapes the design more than raw throughput does.
 
 The consequence is a control plane built around durable intent, reconstructable dispatch hints, renewable leases, monotonically increasing fencing tokens, and explicit idempotency contracts. Timing data must be indexed well enough to find due work without melting a hot `now` partition. Ownership must survive pauses and partitions without letting zombie workers complete stale attempts. Cron and DAG semantics must be written down rather than implied by whatever retry happened first.
 
@@ -36,7 +36,7 @@ Each run might produce state events for creation, ready, dispatch, start, heartb
 
 Now assume `10M` recurring definitions. If just `10%` fire at the top of the hour, that is `1M` due occurrences in a narrow window. Spread over one minute, the creation pressure is `1,000,000 / 60 = 16,667` runs per second before retries and DAG expansion. If all hourly schedules are indexed only by `next_fire_time`, every timer owner hammers the same key range around the current time. The scheduler needs time buckets plus hash shards, and it should smear eligible work across virtual partitions instead of making the current minute a global hot partition.
 
-Worker scale has a different implication. With `5M` simultaneously running attempts and a `30` second heartbeat interval, the heartbeat write rate is `5,000,000 / 30 = 166,667` heartbeats per second if every heartbeat is durably written. That is too much for the same transaction path that owns state transitions. Heartbeats should update a compact lease record, be coalesced, or be written only when progress changes, while terminal transitions remain strongly consistent.
+Worker scale has a different implication. With `5M` simultaneously running attempts and a `30` second heartbeat interval, the heartbeat write rate is `5,000,000 / 30 = 166,667` heartbeats per second if every heartbeat is durably written. That requires a partitioned lease-renewal path, not full history events on every heartbeat. Batch or coalesce renewals only within a safe margin before expiry, and acknowledge an extension only after it is authoritative. Progress events can be sampled or emitted only on change; leases must still renew when a healthy job makes no measurable progress.
 
 > **Key idea.** The numbers say the hard part is not accepting an API call; it is indexing due work, smoothing calendar bursts, and keeping ownership state small and strongly consistent while execution progress is noisy and huge.
 
@@ -72,7 +72,10 @@ POST /v1/schedules
 
 POST /v1/workflows
 {
-  "nodes": [{"name": "extract", "handler": "etl-extract:v4"}],
+  "nodes": [
+    {"name": "extract", "handler": "etl-extract:v4"},
+    {"name": "load", "handler": "etl-load:v2"}
+  ],
   "edges": [{"from": "extract", "to": "load", "condition": "SUCCESS"}],
   "failure_policy": "block_dependents"
 }
@@ -117,7 +120,7 @@ A run still is not enough once workers crash. If run state just says `RUNNING wo
 
 Recurring jobs need a way to prevent duplicate occurrence creation. That requires a uniqueness constraint on `(job_id, scheduled_for)` for logical cron runs. The timer can scan overlapping windows and safely race with another timer owner because only one insert wins. The scheduler may publish duplicate ready messages, but the run row remains unique.
 
-DAGs introduce a different failure. A child cannot just wait for a parent status in memory, because the dependency event may be consumed twice or the workflow engine may restart. We add `DependencyEdge` plus a durable processed marker keyed by `(parent_run_id, child_run_id, condition)`. The child stores `remaining_dependencies`; an idempotent transition decrements it exactly once per satisfied edge.
+DAGs introduce a different failure. A child cannot just wait for a parent status in memory, because the dependency event may be consumed twice or the workflow engine may restart. We add `DependencyEdge` plus a durable processed marker keyed by `(parent_run_id, child_run_id, condition)`. The child stores `remaining_dependencies`; inserting the marker, decrementing the counter, and writing any readiness event must be one transaction on the child's shard. Separate writes can either strand the child or decrement it twice after a crash.
 
 Finally, debugging and reconciliation need history. A mutable status row tells us where a run is now, but not why it got there. `StateEvent` is appended in the same transaction as important state transitions. Search indexes are derived from these events; they are not authoritative for scheduling.
 
@@ -130,6 +133,7 @@ JobDefinition
 JobRun
 - run_id, job_id, tenant_id, scheduled_for, state
 - remaining_dependencies, attempt_count, deadline_at
+- current_attempt_id, current_lease_epoch, schedule_revision
 - business_idempotency_key, version, next_action_at
 
 Attempt
@@ -183,7 +187,7 @@ Delayed and recurring work is stored with `next_action_at`, `time_bucket`, and `
 
 ### Fix 3: Use attempts, leases, and fencing tokens for ownership
 
-A scheduler does not merely set `state = RUNNING`; it creates an attempt with a renewable lease and a monotonically increasing epoch. Workers heartbeat and complete using that epoch. If the lease expires, a reconciler can create a new epoch and retry. If the old worker later wakes up, its completion is rejected because the epoch is stale. This protects against zombie workers, not just dead ones.
+A scheduler does not merely set `state = RUNNING`; it atomically creates an attempt and installs its renewable lease and increasing epoch on `JobRun`. Workers heartbeat and complete against that current-owner record. If the lease expires, a reconciler can replace it with a new epoch and retry. A resumed old worker cannot complete the run through its historical `Attempt` row. This fences scheduler state; protecting external effects requires destination cooperation.
 
 ### Fix 4: Treat workflows and cron as durable state machines
 
@@ -234,6 +238,8 @@ The fix is to make due work partitionable before it is due. Each scheduled item 
 
 Bucket width is a trade-off. A one-minute bucket reduces index cardinality but creates larger bursts inside the owner. A one-second bucket gives precise scans but more buckets to manage and more shard metadata. A practical design uses coarse durable buckets and a near-horizon timing wheel inside each timer owner. The database answers, "which items may fire soon for this shard?" The in-memory wheel answers, "which of these should fire in the next few milliseconds?" If the timer process dies, it loses only the cache; the next owner reloads from the durable bucket.
 
+Persist a per-shard catch-up cursor and revisit overdue buckets until every due row has an outcome or durable continuation. Scanning only the new current bucket after restart would permanently miss old work. Advance that cursor only after its work is durably recorded; expired-owner writes validate the timer epoch, and duplicate scans remain safe through occurrence uniqueness.
+
 The ready queue needs the same anti-hotspot thinking. Partitioning only by priority sends the 09:00 burst to a small number of partitions. Partition by execution pool, priority band, and virtual shard. Consumers discover active partitions rather than polling every possible one. Meta FOQS is a useful production reference: it combines persistent priority and delay metadata with leases, ack/nack, active-topic discovery, and in-memory ready indexes so consumers find active work without scanning every shard. That maps directly to a job scheduler where many partitions are empty most of the day and a few become hot during cron bursts.
 
 Airbnb Dynein reinforces the separation of concerns. Immediate jobs can use queue semantics, while jobs scheduled months out belong in a delayed scheduler store until they approach execution. If all future work is inserted directly into an immediate queue, the queue becomes both a timer database and a dispatch buffer, which makes long delay, rebalancing, and recovery harder. The scheduler should keep the durable future in a store optimized for indexed time scans and publish to immediate queue partitions only when work is near ready.
@@ -261,7 +267,7 @@ The scheduler can prevent stale control-plane mutations with monotonically incre
 
 A lease timeout alone is not enough. It tells the scheduler when it may give up on an owner, but it does not stop the old owner from acting later. Network partitions, process pauses, overloaded hosts, and asymmetric packet loss all create zombies: workers that are no longer authorized but still running. If the only rule is "complete before `lease_expires_at`," a worker with a skewed clock or delayed packets can overwrite a newer attempt.
 
-The core protocol is compare-and-swap around an epoch. When a scheduler dispatches an attempt, it writes `lease_epoch = 42`, `worker_id = worker_a`, and `lease_expires_at = now + duration` under the run's current version. The worker receives epoch `42`. Every heartbeat, progress update, cancellation acknowledgement, and completion includes epoch `42`. The store accepts the mutation only if the run is still in a compatible state and the attempt still has epoch `42`. If the lease expires and a reconciler retries the run, it moves ownership to epoch `43`. From that moment, epoch `42` is fenced.
+The core protocol is compare-and-swap around the run's current owner. Dispatch atomically installs `(current_attempt_id, current_lease_epoch = 42)` on the run and creates the worker's lease. Every heartbeat, progress update, cancellation acknowledgement, and completion checks both fields against `JobRun`, compatible run state, and authoritative lease validity. Checking only the historical attempt's epoch is insufficient because that old row still says `42` after takeover. Renewal and takeover serialize against the same lease record; an expired lease cannot be revived by a late heartbeat. A retry atomically installs epoch `43` before dispatching the new worker.
 
 ```mermaid
 sequenceDiagram
@@ -282,9 +288,9 @@ sequenceDiagram
 
 The lease duration should be short enough to meet recovery objectives but long enough to avoid false loss under ordinary pauses. Heartbeats can be frequent, but the authoritative lease record should stay compact. For millions of running attempts, writing every progress tick as a full event is wasteful. Coalesce heartbeat writes, store a last-seen timestamp and progress digest, and append durable events only for meaningful state transitions or sampled progress.
 
-Fencing must propagate to resources that can be corrupted by stale workers. The job store can reject a stale `Complete`, but it cannot undo a stale worker's direct call to a payment API, data warehouse, or email service. The worker SDK should pass a stable `business_idempotency_key`, `run_id`, `attempt_id`, and `lease_epoch` to handler code. Downstream systems that support conditional writes can store the highest accepted epoch and reject lower epochs. Systems that support idempotency keys can deduplicate repeated calls. Systems that support neither must be treated as at-least-once side-effect targets, and job owners must choose retry policies accordingly.
+Fencing must propagate to resources that can be corrupted by stale workers. The job store cannot undo a stale worker's direct call to a payment API, data warehouse, or email service. Pass `run_id`, `attempt_id`, `lease_epoch`, and a stable business operation key to handlers. Retrying one logical effect uses the same business key across attempts, not a new key containing `attempt_id`; multiple effects within a run need distinct operation keys. A destination must atomically validate its resource's fence and apply the mutation. Per-run epochs are not comparable across different runs writing one shared resource, which needs its own ownership sequence. Keeping the highest observed fence prevents older writes after a newer fence, but does not deduplicate an effect already performed before takeover. Single-effect semantics still need idempotency.
 
-This is where the design has to be honest. "Exactly once" is sometimes achievable inside one database transaction, but a generic scheduler cannot atomically commit its attempt state with arbitrary external effects. Temporal's durable execution model and Cadence-style workflow histories help code resume after process failure, but activities still need idempotency or compensation. Dropbox ATF states the same contract directly: at-least-once callbacks, idempotent user code, and no concurrent task execution. That is a stronger product contract than vague exactly-once language because it tells users where the boundary is.
+This is where the design has to be honest. A generic scheduler cannot atomically commit its attempt state with arbitrary external effects. Temporal and Cadence-style histories help orchestration resume, but activities still need idempotency or compensation. Dropbox ATF's published no-concurrent-execution contract uses both exclusive claiming and executor self-termination after repeated heartbeat failures. That is an additional runtime assumption, not a property obtained from a lease alone. This design guarantees one valid control-plane owner, not that every old process or in-flight network request has physically stopped.
 
 Cancellation uses the same protocol. Marking a run `CANCEL_REQUESTED` notifies the current owner. If the worker completes with the current epoch before the cancellation transition fences it, success may win. If cancellation increments the epoch first, later completion is stale. The API should expose this race rather than hiding it: cancellation is best effort until a terminal state is committed.
 
@@ -307,13 +313,13 @@ The answer must come from explicit schedule and workflow policy. Cron definition
 
 </details>
 
-Cron looks simple until local time becomes part of the contract. A schedule such as `0 2 * * *` in `America/Los_Angeles` has days where 02:00 does not exist and days where an hour repeats. If the scheduler stores only the next UTC instant, users cannot tell whether the system skipped intentionally, fired twice intentionally, or did whatever the library happened to do. The definition should store the original expression, IANA time zone, daylight-saving policy, and a revision. The occurrence row should store the resolved `scheduled_for` instant and the local-time label that produced it.
+Cron looks simple until local time becomes part of the contract. In `America/Los_Angeles`, a 02:00 schedule encounters a missing time in spring, whereas a 01:30 schedule encounters a repeated time in fall; 02:00 itself does not repeat there. The definition should store the original expression, IANA time zone, daylight-saving policy, and a revision. The occurrence row stores the resolved UTC `scheduled_for` instant plus its local label and offset so repeated wall-clock times are distinguishable.
 
 Misfire policy matters even more during outages. Google SRE's distributed cron chapter highlights that some jobs tolerate skipped launches better than duplicate launches. Payroll, billing, newsletters, and destructive maintenance are examples where fail-closed behavior may be safer than automatic catch-up. Other jobs, such as hourly metrics rollups, may need every missed occurrence. A third class can coalesce: if three hourly refreshes were missed, run once for the latest state. The scheduler should not make this a hidden global setting. It belongs on the schedule, and unsafe catch-up should require explicit opt-in.
 
-The occurrence creation protocol is conditional. For each due local occurrence, the timer tries to insert `(job_id, scheduled_for)` with the schedule revision and policy result. If two timer owners race, one insert wins. If the policy says coalesce, the scheduler creates or updates a single catch-up run keyed by the coalescing window. If the policy says skip, it appends a state event explaining the skipped occurrence so users see an intentional decision rather than a missing row.
+The occurrence creation protocol is conditional. For each due occurrence, insert `(job_id, scheduled_for)` and advance the definition's scheduling cursor in one transaction that validates the expected revision and pause state. Uniqueness alone would not stop an old timer from creating jobs after a schedule edit or pause. For coalescing, persist the missed interval and selected occurrence atomically with cursor advancement so overlapping scans choose one stable catch-up identity; never change the payload of an already-dispatched run. For skipping, persist the decision before advancing the cursor so users see an intentional outcome rather than a missing row.
 
-Workflows add a separate state machine. A naive DAG engine keeps an in-memory count of unfinished parents and enqueues children when callbacks arrive. That fails when callbacks are duplicated, the engine restarts, or a parent reaches a terminal state that can never satisfy the edge condition. The durable model stores dependency edges and a child `remaining_dependencies` count. When a parent reaches `SUCCEEDED`, an edge consumer records that this parent-child edge was processed and conditionally decrements the child. When the counter reaches zero, the child transitions to `READY`. Duplicate parent completion events are harmless because the processed marker already exists.
+Workflows add a separate state machine. A naive DAG engine keeps an in-memory count of unfinished parents and enqueues children when callbacks arrive. That fails when callbacks are duplicated, the engine restarts, or a parent reaches a terminal state that can never satisfy the edge condition. Parent completion emits a durable outbox event. On the child's shard, one transaction inserts the edge's processed marker, decrements `remaining_dependencies`, and, at zero, changes the child to `READY` and inserts its outbox event. Duplicate events do nothing because the marker and decrement committed together. Validate node references and reject cycles when accepting the DAG.
 
 Failure edges need equal care. If a child requires `SUCCESS` and the parent becomes `FAILED` after exhausting retries, the child should not sit forever with `remaining_dependencies = 1`. The workflow policy decides whether to mark it `BLOCKED`, `SKIPPED`, or `FAILED`, or whether to run a compensation path. A completion condition can also be `COMPLETION` rather than `SUCCESS` for cleanup tasks. This distinction is what turns a job scheduler into a workflow engine rather than a pile of callbacks.
 
@@ -350,7 +356,7 @@ Signals worth watching: cron misfires by policy, skipped occurrence counts, dupl
 
 **10x scale.** At `1B` runs per day, the average creation rate is `1,000,000,000 / 86,400 = 11,574` runs per second and a 20x burst is about `231k` runs per second. The architecture stays the same, but every logical partition becomes many virtual partitions, ready queues move toward log-structured storage with aggressive batching, heartbeat writes must be coalesced, and tenant-level admission control becomes mandatory rather than protective. Search and history pipelines need asynchronous compaction because raw event volume would be about `1B × 20 × 300 = 6 TB` per day before replication.
 
-**Multi-region active-passive.** Keep each tenant's scheduling state in a home region replicated across zones, with asynchronous disaster recovery to another region unless the tenant pays the latency and availability cost of synchronous cross-region quorum writes. During failover, increment a regional epoch, stop accepting stale worker completions from the old region, rebuild ready queues from the job store, and disclose any acknowledged writes beyond the replication point. Active-active ownership of the same run is avoided because it turns lease fencing into a global consensus problem.
+**Multi-region active-passive.** Keep each tenant's scheduling state in a home region replicated across zones, with asynchronous DR unless synchronous cross-region durability is required. Promotion must first fence the old region through a shared, strongly consistent ownership authority or verified isolation; incrementing a counter only in the replacement region cannot revoke an isolated old writer. Pair that regional generation with per-run epochs and enforce it at destinations that need fencing. Reconcile missing runs and external effects before replaying uncertain work from a lagging replica. A nonzero DR RPO means some acknowledged jobs or completion records can be lost; zero-loss cross-region guarantees require synchronous replication, not merely disclosure after failover.
 
 **Tenant with strict no-duplicate side effects.** For payroll-like jobs, configure cron misfires as skip or operator-reviewed catch-up, require downstream idempotency keys, and make retry budgets conservative. The scheduler can still be at least once internally, but product defaults should fail closed when duplicate external effects are worse than late execution. Google distributed cron's skipped-versus-duplicate framing belongs directly in this variant.
 

@@ -32,7 +32,7 @@ That asymmetry forces the architecture to separate durable acceptance from displ
 
 Assumptions here are illustrative, not facts about any one company. Suppose the service has 100 million daily viewers and an ordinary peak of 10 million concurrent connections. A championship or celebrity event can push that to 30 million. If an average connected viewer keeps one active comment subscription, the gateway layer must maintain `10M` to `30M` live subscriptions plus heartbeat state. This makes connection management a first-class subsystem, not a side effect of the read API.
 
-For writes, assume an ordinary peak of 100,000 comments per second across the fleet and an extreme peak of 1,000,000 comments per second. With a compact 500-byte durable comment payload before indexes and replicas, average raw ingest at 100,000 comments per second is `100,000 × 500 = 50,000,000` bytes per second, about 50 MB/s. Per day that is `50 MB/s × 86,400 = 4,320,000 MB`, about 4.32 TB/day raw, or `4.32 × 365 = 1,576.8` TB/year before replication, indexes, moderation evidence, and tiering. That is serious storage, but it is not the shape that breaks the design.
+For writes, assume an ordinary peak of 100,000 comments per second across the fleet and an extreme peak of 1,000,000 comments per second. With a compact 500-byte durable comment payload before indexes and replicas, raw ingest at the ordinary peak is `100,000 × 500 = 50,000,000` bytes per second, about 50 MB/s. Sustaining that peak gives `50 MB/s × 86,400 = 4,320,000 MB`, about 4.32 TB/day raw, or `4.32 × 365 = 1,576.8` TB/year before replication, indexes, moderation evidence, and tiering. These are peak-sustained bounds, not average-volume forecasts. That is serious storage, but it is not the shape that breaks the design.
 
 The fan-out multiplier is the design-shaping number. A normal active discussion with 100 viewers and 10 comments per second costs `100 × 10 = 1,000` deliveries per second and can run in full mode. A hot live event with 5 million viewers and 100,000 comments per second costs `5,000,000 × 100,000 = 500,000,000,000` deliveries per second if delivered in full. If each pushed envelope were only 200 bytes after compression and framing, that would be `500,000,000,000 × 200 = 100,000,000,000,000` bytes per second, or 100 TB/s, before TLS, retries, and mobile radio overhead. The correct response is not a bigger WebSocket cluster; it is a product and protocol rule that no viewer receives that firehose.
 
@@ -45,7 +45,7 @@ Reconnects are the second multiplier. If a regional gateway fleet serving 2 mill
 **Question.** How can a client safely retry a post, reconnect to a different gateway, and still know whether it is seeing the complete stream?
 <details><summary>Answer</summary>
 
-A post uses an idempotency key and returns the server-assigned sequence after durable append. A subscription includes the last durable sequence the client has applied. The server replies with a delivery mode, so the client can distinguish a complete stream from a ranked or sampled view.
+A post uses an idempotency key and returns the server-assigned sequence after durable append. A subscription includes the last applied coverage checkpoint. The server replies with a delivery mode, distinguishing a complete stream from a ranked or sampled view.
 
 </details>
 
@@ -70,17 +70,19 @@ Idempotency-Key: 91a1b6
 {"body":"edited text"}
 
 DELETE /v1/comments/{comment_id}
+If-Match: "version-3"
 Idempotency-Key: b42d
 
 WS -> {"type":"subscribe","thread_id":"t-7","after_sequence":98220,"max_events_per_second":8}
 WS <- {"type":"subscribed","thread_id":"t-7","from_sequence":98221,"delivery_mode":"RANKED","sealed_through":98220}
-WS <- {"type":"comment","thread_id":"t-7","sequence":98221,"comment_id":"c-882","rank_reason":"followed_author"}
-WS <- {"type":"hide","thread_id":"t-7","sequence":98244,"comment_id":"c-810","policy_version":"p19"}
+WS <- {"type":"comment","thread_id":"t-7","sequence":98221,"comment_id":"c-882","version":1,"rank_reason":"followed_author"}
+WS <- {"type":"hide","thread_id":"t-7","sequence":98244,"comment_id":"c-810","version":4,"policy_version":"p19"}
+WS <- {"type":"checkpoint","thread_id":"t-7","covered_through":98244,"delivery_mode":"RANKED"}
 ```
 
-Push is the normal read path for live viewing, but it is not the source of truth. Every pushed event carries `(thread_id, sequence, event_type)` so the gateway and client can deduplicate after at-least-once delivery. The subscription request says `after_sequence`, not `offset`, because offsets shift under concurrent writes while a per-thread sequence is stable. The response includes `delivery_mode`: `ALL` means the viewer should receive every visible event after the cursor; `RANKED`, `SAMPLED`, and `AGGREGATED` mean the stream is intentionally incomplete and must not be used as an archival view.
+Push is the normal read path for live viewing, but it is not the source of truth. Every pushed event carries `(thread_id, sequence, event_type)` for deduplication. The subscription request says `after_sequence`, not `offset`. The response includes `delivery_mode`: `ALL` covers every eligible event; `RANKED`, `SAMPLED`, and `AGGREGATED` intentionally omit ordinary display candidates. A client's resume cursor advances only on an applied `covered_through` checkpoint certifying that every required control event through that point was delivered or reflected in a replacement snapshot. Neither the largest sampled sequence nor `sealed_through` proves that coverage. The latter only describes the finalized log prefix.
 
-Posting returns only after the write path has appended to a quorum-replicated durable stream. If moderation holds the comment, the response still has a sequence and status, but public fan-out excludes it until a later restore or visible mutation. Retries with the same idempotency key return the original result. Edits and deletes use expected versions because a user edit racing a moderator hide should not silently overwrite the moderation state.
+Posting returns only after the write path has appended to a quorum-replicated durable stream. If moderation holds the comment, the response still has a sequence and status, but public fan-out excludes it until a later restore or visible mutation. Retries with the same idempotency key return the original result within the documented retention window. Edits and deletes use expected versions because a user edit racing a moderator hide should not silently overwrite the moderation state.
 
 Cancellation is deliberately narrow. A client can cancel a local optimistic bubble before the server accepts it, but once the API returns a sequence, undo is represented as a delete mutation. This avoids the race where a gateway has already delivered a comment while a late HTTP cancel tries to pretend it never existed.
 
@@ -131,6 +133,7 @@ CommentMutation
 - created_at
 
 IdempotencyRecord
+- thread_id
 - actor_id
 - idempotency_key
 - request_hash
@@ -155,12 +158,13 @@ GatewaySubscription
 - connection_id
 - thread_id
 - last_sent_sequence
+- last_covered_sequence
 - delivery_mode
 - max_events_per_second
 - heartbeat_deadline
 ```
 
-The ordered stream is partitioned primarily by `thread_id`, with hot threads isolated onto dedicated partitions or shards. The primary comment store is a wide-column or log-structured store keyed by `(thread_id, sequence)` for range scans, plus a key-value index by `comment_id` for direct edits and moderation. `IdempotencyRecord` must be stored with the same failure domain as the write log or replicated atomically enough that a retry after failover cannot create a duplicate. `GatewaySubscription` and presence live in memory and short-TTL key-value stores near the gateways; they deliberately do not go in the transactional comment store.
+The ordered stream is partitioned primarily by `thread_id`, with hot threads isolated onto dedicated partitions or shards. Comment rows and the `comment_id` index are read projections; the mutation log and its replayed state own current versions, thread mode, and deduplication. Acceptance atomically records the mutation and `(thread_id, actor_id, idempotency_key, request_hash, result)` in that authority before acknowledgement. Merely sharing a failure domain does not prevent a crash between two writes. Read projections expose an applied watermark and never claim to cover a newer log prefix. `GatewaySubscription` and presence remain in memory and short-TTL stores.
 
 > **Key idea.** The durable model is an ordered mutation log per thread plus projections for reads; gateway subscriptions are rebuildable delivery state, not comment truth.
 
@@ -257,9 +261,9 @@ flowchart TD
 
 LinkedIn, Hotstar, and Twitch illustrate different parts of this architecture. LinkedIn's presence work shows that subscription-adjacent state needs local routing and expiry because mobile clients churn. Hotstar's 50-million-connection PubSub experience shows that broadcast clusters hit practical limits around cluster size, load balancers, and subscriber nodes, so publisher/subscriber separation and many subscriber nodes matter. Twitch's engineering description separates ingress, policy evaluation, and Pubsub fan-out, which is exactly the isolation needed here: a moderation slowdown should not take down socket delivery, and a socket storm should not accept invalid comments.
 
-The tree still has hard edge cases. If a hot thread moves from `ALL` to `RANKED`, every gateway must learn that mode quickly, but clients must also be told so the UI does not imply completeness. If a regional fan-out worker is slow, it should skip ordinary ranked candidates rather than delay mandatory mutations. If a gateway's per-connection queue grows, the gateway downgrades that connection to snapshot mode and sends a control message with the latest sealed sequence.
+The tree still has hard edge cases. A change from `ALL` to `RANKED` is announced with a coverage checkpoint so clients do not imply completeness. A slow regional worker may skip ordinary candidates, but it must scan the control path through the advertised checkpoint. If even mandatory traffic exceeds a connection's budget, replace its display state with a bounded, current snapshot and matching coverage cursor, or disconnect it for resync. Sending a newer sealed sequence without the intervening controls or a replacement snapshot would lose removals.
 
-A tempting alternative is to partition the comment stream itself into many independent shards and let clients merge. That improves write throughput, but it complicates ordering and recovery. For live comments, a single logical per-thread sequence is valuable. We can still scale hot ingestion by leasing sequence ranges to workers with fencing epochs, but the externally visible cursor remains one sequence space. Gaps from expired leases are sealed explicitly so clients do not wait forever.
+A tempting alternative is to partition the comment stream itself into independent shards and let clients merge. That improves write throughput but changes ordering and recovery. This design keeps one logical per-thread sequence and batches commits. Leased ranges may parallelize preparation, but cannot bypass the ordered commit authority described below; gaps must be fenced and sealed before cursors advance.
 
 Signals worth watching: fan-out deliveries per accepted comment, per-gateway queue depth, hot-thread mode transitions, broker consumer lag by region, and the percentage of viewers in each delivery mode.
 
@@ -284,7 +288,7 @@ Sampling is often described as if it were random loss. That is dangerous. The pr
 
 The durable log contains complete ordered mutations. The fan-out selector reads events and builds per-viewer output under a token bucket, for example eight comment-like events per second plus a separate control lane. The first lane is mandatory: hides, restores, locks, slow-mode changes, pins, and acknowledgements for comments authored by this connection's user. The second lane is personalized priority: followed authors, direct replies, mentions, local-language matches, and comments that are early in a thread before heat rises. The third lane is ranked public sampling: quality scores, diversity constraints, recency, and randomization so the stream does not become only celebrity accounts or only the loudest cohort. The fourth lane is aggregate updates: counts, top reactions, and periodic highlights.
 
-The selector must also reason about history. Suppose a viewer saw comment sequence 500, and an async model hides it at sequence 900. The viewer may now be receiving only one ranked comment per second. The hide cannot wait behind the ranked lane; it must be sent promptly or applied during the next snapshot. Similarly, if a viewer never saw sequence 500 because sampling skipped it, sending a hide for it is harmless but wasteful; gateways can keep a small displayed-comment bloom filter or LRU set per connection to target removals when possible. Correctness still comes from authoritative reads filtering hidden content.
+The selector must also reason about history. Suppose a viewer saw comment sequence 500, and an async model hides it at sequence 900. The hide cannot wait behind the ranked lane; it must be sent promptly or applied by a replacement snapshot before coverage advances past 900. A displayed-ID filter may suppress a hide only if it has no false negatives for every item the client still retains. An evicting LRU is not sufficient: an evicted ID may remain visible on the phone. When display history is uncertain, send the hide or reset the window. Clients retain per-comment versions/tombstones so an older queued create arriving after a hide cannot resurrect the comment.
 
 Meta's Bladerunner work is the right mental model: stream processors apply application-specific filtering and aggregation before device delivery. The key addition for comments is explicit non-droppable semantics. A ranking model may decide which public comments are interesting, but policy events are not candidates for ranking. Moderation and user-owned reconciliation are control-plane facts.
 
@@ -307,13 +311,13 @@ Signals worth watching: mandatory-event latency, own-comment reconciliation late
 **Question.** A gateway fleet restarts during a live event. Two million clients reconnect within a minute. How does the system avoid losing comments or melting the database?
 <details><summary>Answer</summary>
 
-Clients reconnect with their last applied sequence. Gateways first fill from local recent-window caches, then coalesced range reads, and finally snapshots if the gap is too large. The durable log and read store are authoritative; gateway queues are disposable.
+Clients reconnect with their last applied coverage checkpoint. Gateways use recent caches, coalesced reads, or a replacement snapshot, all checked against current moderation state. The log is authoritative; read stores are watermarked projections and gateway queues are disposable.
 
 </details>
 
-A real-time system fails if it treats a WebSocket as durable state. Mobile networks suspend apps, load balancers rebalance, deployments restart gateways, and regional incidents produce synchronized reconnects. If the only copy of "what this viewer should see next" is a gateway queue, the system either loses events or keeps unbounded queues. The better contract is that every client owns a cursor: the highest durable sequence it has applied for each thread. Reconnect is `subscribe(thread_id, after_sequence=n)`.
+A real-time system fails if it treats a WebSocket as durable state. Mobile networks suspend apps, deployments restart gateways, and incidents produce synchronized reconnects. Each client persists its last applied coverage checkpoint, not its largest observed event ID, and reconnects with `subscribe(thread_id, after_sequence=n)`. A new gateway without the previous display set either conservatively replays all intervening controls or replaces the entire visible window with a snapshot.
 
-The catch-up path is tiered. First, the gateway checks an in-memory or edge-cache recent window keyed by `(thread_id, sequence range, audience class)`. Hot threads almost always need the newest few hundred events, so this cache absorbs the common case. Second, the gateway or read service coalesces identical misses. If 50,000 viewers ask for `t-7:98200..98280`, only one backend range read should hit the comment store. Discord's data-service pattern is useful here: put a service in front of the storage engine that uses consistent-hash routing and request coalescing for hot channel ranges. Third, if the client is too far behind or the stream retention window has expired, return a snapshot: recent visible comments, pinned comments, current mode, and `sealed_through` cursor.
+The catch-up path is tiered. First, the gateway checks a recent window keyed by `(thread_id, sequence range, audience class)`, with current moderation validation. Second, identical misses are coalesced: 50,000 requests for `t-7:98200..98280` need not produce 50,000 storage reads. Discord's data-service pattern motivates this. Third, if the gap or control replay is too large, return a replacement snapshot of recent visible comments, pins, and thread mode, plus a matching `covered_through` cursor no newer than the projection's applied, sealed prefix.
 
 ```mermaid
 sequenceDiagram
@@ -325,7 +329,8 @@ sequenceDiagram
     C->>G: subscribe(thread_id, after_sequence=98200)
     G->>E: get range 98201..latest
     alt cache hit and small gap
-        E-->>G: visible events plus sealed_through
+        E-->>G: events, controls, and applied/sealed boundary
+        G->>G: Validate current moderation fence
         G-->>C: catch_up events, then live mode
     else cache miss
         G->>R: coalesced range request
@@ -336,13 +341,13 @@ sequenceDiagram
     end
 ```
 
-Sequence gaps deserve explicit handling. A hot sequencer may lease ranges to workers. If a worker dies after reserving 100 sequence numbers, clients might observe sequence 1000 and then 1101. Without metadata, they will wait forever for 1001..1100. The log therefore needs sealed gaps or a `sealed_through` watermark. A read response can say "there are no visible events through 1100" or "events through 1100 are not yet sealed; retry." This distinction prevents both false loss and endless spinners.
+Sequence gaps deserve explicit handling. If workers reserve ranges and one dies, the commit authority must fence its unused reservations before durably sealing those slots as no-ops. `sealed_through=N` means every slot through N is committed or permanently empty; no late append may fill a sealed gap. Readers and projections cannot advance over unsealed holes. This is distinct from audience filtering and sampling, which may omit committed events but require the coverage protocol above.
 
 Reconnect storms also interact with presence. If every disconnect immediately decrements viewer count and every reconnect increments it, counts flap wildly. LinkedIn's presence lesson applies directly: use heartbeat expiry with grace windows and delayed offline triggers. A gateway restart should mark connections uncertain, not instantly offline. Counts are approximate and can be recomputed from heartbeat leases; comments cannot.
 
 Slack's Flannel work adds another important point: bootstrap payloads should be slim and edge-served. A reconnecting live-comments client does not need the entire user profile graph, all historical comments, and every reaction. It needs thread config, pinned comments, recent visible window, delivery mode, and a cursor. Everything else can lazy-load.
 
-The failure modes are mostly around cache correctness. A recent-window cache must not serve hidden comments to ordinary viewers after a moderation mutation. There are two safeguards: hide mutations invalidate or patch cache entries, and the authoritative read service filters by current status. For very hot threads, it is often cheaper to include tombstone/control events in the cache than to rewrite large cached windows.
+The failure modes are mostly around cache correctness. A cache hit must pass the same current moderation check as a miss. Each window carries an applied moderation revision; serving validates it against the authoritative thread moderation fence and patches/removes affected items or waits for a current snapshot. Asynchronous invalidation plus filtering only on backend misses would still serve hidden comments from stale edges. Snapshot content and its coverage cursor must describe the same applied revision, and subscription buffers the tail after that boundary before handing off to live delivery.
 
 Signals worth watching: reconnects per minute, cache catch-up hit ratio, coalescing factor, backend range-read QPS per hot thread, snapshot fallback rate, and clients reporting sequence gaps beyond a retry budget.
 
@@ -365,9 +370,9 @@ Thread mutations pass through a sequenced, fenced authority. Workers validate th
 
 Per-thread order is the backbone of recovery, but it creates a hot-key risk. One sequencer per active thread is easy to reason about: it increments `next_sequence` and appends. Under normal load, that is ideal. Under a celebrity event, one process or one database partition may be too small. The mistake is to remove ordering entirely. The better design scales the sequencer while preserving one external sequence space.
 
-A common mechanism is a fenced leader with range leases. The thread has a `sequencer_epoch`. A leader obtains epoch 42 and leases ranges such as 10,000..10,999 to write workers. Each append includes epoch and sequence. The log accepts only the current epoch and each sequence at most once. If the leader stalls and a new leader obtains epoch 43, late writes from epoch 42 are rejected. If a worker dies with unused sequence numbers, the new leader writes a sealed-gap marker for that range or advances `sealed_through` with proof that no events will appear there.
+A fenced leader owns the thread's `sequencer_epoch`, next committed sequence, mode, comment versions, and deduplication state. It validates commands against predecessor state and atomically commits an ordered batch plus its new head; append checks the epoch and expected head at the storage authority. If ranges are leased to workers, those workers only prepare commands. The authority commits or fences/skips every lower slot before exposing a higher slot. A unique sequence and current epoch alone do not enforce lock order or prevent late low-numbered writes behind a cursor.
 
-Moderation and thread mode changes use the same ordered path. A lock at sequence 20,000 means normal create mutations after 20,000 should fail. There is still a race before the lock is sequenced: comments accepted at 19,998 and 19,999 are valid because they happened before the lock in thread order. This is better than pretending a wall-clock timestamp can decide. Gateways may optimistically gray out the composer when they hear about a pending lock, but the write service is authoritative.
+Moderation and thread mode changes use the same ordered path. A lock at sequence 20,000 commits only after lower slots are finalized; normal creates after it fail under the resulting mode even if a worker prepared them earlier. Slow-mode eligibility is checked and updated per actor/thread in that same authority so simultaneous requests on two devices cannot both pass. Gateways may gray out the composer early, but cached configuration is not permission to commit.
 
 ```mermaid
 stateDiagram-v2
@@ -381,7 +386,7 @@ stateDiagram-v2
     Locked --> [*]: retention expiry
 ```
 
-Moderation removal also benefits from sequencing. If an async model hides comment 100 at sequence 150, every projection can apply: comment 100 remains in audit storage, public reads filter it after sequence 150, and gateways that displayed it receive a hide control event. If an author edit races that hide, expected versions prevent the edit from turning a hidden comment visible by accident. The projection code applies mutations with compare-and-set on `current_version` and status transition rules.
+Moderation removal also benefits from sequencing. If an async model hides comment 100 at sequence 150, it remains in audit storage while public reads suppress it and gateways send a hide. The command authority, not just a lagging projection, validates the expected comment version and allowed transition before acknowledging an edit. Projections apply committed mutations in order or buffer gaps; blindly skipping to a newer partial edit could otherwise lose an earlier hide.
 
 Hot partitions remain real. Partitioning by `thread_id` preserves range scans but creates skew. The mitigations are layered: isolate hot threads onto dedicated stream partitions, batch appends, coalesce reads, keep recent windows in memory, and move fan-out work away from the storage partition. If a single logical thread exceeds what one ordered log can accept, the product can choose regional substreams, but that changes semantics: viewers in different regions may see different interleavings until merged. That is a product trade-off, not an invisible optimization.
 
@@ -407,7 +412,7 @@ Signals worth watching: sequencer lease expirations, rejected stale epochs, seal
 
 ## 8. The transferable pattern
 
-This problem is an instance of complete-write, selective-read architecture. The system records every accepted mutation exactly once in an ordered, replayable substrate, then admits that real-time delivery is a projection constrained by bandwidth, client capacity, and human attention. The same pattern appears in [chat](./chat-app-system-design.md), [news feeds](./news-feed-system-design.md), [YouTube](./youtube-system-design.md), and [pub/sub](./pub-sub-message-queue-system-design.md), but live comments emphasize the gap between durable truth and what any one viewer can consume.
+This problem is an instance of complete-write, selective-read architecture. The system durably appends accepted mutations and deduplicates retries within its documented idempotency-retention window; that is not an unlimited exactly-once transport guarantee. Real-time delivery is a projection constrained by bandwidth, client capacity, and human attention. The same pattern appears in [chat](./chat-app-system-design.md), [news feeds](./news-feed-system-design.md), [YouTube](./youtube-system-design.md), and [pub/sub](./pub-sub-message-queue-system-design.md), but live comments emphasize the gap between durable truth and what any one viewer can consume.
 
 The reusable move is to name which events are correctness events and which are display candidates. Correctness events need idempotency, ordering, recovery, and often fencing. Display candidates can be ranked, sampled, coalesced, or dropped with transparent metadata. Systems that fail to make that distinction either overload themselves trying to deliver everything or corrupt user-visible state by dropping the wrong thing.
 
@@ -434,14 +439,14 @@ Live comments are shaped by fan-out asymmetry: appending accepted comments is ex
 3. Why does reconnect use `after_sequence` instead of a timestamp or offset?
    <details><summary>Answer</summary>
 
-   A per-thread sequence is stable under concurrent writes and gives an exact cursor. Timestamps can skew or tie, and offsets shift as inserts and hides occur. `after_sequence` lets gateways and read services deduplicate and fill gaps deterministically.
+   A per-thread sequence is stable under concurrent writes, unlike offsets or clock time. The resume value is the last applied coverage checkpoint: in sampled mode, the greatest observed comment sequence alone says nothing about whether an earlier hide was delivered.
 
    </details>
 
 4. What is a sealed gap and why does it matter?
    <details><summary>Answer</summary>
 
-   A sealed gap is a range of sequence numbers that will never contain visible events, often because a leased range expired. It tells clients and projections not to wait forever for missing numbers while still distinguishing true gaps from events that are merely delayed.
+   A sealed gap is a range of permanently unused sequence slots. The authority fences old reservations before sealing it, so late writes cannot fill it. This differs from sampling or permission filtering, which can omit real committed events without making their slots empty.
 
    </details>
 

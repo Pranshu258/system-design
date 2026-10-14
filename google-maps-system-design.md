@@ -2,6 +2,8 @@
 
 A Google Maps-like system renders interactive maps, finds places and addresses, and computes routes with live traffic over a continuously changing world. This design focuses on the serving and update architecture for tiles, search/geocoding, road routing, traffic, ETA, and map releases; street imagery capture, social reviews, ads, and business-owner workflows are out of scope except where they affect map correctness.
 
+This is an illustrative architecture informed by the cited papers and engineering posts, not a description of Google's private routing algorithm or release protocol.
+
 ## 1. Requirements
 ### 1.1 Functional requirements
 - Render global, zoomable maps on web and mobile clients using cacheable vector tiles.
@@ -31,7 +33,7 @@ The following numbers are illustrative, not claims about any one company. Suppos
 
 Search and routing are smaller but more CPU-bound. If `100M` users issue `5` search or autocomplete requests per day, that is `500M/day`, or `5.8k/s` average and perhaps `60k/s` peak because autocomplete fans out as users type. If `20M` users request `10` routes or reroutes per day, that is `200M/day`, or `2.3k/s` average and `20k-30k/s` peak. A route request that touches only a few megabytes of memory is manageable; one that scans gigabytes of graph state is not.
 
-The road graph size also shapes the algorithm. Assume `1B` directed edges globally after splitting roads at intersections and restrictions. Even a compact edge record of `64` bytes is `64GB` before geometry, turn tables, indexes, live speed arrays, and multiple modes. Replicating the full hot graph in every routing worker is wasteful, but routing workers still need memory-local shards and high-level overlay data. If live traffic updates touch `10M` segments per minute, recomputing all shortcuts globally every minute is impossible; updating affected cells or metric overlays is the only plausible path.
+The road graph size also shapes the algorithm. Assume `1B` directed edges globally after splitting roads at intersections and restrictions. Even a compact edge record of `64` bytes is `64GB` before geometry, turn tables, indexes, live speed arrays, and multiple modes. Replicating the full hot graph in every routing worker is wasteful, but routing workers still need memory-local shards and high-level overlay data. If live traffic updates touch `10M` segments per minute, customization throughput must be measured against that deadline. Global refresh is not inherently impossible: CRP research demonstrates fast continental metric customization. Regional or affected-cell refresh reduces work, but must propagate changed boundary costs through all dependent overlay levels before publication.
 
 Traffic probes have a different shape. If `10M` opted-in moving devices send a location update every `5` seconds during a global peak, ingestion sees `10M / 5 = 2M` probe events per second before sampling and partner feeds. The design must map-match, aggregate, threshold, and downsample before writing serving state; it cannot let raw probes become random writes into the routing graph.
 
@@ -42,7 +44,7 @@ Traffic probes have a different shape. If `10M` opted-in moving devices send a l
 **Question.** How does the API keep a route, its tiles, and its traffic explanation from silently mixing incompatible versions?
 <details><summary>Answer</summary>
 
-Every serving response carries a `map_release_id`; route responses also carry a `traffic_snapshot_id` and freshness metadata. Clients may request `release=current`, but services resolve `current` to an immutable release at the start of a request or navigation session. If a live overlay references an edge absent from that base release, the overlay is ignored and surfaced as a data-quality signal rather than being applied to the wrong road.
+Every serving response carries a `map_release_id`; route responses also carry a `traffic_snapshot_id` and freshness metadata. A client first resolves `current`, then sends that concrete release on tiles, place selection, and routing throughout the session; independently resolving `current` on every request could still mix releases. Incompatible traffic data may fall back to historical estimates, but an unmappable safety closure requires a compatible release, a conservative geographic exclusion, or route refusal—not silently ignoring the closure.
 
 </details>
 
@@ -78,7 +80,7 @@ POST /v1/navigation/{session_id}:reroute
 GET /v1/map-releases/{release_id}/manifest
 ```
 
-Tile APIs are ordinary safe `GET`s because their payloads are immutable by release and cacheable by `ETag`. Search APIs include a `session_id` so autocomplete and final selection can share ranking context and billing without making keystroke retries create duplicate sessions. Route requests are logically reads, but the `Idempotency-Key` still matters for quota, billing, and client retries after timeouts. A timed-out route computation may finish server-side; retrying with the same key should either return the same completed route or attach to the same in-flight work.
+Tile APIs are ordinary safe `GET`s, but only concrete-release URLs are immutable and eligible for long CDN TTLs. The `current` alias/manifest must revalidate or have a short bounded TTL and resolve to a concrete URL; it cannot itself be cached as immutable. Search APIs include a `session_id` so autocomplete and final selection can share ranking context and billing without making keystroke retries create duplicate sessions. Route requests are logically reads, but the `Idempotency-Key` still matters for quota, billing, and client retries after timeouts. A timed-out route computation may finish server-side; retrying with the same key returns the same completed request or attaches to the same in-flight work, with its original freshness. New navigation decisions use a new key and current closure checks rather than treating an old idempotent response as a still-safe route.
 
 The route response includes `route_id`, `map_release_id`, `traffic_snapshot_id`, `traffic_freshness_seconds`, `confidence`, a polyline, maneuvers, warnings, and alternative explanations. Reroute is modeled as a session operation rather than a blind new route because it must avoid oscillating between nearly equal paths and must understand what the driver is already following. Cancellation is best-effort: if a mobile client abandons a route request, the server can stop work only until the computation has already been committed to a shared in-flight cache.
 
@@ -132,6 +134,8 @@ MapRelease
 ```
 
 Canonical features live in a versioned spatial store with provenance and review metadata because ingestion needs history, source comparison, and auditability. Tiles live in object storage keyed by immutable release, style schema, zoom, x, and y, with a CDN in front. Search shards live in geo-text indexes partitioned by region and language with a global fallback for famous places. Routing graph shards are memory-mapped or loaded into RAM by cell, plus a replicated high-level overlay graph. Traffic overlays live in low-latency key-value or in-memory stores partitioned by segment/cell and time bucket; raw probe history belongs in streaming logs and columnar storage, not in the transactional map database.
+
+Transit cannot be modeled merely as a driving speed profile. It also needs versioned stops, trips, service calendars, stop times, transfer constraints, and live delays/cancellations. A schedule-aware transit planner combines those with pedestrian access legs; road modes use their own access restrictions and costs. Cross-region road queries pin a compatible set of regional releases and matching boundary connectors in one manifest, not unrelated regional `current` pointers.
 
 > **Key idea.** The canonical map is a slow, reviewable source of truth; serving uses immutable derived artifacts plus small, expiring dynamic overlays.
 
@@ -220,9 +224,11 @@ Contraction hierarchies solve the static case by ordering nodes by importance an
 
 Customizable Route Planning changes the split. The expensive preprocessing partitions the graph and computes topology structures that do not depend heavily on the exact travel-time metric. A customization phase then computes boundary-to-boundary costs for cells using the current metric. Microsoft Research's CRP work is relevant because it treats new cost functions as a first-class operation rather than as a full rebuild. In this design, the base graph release is stable, while traffic customization refreshes affected cells and overlay arcs. A downtown cell with changing speeds can be recustomized frequently without touching rural cells three states away.
 
-Time dependence adds another trap. The cost of an edge is not just `length / speed_now`. If the driver will reach that edge in `35` minutes, the router should evaluate the predicted speed for that future arrival time. For road traffic, the algorithm depends on the FIFO property: leaving later should not let you arrive earlier on the same edge in a way that violates causality. With FIFO piecewise-linear travel-time functions, time-dependent Dijkstra-like algorithms remain valid. If the system mixes in transit schedules, waiting, or non-FIFO behavior, it must model waiting explicitly rather than pretending every edge has a simple scalar weight.
+Time dependence adds another trap. The cost of an edge is not just `length / speed_now`. If the driver will reach that edge in `35` minutes, the router should evaluate the predicted speed for that future arrival time. FIFO means the arrival function `t + travel_time(t)` is nondecreasing; it is a routing-model assumption, not a law of causality. Enforce it on predicted profiles or use an algorithm that explicitly handles waiting/non-FIFO behavior. Turn bans also require incoming-edge or turn-expanded state, not just a vertex and scalar edge weight.
 
-A practical route query has phases. First, snap origin and destination to plausible directed edges using location, heading, mode, access rules, and confidence. Second, search detailed local cells near each endpoint. Third, traverse the overlay graph across larger regions. Fourth, unpack shortcuts into detailed edges. Fifth, validate dynamic restrictions and closures, because an overlay may close a ramp that the preprocessed graph considers legal. Sixth, generate alternatives that are meaningfully distinct rather than trivial variants.
+Scalar CRP customization for one traffic snapshot does not automatically implement time-dependent routing. Exact time-dependent shortcuts need departure-time cost functions and correct composition through intermediate arrival times. This design either builds those profiles with a compatible algorithm or uses scalar/time-bucketed hierarchy only for candidate generation, then re-searches with time-dependent costs and restrictions, exposing any bounded route-quality approximation. Merely recomputing the ETA on a statically chosen path cannot establish time-dependent optimality.
+
+A practical route query has phases. First, snap origin and destination to plausible directed edges using location, heading, mode, access rules, and confidence. Second, search detailed local cells near each endpoint. Third, traverse a compatible customized overlay graph. Fourth, unpack shortcuts into detailed edges. Fifth, validate dynamic restrictions and closures at predicted traversal times. If validation fails, invalidate the affected shortcuts and re-search or refuse the route within the latency budget; do not return the illegal path with only a warning. Closure updates arriving after the pinned snapshot trigger navigation revalidation/rerouting. Sixth, generate meaningfully distinct, independently validated alternatives.
 
 ```mermaid
 sequenceDiagram
@@ -238,6 +244,7 @@ sequenceDiagram
     R->>T: Pin compatible traffic snapshot
     R->>G: Local search plus overlay traversal
     R->>T: Validate closures and time-dependent costs
+    Note over R,G: On violation, re-search safely or return no route
     R->>E: Refine ETA residual
     R-->>C: Route, ETA, release, freshness
 ```
@@ -267,7 +274,7 @@ Raw location events are not traffic. GPS drifts into frontage roads, urban canyo
 
 Map matching is a probabilistic inference problem. Given latitude, longitude, accuracy radius, heading, speed, recent path, and road topology, the matcher selects likely directed edges. A hidden Markov model or similar path-continuity method avoids snapping every point independently. Independent snapping causes impossible jumps between parallel roads and overreacts to noisy points near interchanges. Uber has described driver GPS pings on the order of seconds being map-matched to a global road graph; at that scale, map matching is a hot production service, not offline cleanup.
 
-After map matching, aggregation estimates speed for segments or corridors by time bucket. Sparse roads rely more on historical profiles. Dense roads can use live observations with higher confidence. Incidents and closures are different from ordinary speed estimates: a verified closure should set a hard prohibition or large penalty with an expiry, while ordinary congestion is a soft cost. Every output includes confidence, source mix, and expiry. If a traffic overlay expires, routing should decay toward historical speeds rather than keep stale congestion forever.
+After map matching, aggregation estimates speed for segments or corridors by time bucket. Sparse roads rely more on historical profiles. Dense roads can use live observations with higher confidence. A verified closure is a hard prohibition during its effective interval, not a large finite penalty that a shortest-path search can still choose. Ordinary congestion is a soft cost and expired speeds may decay toward historical estimates. Closure metadata separately distinguishes a known reopening from an expired report: unknown status needs refresh or conservative exclusion rather than inferring that the road reopened. Every output includes confidence, source mix, and freshness.
 
 Historical data must adapt to regime changes. Google has written about combining live traffic with historical patterns and emphasizing more recent weeks when COVID-era traffic changed normal behavior. The general design lesson is to keep history time-decayed and regime-aware. A holiday, storm, roadwork season, or pandemic can make a five-year average actively misleading.
 

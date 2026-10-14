@@ -32,11 +32,11 @@ That constraint forces the main mechanisms in the design: host-sharded frontiers
 
 Assume illustrative scale of `10B` known canonical URLs, `3B` retained pages, and `1B` fetch attempts per day. The average fetch rate is `1B / 86,400 = 11,574` fetches per second; a peak factor of about `4.3` gives roughly `50,000` fetches per second. That sounds large, but it is easy to parallelize across workers. The harder number is host fan-out: with `100M` known origins, most origins are idle at any moment, while a small set of popular hosts contribute a large fraction of URLs. The scheduler must efficiently find eligible origins without scanning millions of empty or sleeping queues.
 
-If the average compressed response is `500 KiB`, daily ingress is `1B × 500 KiB = 500,000,000,000 KiB`, which is about `466 TiB` per day. At peak, bandwidth is `50,000 × 500 KiB = 25,000,000 KiB/s`, about `23.8 GiB/s` before protocol overhead. This number drives streaming fetches, response caps, object-storage writes, parser backpressure, and a smaller indexing prefix. For example, the system may retain diagnostic objects up to `20 MiB`, but parse and index a bounded prefix so a handful of huge pages cannot monopolize CPU and storage.
+If every request returned an average compressed body of `500 KiB`, the upper-envelope daily ingress would be `1B × 500 KiB = 500,000,000,000 KiB`, about `466 TiB`. At peak, `50,000 × 500 KiB` is about `23.8 GiB/s` before protocol overhead. Actual bytes depend on the mix of full pages, robots, errors, and bodyless `304` responses. This drives streaming fetches, response caps, storage, and parser backpressure. For example, retain diagnostic objects up to `20 MiB` but parse/index a bounded prefix, tracking truncation rather than treating partial bytes as a complete page.
 
-Discovery has a larger internal multiplier. If each fetched page exposes `30` links before filtering, the parser emits `1B × 30 = 30B` discovered links per day. Even if canonicalization and policy reject `90%`, `3B` candidate insertions per day still hit the URL seen path, about `34,722` writes per second on average. That implies the seen store must be an authoritative, horizontally partitioned KV/LSM store, with Bloom filters only as a cache. A false positive in an in-memory filter cannot be allowed to permanently suppress a real URL.
+Discovery has a larger internal multiplier. At the upper envelope of `1B` parsed pages with `30` links each, the parser emits `30B` discovered links per day. Rejecting `90%` still leaves `3B` candidate admission attempts, about `34,722/s`; not all become new records. Actual page count is lower when requests go to robots, retries, redirects, or unchanged pages. The seen store must be authoritative and horizontally partitioned, with Bloom filters only as accelerators; a false positive cannot permanently suppress a real URL.
 
-Freshness capacity is also finite. If the crawler spends `1B` daily fetches across `10B` known URLs, the naive average revisit period is `10` days. But a news home page may need minutes and a static PDF may need months. A single FIFO recrawl queue would waste requests on stable pages while fresh pages go stale. The recrawl planner must estimate expected value: probability of change multiplied by page importance, divided by fetch cost and host pressure.
+Freshness capacity is also finite. Treat `1B/day` as a total HTTP-request budget: robots refreshes, redirect hops, retries, and conditional `304` requests consume it too. The `10B / 1B = 10` day revisit period is only an ideal lower bound if every request revisits a different known URL. Refreshing robots once daily for all `100M` origins would alone leave at most `900M` page requests, or `10B / 900M = 11.1` days before discovery, redirects, and retries. In practice refresh robots only for active origins and allocate by value. A news home page may need minutes and a static PDF months. A FIFO recrawl queue wastes scarce capacity on the wrong pages.
 
 > **Key idea.** The capacity math says bandwidth and storage are expensive, but the architecture is shaped by scarce per-host request slots. Every stage should protect those slots from duplicates, traps, retries, and low-value recrawls.
 
@@ -154,7 +154,7 @@ URL canonicalization and an atomic seen-set insert happen before frontier admiss
 
 ### Fix 3: Fenced leases and idempotent completion
 
-The frontier issues a `FetchAttempt` with a lease token and fencing epoch. Completion updates attempt state and URL metadata only if the token is still current. If the worker dies, the lease expires and another attempt can run. If the first worker later returns, its completion is stale and cannot overwrite the newer attempt. The object store remains append-only; unreferenced objects from ambiguous failures expire through lifecycle garbage collection.
+The frontier issues a `FetchAttempt` with a lease token and fencing epoch. Completion atomically updates attempt state, URL metadata, and a parse-work outbox only if the token still owns the attempt. Retries return the recorded completion; stale attempts cannot overwrite it. Expiry permits retry only after the old network operation has been fenced or its enforced request lifetime has elapsed, not merely because metadata ownership changed. The object store remains append-only; unreferenced objects from ambiguous failures expire through lifecycle garbage collection.
 
 ### Fix 4: Freshness planner and crawl budget allocation
 
@@ -167,13 +167,13 @@ flowchart TD
     Seeds["Seeds, sitemaps, and push hints"] --> Ingest["URL ingestion and validation"]
     Ingest --> Canon["Canonicalizer"]
     Canon --> Seen["Authoritative URL seen store"]
-    Seen --> Frontier["Host-sharded frontier"]
+    Seen -->|"durable admission outbox"| Frontier["Host-sharded frontier"]
     Frontier --> Scheduler["Politeness scheduler"]
     Scheduler --> Lease["Fenced fetch lease"]
     Lease --> Fetcher["Sandboxed fetch worker"]
     Fetcher --> Raw["Immutable object store"]
     Fetcher --> Attempts["FetchAttempt metadata"]
-    Fetcher --> Parser["Parser and link extractor"]
+    Attempts -->|"committed parse-work outbox"| Parser["Parser and link extractor"]
     Parser --> Links["Link stream"]
     Links --> Canon
     Parser --> Index["Index and graph streams"]
@@ -183,7 +183,7 @@ flowchart TD
     Robots --> Fetcher
 ```
 
-A discovered URL first enters ingestion, where invalid schemes, blocked hosts, policy exclusions, and obvious traps are rejected. Canonicalization computes `url_hash`; an atomic put-if-absent in the seen store decides whether this is a new URL or just another signal for an existing record. The host-sharded frontier stores an `OriginQueueItem` under the URL's origin. The scheduler waits until that origin is eligible, checks the current robots policy, issues a fenced `FetchAttempt`, and sends it to a sandboxed fetcher. The fetcher writes bytes to object storage, commits attempt metadata, emits parse work, and the parser sends extracted links back through ingestion. Recrawl signals update `next_fetch_at` and frontier priority without bypassing host politeness.
+A discovered URL first enters ingestion, where invalid schemes, blocked hosts, policy exclusions, and obvious traps are rejected. Canonicalization computes `url_hash`; an atomic put-if-absent stores the canonical identity and a frontier-admission outbox item in the same seen-store transaction. The origin-sharded frontier idempotently consumes that item. Without this durable bridge, crashing after "seen" but before enqueue would permanently lose the URL. The scheduler checks origin eligibility and robots, issues a fenced attempt, and the fetcher stores bytes before atomically committing metadata and parse work. Parser outputs carry page-version IDs, are replay-safe, and cannot replace newer URL metadata. Recrawl signals update priority without bypassing politeness.
 
 > **Key idea.** Each component traces back to a specific failure of the naive design: host queues protect politeness, dedup protects budget, leases protect retries, and recrawl scoring protects freshness.
 
@@ -202,7 +202,9 @@ A global priority queue looks attractive because every URL can have one score. I
 
 The scheduler needs two levels. The front level chooses broad crawl classes or score buckets: urgent recrawls, high-importance discovery, normal recrawls, low-value exploration, and retry work. The back level stores queues per origin. A scheduler shard owns many origins, but each origin has one governor: `next_allowed_at`, `in_flight_count`, `max_concurrency`, `crawl_delay_ms`, health state, robots policy, and pause state. The shard keeps an origin eligibility heap ordered by `next_allowed_at`; when the heap's minimum is in the past, the shard can lease work for that origin.
 
-Within an origin, the scheduler chooses the best URL according to priority, freshness, age, and budget class. It then advances the origin's `next_allowed_at`. If `crawl_delay_ms` is `1000` and `max_concurrency` is `1`, the next lease cannot issue for another second. If the host returns `429` with `Retry-After`, the scheduler pushes `next_allowed_at` to that time and may lower `max_concurrency`. If timeouts or 5xxs rise, the host health controller slows the origin, matching Google's published crawl-budget intuition that rate limit falls when the site is unhealthy. The point is not to punish a site; it is to avoid wasting requests and causing harm when the server is already struggling.
+Within an origin, the scheduler chooses the best URL according to priority, freshness, age, and budget class. If spacing is `1000 ms` and concurrency is `1`, the next request cannot start before both the spacing deadline and completion of the previous request; a ten-second response does not free a slot after one second. Enforce spacing at actual request start, not just lease issuance, because delayed workers could otherwise start many preissued leases together. A `429` with `Retry-After` extends the deadline, and rising timeouts/5xxs reduce the rate. Robots use scheme/host/port origin identity, while shared host/domain or destination-IP budgets can additionally prevent HTTP/HTTPS and aliases from multiplying load on the same server.
+
+Automatic redirect following must not bypass the governor. Every hop obtains a destination-origin budget and robots decision (except the robots bootstrap fetch itself), with a bounded redirect chain. A controlled egress layer validates the current owner/attempt token immediately before opening the request and owns the connection lifetime. It resolves and pins approved public IPs, blocks non-public destinations, and repeats validation on redirects and new connections; parser sandboxing alone does not prevent server-side requests to internal addresses. Credentials and cookies are not forwarded across origins. These checks also cover robots redirects and rendering subresources.
 
 Sharding must preserve that single governor. The partition key is `origin_id`, not URL hash, for scheduling state. A huge host may have millions of queued URLs, and it is tempting to split them across many shards for throughput. That would break politeness unless all shards coordinate through one limiter, which becomes the real bottleneck anyway. The better design is to subpartition the queue storage by priority bucket or page type while keeping one origin owner that grants leases. For very large sites with explicit cooperation, the policy can define finer identities such as host plus path prefix, but that is a policy decision, not an accidental storage split.
 
@@ -215,6 +217,7 @@ sequenceDiagram
     participant H as "Origin eligibility heap"
     participant Q as "Per-origin queue"
     participant O as "Origin state"
+    participant E as "Controlled egress"
     W->>S: lease(capacity=100)
     S->>H: pop origins with next_allowed_at <= now
     H-->>S: origin example.com
@@ -222,11 +225,14 @@ sequenceDiagram
     S->>Q: pop best URL for example.com
     S->>O: increment in_flight and advance next_allowed_at
     S-->>W: attempt_id, lease_token, URL, policy_version
+    W->>E: start request under current token
+    E->>O: recheck policy, ownership, spacing, and live slots
+    E-->>W: response or fenced/blocked result, connection closed
     W-->>S: complete(attempt_id, lease_token)
     S->>O: decrement in_flight and update health
 ```
 
-The failure modes are subtle. Clock skew can make one shard think an origin is eligible too early after ownership transfer, so origin ownership carries an epoch and the new owner waits out the old lease window or reads replicated state before issuing leases. Scheduler crashes can leave `in_flight_count` inflated; lease expiry reconciliation decrements expired attempts and reschedules retryable URLs. A robots update can disallow already queued URLs; the scheduler checks policy at lease time, not only at enqueue time, so stale queue items are dropped or marked denied before fetch.
+The failure modes are subtle. A metadata epoch cannot stop a paused worker from sending an HTTP request to a publisher that does not understand fencing tokens. Ownership transfer therefore fences old egress access and carries forward live request accounting, or waits out the maximum authorized start window plus enforced request lifetime and clock uncertainty. Reading replicated state alone is not sufficient. Reconciliation releases each expired attempt's in-flight slot once, only after its connection is closed or bounded lifetime passes. Robots decisions are checked again at request start if the leased policy expired or changed. On uncertain ownership, stop that origin rather than letting both regions issue traffic.
 
 Signals worth watching: per-origin request rate, eligible-origin lag, heap size, politeness violations, `429/503` rate, retry-after volume, scheduler lease expirations, and changed pages per 1,000 fetches.
 
@@ -251,11 +257,11 @@ Deduplication starts before the network. The parser may emit `30B` raw links per
 
 The dangerous word is "safe." Query parameters cannot be globally stripped. `?session=...` may be a trap parameter on one site, while `?id=123` may identify content on another. Canonical tags and redirects are also hints, not authority. A malicious page can claim a canonical URL on a victim domain; a redirect chain can loop; a soft-404 page can make many distinct URLs look alike. The crawler records hints and final URLs, but the canonical URL identity used for scheduling changes only through conservative rules and observed evidence.
 
-The URL seen path needs an atomic put-if-absent. Two parsers can discover the same new URL concurrently; both may pass a local Bloom filter, and both may try to enqueue. The authoritative store performs `insert url_hash if absent`; only the winner creates a new `UrlRecord` and `OriginQueueItem`. The loser can update discovery evidence, such as last seen time or inbound link count, without duplicating fetch work. This is a race condition hidden inside many simplistic crawler designs: deduplication is not a batch cleanup step; it is part of admission control.
+The URL seen path needs an atomic put-if-absent with canonical-string collision verification. Two parsers can discover the same URL concurrently. Only the winner creates the seen record and durable admission outbox item; the frontier deduplicates deliveries by URL/admission generation. The loser updates discovery evidence without duplicating fetch work. The URL-hash seen store and origin-sharded frontier do not share a local transaction, so "only the winner enqueues" without an outbox is incomplete.
 
-A Bloom filter still helps because the write path is enormous. It can reject obvious repeats in memory and protect the KV store from hot rediscovery. But false positives are inevitable, especially across billions of URLs and rolling filter generations. To preserve coverage, the system either uses the filter only to skip an expensive precheck before still sampling/confirming positives, or treats it as a cache backed by the authoritative store. When rotating generations, the crawler should measure false-positive rate against sampled authoritative lookups. A rising false-positive rate is a coverage bug, not merely an efficiency metric.
+A Bloom filter still helps, but a positive is not proof that a URL was admitted. Every positive not covered by an exact cache of durably admitted URLs must be checked in the authoritative store or recorded for guaranteed deferred verification. Sampling positives only measures loss; it does not prevent an unseen URL from disappearing permanently. A negative may skip a read but still requires atomic insertion to resolve concurrent discoveries. Rotating filters and sampled false-positive metrics are operational optimizations, not the coverage guarantee.
 
-After fetch, exact content deduplication solves a different problem. The same bytes can appear at `http://`, `https://`, `www`, mobile hosts, mirrors, and duplicated product pages. Storing raw bodies by SHA-256 lets many `PageVersion` rows reference one `ContentObject`. This does not mean the URLs are duplicates for crawling. They may have different robots policies, different inbound links, different canonical hints, or different importance. Exact byte identity saves storage and parser work; it should not erase URL history.
+After fetch, exact content deduplication solves a different problem. The same bytes can appear under many URLs, so SHA-256-addressed objects can be shared. They still have different robots policies, HTTP metadata, and base URLs: identical HTML containing a relative link can resolve to different destinations. Reuse context-independent parsing only; resolve links and indexing policy per page version. Hashes of truncated prefixes are not full-body equality, so preserve truncation state and never collapse complete-page identity based solely on a shared prefix.
 
 Near-duplicate detection is looser. Google's SimHash work showed how pages represented by feature fingerprints can be compared by Hamming distance, making large-scale near-duplicate grouping feasible. This is valuable for boilerplate-heavy pages, mirrors, infinite calendars, and faceted navigation. A near-duplicate cluster can lower indexing priority, reduce recrawl demand, or raise trap scores. It must not be the authority for seen URLs because near duplicates can still represent distinct products, articles, legal notices, or language variants. A robust system uses SimHash as a signal, not a verdict.
 
@@ -265,7 +271,7 @@ flowchart TD
     Canon --> Policy["Scheme, host, and path policy"]
     Policy --> Filter["Bloom filter cache"]
     Filter --> Store["Authoritative seen store CAS"]
-    Store -->|"insert wins"| Enqueue["Create queue item"]
+    Store -->|"insert and outbox commit"| Enqueue["Idempotently create queue item"]
     Store -->|"already exists"| Signals["Update discovery signals"]
     Enqueue --> Fetch["Fetch URL"]
     Fetch --> Hash["SHA-256 content hash"]
@@ -295,13 +301,13 @@ The hints become freshness signals that raise priority, not direct fetch command
 
 </details>
 
-A crawler that only discovers new links becomes stale. A crawler that recrawls everything on a fixed interval wastes most of its capacity. With `10B` known URLs and `1B` daily fetches, the average revisit interval is `10` days, but averages are misleading. A high-value news page can become stale in minutes. A stable documentation page may be unchanged for months. Recrawl scheduling is the mechanism that turns limited host slots into freshness.
+A crawler that only discovers new links becomes stale. A crawler that recrawls everything on a fixed interval wastes capacity. With `10B` known URLs and `1B` daily requests, ten days is only the ideal revisit lower bound before robots, retries, and discovery overhead. A high-value news page can become stale in minutes while stable documentation remains unchanged for months. Recrawl scheduling turns limited host slots into freshness.
 
 The naive policy is `next_fetch_at = last_fetch_at + 7 days`. It fails in both directions: frequently changing pages are stale, and stable pages consume capacity. A better policy estimates change probability and value. Inputs include previous content hashes, `ETag`, `Last-Modified`, status history, page class, inbound link importance, sitemap hints, feed entries, push hints, and host health. If a URL changes on most fetches, shorten the interval. If it returns repeated `304 Not Modified` or identical hashes, lengthen it. Add jitter so millions of pages from the same host do not become due at exactly midnight.
 
 The scoring objective should be explicit: expected value per fetch. A simplified score might be `importance × probability_of_change × freshness_urgency / cost`. Cost includes bandwidth, parser CPU, rendering need, and host pressure. This is why Bing's crawl efficiency idea matters. A dashboard that celebrates pages per second can make the crawler worse by rewarding unchanged recrawls and duplicate discovery. Better metrics ask how many valuable changed pages were found per 1,000 fetches, and how much webmaster load was imposed to find them.
 
-Robots policy sits in the critical path. RFC 9309 formalized the Robots Exclusion Protocol, including matching semantics and crawler behavior that had long been inconsistent. The scheduler should evaluate the current parsed policy at lease time, not just at discovery time, because rules change. The raw robots file and parsed version are stored with expiry so an operator can later answer, "Why did we fetch this URL?" If robots is unknown for a host, fetch robots first. If a previously reachable robots file becomes temporarily unavailable, fail closed for new fetches or use an unexpired cached policy according to the configured conservative mode. `Crawl-delay` is not a portable RFC requirement, but many crawlers honor it as a crawler-specific extension or operator policy.
+Robots policy sits in the critical path. Fetch unknown policies before ordinary pages, accounting for those requests in the host budget. RFC 9309 distinguishes unavailable robots (HTTP 4xx, which may permit crawling) from unreachable robots (network errors/5xx, requiring disallow absent a usable cached policy). This design additionally backs off on 429 and never treats it as permission. Parse at least 500 KiB, apply the longest matching rule and allow on equivalent allow/disallow ties, and normally refresh within 24 hours; the RFC permits extended cache use when unreachable. Follow at least five robots redirects subject to network safety, applying the result to the original authority. `Crawl-delay` is an optional extension/operator policy, not a standardized RFC directive.
 
 Push hints are useful because polling the whole web for changes is wasteful. IndexNow-style notifications, sitemaps, feeds, and Cloudflare-like crawler hints from cache misses or purges can all reduce latency. Cloudflare's Crawler Hints architecture is instructive: capture events, validate them, deduplicate and buffer URLs, batch dispatch, and monitor lag and memory. The crawler should use the same separation. Hint ingestion writes `FreshnessSignal` records and updates URL priority. It does not directly enqueue unlimited fetches. Otherwise a noisy feed, partner bug, or adversarial source could overwhelm a host or starve organic discovery.
 
@@ -318,7 +324,7 @@ stateDiagram-v2
     Leased --> RetryLater: transient failure
     Fetched --> Scheduled: compute next_fetch_at
     RetryLater --> Scheduled: backoff with jitter
-    Scheduled --> Eligible: next_fetch_at reached
+    Scheduled --> RobotsCheck: next_fetch_at reached
     Denied --> RobotsCheck: policy expires or changes
 ```
 
@@ -338,11 +344,11 @@ Signals worth watching: changed pages per 1,000 fetches, `304` rate, unchanged r
 
 **10x scale.** At `10B` fetches per day, the average rate becomes `10B / 86,400 = 115,741` fetches per second and a similar peak factor would exceed `500,000` fetches per second. Fetch workers, object storage, parser streams, and seen-store partitions scale horizontally, but per-host governors do not loosen. The main changes are more scheduler shards, stricter admission control, more aggressive object lifecycle tiering, and stronger separation between discovery, recrawl, and rendering budgets.
 
-**JavaScript-heavy web.** If many valuable pages require rendering, rendering becomes a scarce secondary pipeline. The default fetch still downloads HTML and extracts cheap links. A classifier sends selected pages to browser rendering based on importance, content gaps, and site behavior. Rendered results feed the same `PageVersion` and link streams, but rendering gets separate quotas because CPU cost and attack surface are much higher than plain HTTP fetching.
+**JavaScript-heavy web.** Rendering is a scarce secondary pipeline selected by importance and content gaps. Rendered results use the same page-version and link protocols, with separate CPU quotas. Every browser subresource, script-triggered request, and redirect still passes through controlled egress, destination budgets, and robots policy; sandboxing a browser does not stop it from generating excessive or internal-network traffic.
 
 **Cooperative large sites.** Some large publishers or platforms may provide sitemaps, feeds, IndexNow updates, or explicit crawl windows. The design does not bypass the frontier; it creates higher-confidence `FreshnessSignal` records and possibly a negotiated `Origin` policy with higher concurrency or path-level budgets. The host owner still controls a single politeness governor so internal queue sharding cannot multiply traffic accidentally.
 
-**Regional ownership and outages.** In multi-region deployment, each origin has a home region and owner epoch. Discoveries route to the home owner; raw content and seen-store updates replicate asynchronously. During a regional outage, a secondary can acquire a higher epoch after a safety delay and resume from replicated origin state. The system prefers temporary staleness over two regions crawling the same host concurrently.
+**Regional ownership and outages.** Each origin has a home owner with consensus-backed scheduling/attempt authority. A secondary fences old egress and recovers live-request accounting or waits out the enforced safety window before resuming. An asynchronous snapshot alone can miss outstanding attempts and next-allowed deadlines. Raw objects may replicate asynchronously, but retain discovery/outbox evidence until durable so accepted URLs are recoverable. Prefer temporary staleness to overlapping origin traffic.
 
 ## 8. The transferable pattern
 
@@ -404,3 +410,4 @@ The crawler is shaped by politeness: the fleet can fetch at massive aggregate ra
 | Microsoft Bing Webmaster | [Bingbot Series: Maximizing Crawl Efficiency](https://blogs.bing.com/webmaster/2018/10/bingbot-Series-Maximizing-Crawl-Efficiency/) | Frames crawl quality as fresh/new content discovered per fetch, not merely pages crawled per second. |
 | Microsoft Bing Webmaster | [IndexNow: Announcing Sharing of Submitted URLs](https://blogs.bing.com/webmaster/2022/1/IndexNow-Announcing-Sharing-of-Submitted-URLs/) | Shows how push URL-change notifications can improve freshness and reduce waste while still needing validation. |
 | Cloudflare | [From 0 to 20 billion - How We Built Crawler Hints](https://blog.cloudflare.com/from-0-to-20-billion-how-we-built-crawler-hints/) | Details a production freshness-hint pipeline with Kafka, Redis dedupe generations, batching, retries, and observability. |
+| IETF | [RFC 9309: Robots Exclusion Protocol](https://www.rfc-editor.org/rfc/rfc9309.html) | Normative matching, redirect, status, caching, and minimum parsing-limit rules; distinguishes the standard from crawler-specific policy. |

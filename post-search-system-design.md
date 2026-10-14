@@ -45,7 +45,7 @@ Finally, consider tail latency. If a query fans out to 256 shards and each shard
 **Question.** What makes pagination and retries safe when the index changes every second?
 <details><summary>Answer</summary>
 
-The search API must bind a cursor to a query fingerprint, a point-in-time view or index generation, and the last returned sort tuple. A retried request can then return the same next page instead of silently running against a refreshed corpus that may skip or duplicate results.
+The cursor binds the viewer, query fingerprint, an actual point-in-time view, and a search-session page boundary. Shard retrieval cursors and application reranking positions are separate. Retries reuse the same candidate page while rechecking current visibility; a mutable index generation alone is not a snapshot.
 
 </details>
 
@@ -69,7 +69,7 @@ Content-Type: application/json
 DELETE /internal/search/denylist/{post_id}
 ```
 
-The public search endpoint is synchronous because normal retrieval must fit within the interactive latency budget. It returns a signed cursor that contains the query fingerprint, point-in-time identifier or index generation, final sort tuple `(score, created_at, post_id)`, locale, safe-search mode, and expiry. Offsets are deliberately absent. With offsets, every shard must score and discard all previous results, and refreshes between pages create duplicates or gaps. With `search_after`, each shard can continue from a deterministic tuple inside a bounded snapshot.
+The public endpoint is synchronous and returns a signed, viewer-bound cursor referencing query, locale, safe-search, expiry, and search-session page state. The session retains actual PIT handles and each retrieval boundary `(retrieval_score, created_at, post_id)` with a unique engine tie-breaker where required. `search_after` uses exactly the shard query's sort, never an application reranker's score. The session stores the bounded candidate pool and its reranked order separately. A generation name only stabilizes routing unless its contents are immutable; refreshing the same generation still changes results.
 
 Suggestions use a separate endpoint because typeahead has a different latency target and a different index shape. It should use prefix dictionaries, popular query caches, and safe locale-specific normalization, not the full ranking stack. The internal indexing endpoint is shown as an HTTP contract for clarity, but production indexers normally consume from a durable stream. Its idempotency key is the event ID; correctness comes from the `post_version`, not from assuming exactly-once delivery. The denylist endpoint is a fast safety valve for urgent removals: a legal or privacy action can block a post ID at query time before the durable tombstone has propagated through every shard.
 
@@ -81,7 +81,7 @@ Start with the obvious entity: `Post(post_id, author_id, body, created_at)`. Tha
 
 Next, the system needs a way to get mutations out of the post store without losing them. Publishing directly to a message bus after committing the post looks fine until the process crashes between commit and publish. The post exists, but search never hears about it. Put an `IndexOutbox` row in the same transaction as the post mutation. A relay publishes it later and marks it sent. This is at-least-once delivery, so every downstream write must be idempotent.
 
-Now consider deletes and reordering. If event version 8 deletes a post and an older version 7 upsert arrives late, a naive indexer can resurrect the post. The search document therefore stores `post_version`, and every upsert or tombstone is conditional: apply only when `incoming_version > indexed_version`. Deletes are not just removals; they are versioned tombstones kept long enough to defeat delayed upserts and to be compacted only after the event-retention window.
+Now consider deletes and reordering. If event version 8 deletes a post and an older version 7 upsert arrives late, a naive indexer can resurrect the post. The search document therefore stores `post_version`, and every content upsert or tombstone is conditional: apply only when `incoming_version > indexed_version`. Deletes are not just removals; they are versioned tombstones kept beyond the event-retention window until older workers, backfills, and replay sources are fenced.
 
 Permissions add another split. Public, safe fields can be indexed, but viewer-specific authorization cannot be fully baked into a global index. Blocks, private audience changes, and legal deny rules change faster than segment merges. The index can store cheap coarse fields like `visibility_class`, `author_id`, `language`, `created_at`, and `policy_state`, but the query path must recheck current deny and visibility state for final candidates. If a permission model cannot be replicated safely, that content should not enter this index at all; Slack's enterprise search made the same trade-off for external sources by querying partner APIs at request time rather than caching data whose permissions it could not safely own.
 
@@ -125,6 +125,7 @@ SearchDocument
 - visibility_class
 - policy_state
 - post_version
+- enrichment_version
 - indexed_at
 - snippet_source
 
@@ -175,7 +176,7 @@ Discord's message-search evolution is useful evidence. Their earlier design rout
 
 Shard retrieval should do cheap lexical work: parse terms, traverse postings, apply static filters, compute BM25-like scores, and return local top `K`. The coordinator merges those candidates, applies fast denylist and visibility filters, and sends only the top few hundred or thousand to a ranking service. The ranking service can use freshness, quality, engagement, and viewer-author affinity without putting dynamic social features in every posting-list traversal. Slack's search architecture follows this shape: Solr retrieval first, application-layer reranking with work-graph features second. That split is why personalization can improve relevance without turning every shard into a user-specific ranking service.
 
-Hydration is the final safety gate. The post service or a read-optimized post view returns display fields only if the viewer can currently see the post. If hydration says no, the coordinator drops the candidate and may backfill from the next ranked candidates. This costs extra reads, but it prevents stale index state from leaking private or removed content.
+Hydration is the final safety gate. It checks authoritative current public-search eligibility, viewer access, and content version even on query-cache hits. If the indexed version differs from the current post, drop it until reindexed or re-evaluate the query and generate snippets from the current authorized body. An ACL check alone would still leak redacted text through old stored snippets, highlights, or match existence. Cache entries and PITs retain candidate IDs, not reusable authorization decisions; uncertainty fails closed.
 
 ### Fix 5: Rebuilds, dark reads, and alias swaps
 
@@ -224,9 +225,9 @@ Every mutation carries a monotonically increasing `post_version`, events are key
 
 The naive indexing path calls the search cluster in the post-write request. It feels fresh because the write and index call happen together, but it has bad failure semantics. If the post transaction commits and the indexing call times out, retrying the whole post write risks duplicate posts; not retrying leaves the post absent from search. If the index call succeeds and the post transaction later rolls back, search sees a ghost. Even when both systems are up, a delete can race an older upsert and resurrect content.
 
-The durable pattern is a transactional outbox plus idempotent consumers. The post service commits the authoritative mutation and an outbox row atomically. The outbox relay can crash, publish twice, or publish late; downstream correctness does not depend on exactly-once messaging. The indexer receives `post_id`, `post_version`, and operation, then fetches the canonical post rather than trusting a large event payload. Fetching canonical state matters because enrichment may need current policy, language, and author state, and because a compact event is easier to retain and replay.
+The durable pattern is a transactional outbox plus idempotent consumers. The relay can crash, publish twice, or publish late. The indexer treats an event as a wake-up hint and fetches the canonical post or retained tombstone. It indexes the fetched payload under the fetched `post_version` and current operation/state, not the older event's version or verb. Otherwise a delayed delete event could incorrectly delete a later restored post, or new content could be mislabeled as an old version.
 
-The index write is conditional. For an upsert, the shard checks the currently indexed version for that `post_id`. If `incoming_version <= indexed_version`, the event is stale and is ignored. For a delete, the shard writes a tombstone containing the delete version. That tombstone may not be visible to normal users as a result, but it is still part of the shard's version memory. Without it, a delayed version 7 upsert could recreate a post after a version 8 delete. Tombstones are compacted only when the stream retention window and rebuild protocol guarantee that older upserts cannot appear again.
+The index write is conditional: content upserts with `incoming_version <= indexed_version` are ignored. A delete leaves an explicit non-searchable tombstone document or durable version ledger, not merely an engine delete whose version memory may expire. Elasticsearch, for example, retains deleted-version information only for its configured `index.gc_deletes` period. Tombstones are compacted only after fencing older retries, backfills, snapshots, and replay sources; log retention alone does not bound an already-running stale worker.
 
 ```mermaid
 sequenceDiagram
@@ -246,16 +247,19 @@ sequenceDiagram
     P->>DB: Commit delete and outbox event
     P->>D: Add post ID immediately
     DB-->>B: Relay event version 2
+    B-->>I: Delete wake-up
+    I->>DB: Fetch canonical tombstone version 2
     I->>S: Conditional tombstone version 2
     B-->>I: Delayed duplicate upsert version 1
-    I->>S: Ignore because version 1 is stale
+    I->>DB: Fetch current canonical tombstone version 2
+    I->>S: No-op because version 2 is already indexed
 ```
 
 Freshness then depends on refresh mechanics. Lucene-like systems write new documents into in-memory buffers, flush segment files, and reopen searchers so the segment becomes visible. Refreshing every second makes posts searchable quickly, but it creates many small segments. Small segments increase per-query overhead, reduce compression efficiency, and create merge backlog. The design therefore separates the active tier from colder optimized segments. Twitter's Earlybird and Omnisearch lessons fit here: real-time search needs postings and refresh paths designed for concurrent writes, while older data benefits from optimized read-only formats with compression and skipping. We do not need to copy a specific implementation, but we should preserve the principle: hot mutable data and cold optimized data have different physical needs.
 
-One subtlety is partial freshness. X reduced search indexing latency to about one second by removing a buffering step and indexing immediately available fields first, with delayed fields updated later. In this design, the initial searchable document contains body tokens, author, language, created time, and coarse policy state. Resolved links, slower quality scores, and some engagement features arrive as partial updates. That means the first few seconds of ranking may be less rich, but the post is discoverable. Safety still comes from query-time denylist and hydration, not from assuming every policy feature is already indexed.
+One subtlety is partial freshness. X described indexing immediately available fields first and delayed fields later. Here, initial indexing supplies text and basic metadata. A later enrichment carries `(post_version, enrichment_version)` and conditionally updates only enrichment fields when the indexed post version still matches and the enrichment revision is newer. Otherwise the strict content-version rule would reject every enrichment of the same post version, or an old enrichment could restore stale text after an edit. New content versions reset enrichment state; safety remains in final authoritative checks.
 
-Backfills use the same version semantics. Build generation `G2` from the post store, capture stream offset `O`, replay events after `O`, compare counts and sampled queries against `G1`, dark-read production traffic, then move the read alias. If a backfill sees post version 6 and replay later sees version 7, the same conditional write applies. If the new generation lags too far behind, the alias does not move.
+Backfills use the same version semantics. Before scanning, establish a consistent source snapshot and its corresponding CDC/outbox replay boundary `O` (a vector for partitioned streams), retaining all later changes. Build `G2` from that snapshot and replay after `O`; capturing `O` only after the scan would miss changes to rows already visited. With an outbox relay, account for unpublished rows at the boundary rather than assuming a sampled broker head corresponds to the database snapshot. Validate and refresh G2 through a cutover watermark before atomically changing the read alias. Existing PIT sessions stay on their retained generation until expiry; new sessions use G2. Keep old-generation replay during the rollback window.
 
 Signals worth watching: commit-to-searchable lag by percentile, outbox relay lag, stream consumer lag, refresh duration, segment count per shard, merge backlog, stale-event drop rate, tombstone ratio, and urgent-removal propagation time.
 
@@ -336,7 +340,7 @@ Meta's Unicorn and Graph Search add another lesson: social search often needs qu
 
 Deletes and permissions cut across every stage. The index stores `visibility_class` and `policy_state` so obviously ineligible documents are filtered early. A legal removal or emergency privacy change writes the `RemovalDenylist` immediately, so the coordinator can drop the post even before the shard refresh sees the tombstone. Blocks and follower-only audience checks can be represented as compact query-time filters only if they are fresh enough and small enough. When they are not, hydration is the final authority. The post hydration service fetches display fields and returns them only if the viewer can currently see the post.
 
-This creates a backfill problem. Suppose each shard returns 100 candidates and the coordinator merges 2,000 candidates, but policy and hydration remove many of the top 20. The coordinator should keep a reserve pool and, if needed, ask shards for a deeper page with the same point-in-time view. It must not fill holes with unchecked documents. It also must not reveal that a removed or blocked post matched the query by returning special placeholders.
+This creates a backfill problem. Suppose each shard returns 100 candidates and the coordinator merges 2,000 candidates, but policy and hydration remove many of the top 20. While constructing the bounded session pool, the coordinator can ask shards for deeper pages under the same PIT. Once the pool and ranked order are frozen, later pages draw only from its reserve; exhaustion returns a shorter page or the session cap, not newly reranked candidates that invalidate earlier page boundaries. It must not fill holes with unchecked documents or reveal that a removed or blocked post matched the query by returning special placeholders.
 
 ```mermaid
 stateDiagram-v2
@@ -353,7 +357,7 @@ stateDiagram-v2
     Returned --> [*]
 ```
 
-Cursor stability is part of ranking correctness. The cursor uses a point-in-time view and the final sort tuple. If reranking uses non-deterministic or rapidly changing features, page two may not be comparable to page one. The system should freeze the ranking model version and the major feature snapshot for the cursor's short lifetime, or else limit cursors to deterministic retrieval sort and rerank only within each page with documented instability. Most social search products choose short-lived point-in-time cursors because perfect stability over minutes is expensive and not worth it.
+Cursor stability requires separating retrieval from reranking. This proposal materializes a bounded candidate pool under a PIT, freezes model/features, and stores the resulting order in a short-lived viewer-bound search session. Pages consume that order with idempotent page transitions and fresh hydration. Reserve candidates fill authorization holes without discarding unseen items. The response exposes the result cap; once the pool is exhausted, request a refined/new search rather than claiming exhaustive globally reranked pagination. Alternatively, a product may extend in retrieval-ordered windows, but then ranking is only within each window, not globally score-sorted. A frozen model alone cannot make its final scores valid `search_after` values for shards sorting by lexical score. PIT handles and the last consumed retrieval tuple remain internal and follow the engine's continuation rules.
 
 Signals worth watching: candidates per stage, drops by denylist and hydration, backfill depth, reranker latency, feature-store timeout rate, model fallback rate, zero-result after filtering, click metrics by query class, and stale-permission incidents.
 
@@ -436,3 +440,6 @@ Post search is a rebuildable, near-real-time projection of authoritative posts. 
 | Discord | [How Discord Indexes Trillions of Messages](https://discord.com/blog/how-discord-indexes-trillions-of-messages) | Explains Elasticsearch cells, destination-aware Pub/Sub bulk indexing, Kubernetes operations, and special handling for huge guilds. |
 | Slack | [Search at Slack](https://slack.engineering/search-at-slack/) | Demonstrates two-stage Solr retrieval plus personalized re-ranking with work-graph features and click-bias-aware training. |
 | Slack | [How we built enterprise search to be secure and private](https://slack.engineering/how-we-built-enterprise-search-to-be-secure-and-private/) | Shows when to use federated, permission-aware real-time retrieval instead of indexing stale external data. |
+| Elastic | [Paginate search results](https://www.elastic.co/docs/reference/elasticsearch/rest-apis/paginate-search-results) | Defines PIT, unchanged query/sort, tie-breakers, and retrieval `search_after` values. |
+| Elastic | [Delete a document](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-delete) | Documents finite deleted-version retention and `index.gc_deletes`; durable replay fences require more than a bare delete. |
+| PostgreSQL | [Logical decoding: exported snapshots](https://www.postgresql.org/docs/current/logicaldecoding-explanation.html#LOGICALDECODING-EXPORTED-SNAPSHOTS) | Provides a primary-source example of a snapshot tied to a change-stream boundary without a scan/replay gap. |

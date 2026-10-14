@@ -32,7 +32,7 @@ That choice forces three mechanisms. First, each partition is a replicated appen
 
 Assume an illustrative peak of 10 million messages per second with an average payload of 1 KB. Ingress is `10,000,000 × 1 KB = 10 GB/s` before protocol overhead and compression. With replication factor three, brokers perform about `10 GB/s × 3 = 30 GB/s` of durable disk writes across leaders and followers, and leader-to-follower replication adds roughly `10 GB/s × 2 = 20 GB/s` of internal network traffic before consumer egress. This immediately rules out a design where one topic owner stores all messages or where every subscriber receives a private physical copy.
 
-Retention is the second shaping number. Seven days at `10 GB/s × 86,400 × 7 = 6,048,000 GB`, about 6.0 PB for one logical copy. At replication factor three, the raw physical footprint is about 18.1 PB before compression, indexes, and tiering. Because most retained bytes are cold after the first few hours, brokers should keep hot segments on local disks and move closed segments to cheaper object storage instead of requiring every broker replacement to copy a full week of history.
+Retention is the second shaping number. Sustaining the stated peak for all seven days would require `10 GB/s × 86,400 × 7 = 6,048,000 GB`, about 6.0 PB for one logical copy and 18.1 PB with three copies. This is a peak-sustained bound; a normal retention estimate uses measured average ingress. Compression and object-tier durability change the physical footprint. Cold segments can move to object storage so a replacement broker need not copy a full week locally.
 
 Partition count drives parallelism and metadata cost. If one partition can safely accept 10 MB/s of sustained append traffic, `10 GB/s ÷ 10 MB/s = 1,000` hot partitions are enough for raw ingress, but real deployments need many more partitions to isolate tenants, keys, and consumer groups. LinkedIn has described Kafka deployments with 100,000 topics and millions of partitions, which is evidence that this order of magnitude is possible, but it also explains why controller metadata and partition movement must be engineered as first-class paths rather than background scripts.
 
@@ -45,7 +45,7 @@ Fan-out can dominate both network and lag. If a topic has 20 active consumer gro
 **Question.** What makes a producer retry safe when the first publish may have succeeded but the response was lost?
 <details><summary>Answer</summary>
 
-The publish request needs a stable producer identity, epoch, and per-partition sequence number, or at least an idempotency key for lower-throughput HTTP clients. The partition leader can then return the original offset for a duplicate retry, reject gaps, and fence older producer epochs instead of appending the same logical record twice.
+Use a stable producer identity, epoch, and per-partition sequence, with dedupe state replicated and recovered on leader change. This suppresses protocol retries within the supported session and retention window, not every duplicate business event forever. Restarting with a new producer identity or application-level republishing can still duplicate a logical event; those cases need a stable business ID and downstream dedupe.
 
 </details>
 
@@ -74,7 +74,7 @@ Next comes `Record`. It is tempting to store one row per message with a UUID and
 
 The first consumer model might put `delivered_to` or `acked_by` on each record. That breaks as soon as one topic has thousands of consumer groups. The scalable model is `CommittedOffset`, one checkpoint per group and partition. The log remains append-only while each group records the next offset it wants to read. For managed queue semantics, `DeliveryAttempt` adds a lease-like ack ID, attempt count, and deadline, but it points back to the immutable record rather than mutating the record.
 
-Finally, transactions need their own metadata. Idempotent single-partition append only needs producer sequence tracking on the partition leader. Atomic writes across partitions need a `Transaction` coordinator record, a participant list, and commit or abort markers written into each involved partition. Read-committed consumers can then hide aborted records and wait past unresolved transactional ranges, at the cost of potentially delaying visibility.
+Finally, transactions need their own metadata. Idempotent append needs recoverable producer-sequence state, not just a volatile leader cache. Atomic writes across partitions need a `Transaction` coordinator record, participants, and commit or abort markers. Read-committed consumers hide aborted records and stop before unresolved transactions; they do not wait by reading past an unstable prefix.
 
 ```text
 Topic
@@ -170,11 +170,11 @@ A topic is split into partitions, and each partition is an append-only log. The 
 
 ### Fix 2: Replicate each partition with leader epochs and high watermarks
 
-Replication fixes acknowledged data loss. Followers copy the leader's log in order and report durable offsets. The leader only exposes records through the high watermark, the largest contiguous offset that has reached the configured commit quorum or in-sync replicas. If the leader fails, the controller elects a sufficiently caught-up replica and increments the leader epoch. Clients include epochs in requests so stale leaders and stale metadata fail fast rather than accepting split-brain writes.
+For the classic Kafka-style ISR design here, without eligible-leader-replica extensions, require replication factor three across failure domains, `acks=all`, `min.insync.replicas=2`, and clean election. All current ISR members must replicate the write; the minimum is an admission threshold, not permission to ignore a third member still in the ISR. Define the high watermark as an exclusive boundary: offsets below `HW` are replication-committed. Transactional `read_committed` adds a last-stable-offset bound. Epochs accompany membership and election rules; comparing a cached epoch alone cannot fence an isolated leader.
 
 ### Fix 3: Separate consumer progress from stored records
 
-A consumer group stores committed offsets per partition. Within a group, only one active member owns a partition at a time, while independent groups each keep their own offsets and receive the full stream. This makes queue semantics a property of group assignment rather than physical message deletion. It also exposes the main scaling limit: adding consumers helps only until there is one active owner per partition, so hot partitions require better partitioning or application-level subkeys, not just more workers.
+A consumer group stores committed offsets per partition and grants one valid assignment per partition at a time. Independent groups keep separate progress. An evicted process can still run, so assignment alone does not fence downstream effects. Adding consumers helps only until all partitions are assigned; hot partitions need better partitioning or explicit application-level concurrency.
 
 ### Fix 4: Add retry, delay, and dead-letter lanes as log-backed state
 
@@ -203,7 +203,7 @@ flowchart LR
     M --> L
 ```
 
-A publish starts when the producer asks a gateway for topic metadata and sends a compressed batch to the partition leader. The leader validates quota, ACL, checksum, producer epoch, and sequence number, appends to the local active segment, replicates to followers, advances the high watermark when the durability condition is met, and returns offsets. A consumer joins a group through the coordinator, receives partition assignments, fetches from leaders starting at committed offsets, processes records, and commits the next offset. Metadata entities live in the metadata log; record batches live in partition segments; group offsets and transaction markers are compacted internal logs; retry attempts and dead-letter records are log-backed state rather than mutations of the original payload.
+A publish starts with metadata lookup and a compressed batch sent to the leader. The leader validates quota, ACL, checksum, producer epoch, and sequence, appends, replicates, and returns offsets after the configured acknowledgement condition. Consumers join groups, process fetched records, and commit the next required offset. Group offsets and transaction-coordinator state use internal logs; transaction commit/abort markers live in the participating data partitions, not only in a separate coordinator log. Retry and dead-letter state remain distinct from the original immutable payload.
 
 > **Key idea.** Each component traces back to a specific failure of the naive design: partition logs for throughput, replication for durable acknowledgement, offsets for fan-out and replay, retry lanes for poison records, and tiered storage for retained bytes.
 
@@ -214,13 +214,13 @@ A publish starts when the producer asks a gateway for topic metadata and sends a
 **Question.** A producer receives an acknowledgement for offset 500, the leader crashes one millisecond later, and a follower becomes leader. How do we know whether offset 500 is still there?
 <details><summary>Answer</summary>
 
-The acknowledgement is durable only if offset 500 was replicated to the required in-sync replicas before the leader replied. Consumers should only read through the high watermark, and the controller should elect a new leader from replicas that contain the committed prefix. If a stale replica is elected uncleanly, availability improves but acknowledged records can be lost.
+For the configured single-broker/zone failure model, offset 500 must be replicated under the ISR acknowledgement rules before success. It is below the exclusive high watermark once `HW >= 501`. Only a clean successor containing the committed prefix may lead; electing a stale replica can discard acknowledged records. Replication acknowledgement is not automatically a per-record fsync guarantee against correlated power loss.
 
 </details>
 
-A single append-only file gives order but not durability. The subtle part is that "written to the leader's disk" is not enough once the leader can die. If the leader acknowledges before any follower has the record, then a crash can elect a follower whose log ends before the acknowledged offset. Clients would see the system forget something it promised. That is why production systems make the durability setting explicit. `acks=1` means the leader accepted the record; `acks=all` means the record reached the required in-sync replicas before acknowledgement.
+A single append-only file gives order but not replicated durability. `acks=1` can acknowledge a record that no future leader has. `acks=all` waits for the current ISR, but without a minimum ISR setting it can still succeed with only the leader left. This design requires at least two in-sync replicas across failure domains and refuses durable publishes below that threshold. A replication error after append is ambiguous; retry the same producer batch rather than inventing a new logical message.
 
-The leader maintains a replica set and an in-sync replica set. Followers fetch from the leader, append in the same order, flush according to policy, and report their durable offset. The high watermark is the highest contiguous offset known to be replicated to the durability quorum. Consumers fetch only up to this watermark. This rule handles the awkward interval where the leader has appended records that are not yet committed: those records may exist on the leader's disk, but they are not visible because a failover could still truncate them.
+Followers append in log order and report replication progress. If all three replicas remain in the ISR, all three must reach offset 500 before `HW` advances to 501; if a lagging follower is safely removed from ISR, the remaining set must still meet the configured minimum. Kafka normally relies on replicated filesystem/page-cache writes rather than fsync for every acknowledgement. A stricter power-loss contract requires an explicit flush policy and its cost, not a renamed replication acknowledgement. Consumers never fetch offsets `>= HW`; read-committed transactional consumers also stop at the last stable offset.
 
 ```mermaid
 sequenceDiagram
@@ -232,15 +232,17 @@ sequenceDiagram
     Producer->>Leader: "Produce batch at epoch 12"
     Leader->>Leader: "Append offsets 498-500"
     Leader->>FollowerA: "Replicate offsets 498-500"
-    FollowerA-->>Leader: "Durable through 500"
-    Leader->>Leader: "Advance high watermark to 500"
+    Leader->>FollowerB: "Replicate offsets 498-500"
+    FollowerA-->>Leader: "Replicated through 500"
+    FollowerB-->>Leader: "Replicated through 500"
+    Leader->>Leader: "Full ISR replicated, advance HW to 501"
     Leader-->>Producer: "Ack offsets 498-500"
     Leader--xController: "Crash"
     Controller->>FollowerA: "Elect leader epoch 13"
     Producer->>FollowerA: "Retry with metadata refresh"
 ```
 
-Leader epochs fence stale authority. Suppose a network partition isolates the old leader from the controller but not from a few clients. Without epochs, those clients might keep writing to it while a new leader accepts a different suffix. With epochs, the metadata log records that the partition is now at epoch 13, followers reject replication from epoch 12, and clients refresh metadata when they receive stale-epoch errors. The partition log may still need to truncate uncommitted suffixes when a follower becomes leader, but it must not truncate records at or below the high watermark.
+Leader epochs are part of stale-authority fencing, not a broadcast that instantly reaches an isolated node. Membership changes and elections must be serialized by the metadata controller, replicas must enforce current terms, and a fenced/disconnected broker must not claim fresh authority or unilaterally shrink ISR to itself. An old node might accept uncommitted local appends, but cannot give the configured durable success once it cannot satisfy the valid ISR protocol. Recovery may truncate an uncommitted suffix, never the committed prefix below `HW`. A different quorum-log implementation must supply its own consensus election rules rather than mixing a majority acknowledgement with classic Kafka ISR semantics.
 
 Unclean leader election is the painful trade-off. If every in-sync replica is gone, the service can either keep the partition unavailable or elect a stale replica. Electing stale restores reads and writes sooner, but it may discard acknowledged data if the stale replica lacks committed offsets. For a message queue where acknowledged records often trigger business workflows, the safer default is to disable unclean election and make unavailability visible. Some low-value telemetry topics might choose the opposite: losing a few seconds of metrics can be better than backpressuring all agents. The point is to make the durability/availability trade explicit per topic class.
 
@@ -267,9 +269,11 @@ It provided at-least-once delivery. The new owner starts from the last committed
 
 Consumer groups are the bridge between a retained log and a queue. The log keeps all records until retention. The group coordinator assigns partitions to members so each partition has at most one active owner in the group. The group's committed offset for a partition is the next offset to read, not the last record delivered. This convention makes recovery simple: after a crash, the new owner fetches from the committed offset and may repeat any records processed but not committed.
 
-The commit boundary is the source of most delivery confusion. If a consumer commits before processing, a crash can lose work because the next owner will skip the record. If it processes before committing, a crash can duplicate work because the next owner will replay it. There is no magic third option for arbitrary side effects. The general-purpose default is at-least-once plus idempotent handlers. For example, a payment workflow should store an idempotency key or event ID in the payment state transition; an email sender should record a send attempt key; a database writer can use `INSERT ... ON CONFLICT DO NOTHING` or a conditional update keyed by record identity.
+The commit boundary is the source of most delivery confusion. Committing before processing can lose work; processing before committing can repeat work. For a database effect, insert the inbox identity and apply the mutation in the same transaction, so a replay is a genuine no-op. Merely inserting a dedupe row before a separate mutation creates a crash gap. An email or payment HTTP call needs provider-supported idempotency or explicit unknown-outcome recovery; a local send-attempt record alone cannot make that external effect exactly once.
 
 Rebalancing adds another race. A member may be slow or partitioned while the coordinator decides it is dead and increments the group generation. If the old member later commits offsets, those commits must be rejected; otherwise, an evicted consumer can overwrite the progress of the new owner. Generation numbers fence stale commits. Cooperative rebalancing improves availability by revoking only partitions that move, letting members drain and commit before handoff, and then assigning the partitions to their new owners. Static membership avoids full rebalances during short rolling restarts because a known member can return without making the whole group reshuffle.
+
+One assigned owner does not imply one physically running process. An evicted consumer may continue external writes even though its offset commits fail. Enforce downstream business deduplication and, where order matters, a current resource fence or sequence check atomically with the effect. Concurrent processing within a partition also needs a completed-offset set: commit only the contiguous completed prefix, not the largest offset that happened to finish.
 
 ```mermaid
 sequenceDiagram
@@ -290,7 +294,7 @@ Exactly-once semantics are narrower than the phrase suggests. Kafka's model comb
 
 The `read_committed` caveat is important. Transactional producers write records before the transaction outcome is known. A read-uncommitted consumer can see records that later abort. A read-committed consumer must skip aborted records and may have to stop at the last stable offset while an earlier transaction remains unresolved. This improves correctness for transactional pipelines but can increase tail latency when a producer stalls. The system needs transaction timeouts and coordinator recovery to prevent one dead producer from hiding later committed records indefinitely.
 
-Google Pub/Sub's exactly-once delivery documentation illustrates a different boundary: successful acknowledgements prevent later duplicate delivery for supported pull subscriptions in a region, but expired deadlines and negative acknowledgements still cause valid redelivery, and only the latest ack ID is accepted. That maps to this design's lease-token rule. Acknowledgement success must be visible to the client; otherwise, a client cannot distinguish "the service accepted my ack" from "the ack was lost and redelivery is possible."
+Google Pub/Sub's enabled exactly-once mode provides a different boundary: successful acknowledgements prevent subsequent redelivery of that message within its regional pull-subscription contract; deadline expiry and nacks still permit redelivery, and stale ack IDs are rejected. This is not a guarantee for all subscription modes and does not remove distinct publish-side duplicates. Our managed queue deliberately adopts strict per-attempt ack tokens. Acknowledgement success must be visible to the client so it can distinguish completion from an unresolved ack timeout.
 
 Signals worth watching: consumer lag by time and bytes, rebalance duration, generation-fenced commits, duplicate-handler no-ops, transaction timeout rate, and the gap between high watermark and last stable offset.
 
@@ -315,7 +319,7 @@ A log and a queue answer different questions. A queue asks, "which work item sho
 
 The naive log-based retry is to not commit the offset until processing succeeds. That preserves order but can create catastrophic head-of-line blocking. If offset 42 is malformed, the partition cannot make progress even if later records are unrelated. Slack's job-queue migration is a useful reminder that queue workloads need duplicate tolerance, failure-mode testing, and migration paths; the hard part is not only storing the jobs but recovering when the queue backend itself is under pressure.
 
-The managed-queue layer introduces delivery attempts. A consumer receives an ack ID with a deadline. If it finishes, it acknowledges that specific attempt and the service advances progress. If it needs more time, it extends the lease. If the deadline expires or the consumer negatively acknowledges, the message becomes visible again. The ack ID must change on redelivery so late acknowledgements from an old attempt cannot erase a newer attempt. Google Pub/Sub's ack-deadline behavior and latest-ack-ID rule are the concrete production version of this mechanism.
+The managed-queue layer introduces delivery attempts. A consumer receives an ack ID with a deadline. Ack, renewal, expiry, and reassignment are atomic conditional transitions on the current attempt. Once expiry or reassignment wins, an old ack cannot erase the replacement attempt. Out-of-order acks are stored individually; the subscription's reclaimable offset advances only over a contiguous acknowledged or durably rerouted prefix. Otherwise, finishing offset 43 while 42 is still leased would lose 42. This strict ack policy resembles Pub/Sub's exactly-once mode, not every default queue's behavior.
 
 ```mermaid
 stateDiagram-v2
@@ -332,9 +336,13 @@ stateDiagram-v2
 
 There are two common implementations. Retry topics keep the core log simple: failed records are republished to topics such as `orders.retry.1m` and later released to the original processing path with headers carrying original topic, partition, offset, attempt, and failure class. This is easy to inspect and scales like normal topics, but it changes ordering because later records can finish first. A delivery-attempt state store keeps a queue-like view over the original log and can preserve more subscription semantics, but it adds a mutable state machine that must itself be durable and partitioned.
 
-Partition skew is the related throughput trap. In a consumer group, one partition can have only one active owner at a time. If one key accounts for 50% of traffic and all records for that key must be ordered, then half the topic's work is serialized no matter how many consumers are added. Cloudflare has described this operational lesson for Kafka-backed message buses: adding workers does not fix skew when a hot partition is the limit. The design needs key-distribution dashboards, hot-partition alerts, and an explicit repartitioning plan. Virtual buckets help by hashing keys to many stable buckets and mapping buckets to physical partitions, but a single hot key still requires application-level subkeys or a relaxed ordering requirement.
+Moving to a retry or dead-letter topic must be durable before acknowledging the original. For a broker-local pipeline, commit the destination record and consumed offset in one broker transaction. With an external attempt store, atomically record the reroute decision and its outbox command, and retain enough payload to finish publication. A standalone publish followed by an offset commit is at-least-once and needs dedupe; committing first can lose the work. The original source identity remains stable across retry lanes.
+
+Partition skew is the related throughput trap. In a consumer group, one partition has one valid assigned owner. If one key accounts for 50% of traffic and its effects must be ordered, half the topic's work is serialized regardless of consumer count. Cloudflare's Kafka message-bus work highlights this limit. Virtual buckets can distribute different keys, but a single hot key still requires subkeys or weaker ordering. Append order is not completion order: strict key lanes must execute sequentially, preserve that lane through retries and handoffs, and fence stale effects.
 
 Tiered storage is the storage-side counterpart. The log model makes replay possible, but replay over petabytes cannot require every byte to remain on broker SSDs. Closed segments can move to object storage with sparse offset and time indexes. Hot consumers read from local disks; old replays fetch remote segments through a cache. Confluent's tiered storage reduces broker replacement and partition reassignment cost because new brokers do not copy all historical segments. Pinterest MemQ pushes the idea further for workloads that accept seconds of latency by writing immutable micro-batches to object storage and scaling serving separately from writes. The trade-off is that remote-read latency and remote-store availability become visible product behavior. A replay from last month may be slower or fail differently than reading the hot tail, and the API should say so.
+
+Verify uploaded segment checksums and durably publish their lookup metadata before evicting local copies. Retention is independent of an individual consumer's acknowledgement: a seven-day log can delete an eight-day-old unprocessed record. Return an explicit offset-expired error, not a silent reset to latest. A queue that promises to retain unacknowledged work must pin or copy its payload within a separately specified maximum retention policy.
 
 Signals worth watching: oldest visible message age, retry and DLQ rate by failure class, expired ack deadlines, hot-key contribution to partition traffic, remote segment cache hit rate, and tier upload backlog.
 
@@ -350,7 +358,7 @@ Signals worth watching: oldest visible message age, retry and DLQ rate by failur
 
 **10x scale.** At 100 million messages per second and 100 GB/s ingress, the same partition-log model remains, but every shared path must be sharded harder. Gateways need connection sharding and request coalescing, metadata propagation must be incremental, partitions need placement automation, and tier upload bandwidth becomes a first-class capacity pool. The design should also introduce topic classes so low-latency topics pay for local replication while bulk telemetry can use larger batches and object-backed storage.
 
-**Multi-region active-passive.** Keep each partition writable in one home region and asynchronously mirror committed records to other regions. Consumers can read local mirrors with measured lag. Failover promotes a mirror only after fencing the old region and choosing a recovery point. Uber's uReplicator work shows that cross-region replication is a product, not a cron job: dynamic topic discovery, offset mapping, lag isolation, and destination backpressure all need ownership.
+**Multi-region active-passive.** Keep one home region per partition and asynchronously mirror committed records. Promotion requires fencing the old region and selecting a recoverable prefix. Regional acknowledgements do not imply zero-loss regional disaster recovery: unmirrored records and group/producer/transaction state can be lost or need reconciliation. Resume consumers using translated checkpoints, deduplicate replayed business events, and resolve incomplete transactions rather than assuming identical offsets or sessions. A zero-RPO contract requires synchronous cross-region durability. Uber's uReplicator work motivates explicit offset mapping, replication-lag isolation, and destination backpressure.
 
 **Strict per-key workflow queue.** If a customer says jobs for one account must never run out of order, retries cannot simply skip a failed record for that key. The design can pause that key, not the whole partition, by using application-level key lanes, or it can accept head-of-line blocking and show the blocked key in operations tooling. If the key becomes hot, the product must choose between subkeying and strict order.
 
@@ -378,7 +386,7 @@ The design starts from the failure of a single broker queue: it cannot provide h
 2. What does the high watermark protect consumers from reading?
    <details><summary>Answer</summary>
 
-   It prevents consumers from reading records that exist only on the current leader and might be truncated after failover. Only records replicated to the required in-sync set or quorum become visible through the high watermark.
+   It is the exclusive replication-committed boundary: offsets below `HW` are safe under the stated failure model. A `read_committed` consumer also respects the last stable offset and skips aborted transaction records.
 
    </details>
 
@@ -399,7 +407,7 @@ The design starts from the failure of a single broker queue: it cannot provide h
 5. Why can adding more consumers fail to reduce lag?
    <details><summary>Answer</summary>
 
-   In one consumer group, a partition has at most one active owner. If lag is concentrated in one hot partition or key, extra consumers sit idle unless the workload is repartitioned, subkeyed, or allowed to relax ordering.
+   In one consumer group, a partition has one valid assigned owner. If lag is concentrated in a hot partition or strictly ordered key, extra consumers alone cannot parallelize it; repartitioning or application-level concurrency must respect the chosen ordering contract.
 
    </details>
 
@@ -417,3 +425,5 @@ The design starts from the failure of a single broker queue: it cannot provide h
 | Slack | [Scaling Slack’s Job Queue](https://slack.engineering/scaling-slacks-job-queue/) | Connects Kafka-style logs to practical job-queue retry, dedupe, and migration concerns. |
 | Google Cloud | [Architectural overview of Pub/Sub](https://docs.cloud.google.com/pubsub/architecture) | Describes forwarders, routers, quorum persistence, and horizontal sharding in a managed pub/sub service. |
 | Google Cloud | [Exactly-once delivery](https://docs.cloud.google.com/pubsub/docs/exactly-once-delivery) | Clarifies ack IDs, lease deadlines, regional scope, and duplicate versus redelivery semantics. |
+| Apache Kafka | [Topic configuration](https://kafka.apache.org/41/configuration/topic-configs/) | Specifies ISR acknowledgement requirements and the minimum-replica durability threshold. |
+| Apache Kafka | [Design](https://kafka.apache.org/41/design/design/) | Explains replication, filesystem caching, transactions, and the limits of delivery guarantees. |

@@ -1,6 +1,6 @@
 # Curated Engineering Blogs
 
-Official engineering blog posts and papers from companies that run these systems in production, curated per design. Each design weaves these lessons into its fixes and deep dives and lists the sources under `Sources and further reading`.
+Official engineering blogs, papers, technical documentation, and standards, curated per design. Each design weaves these lessons into its fixes and deep dives and lists the sources under `Sources and further reading`. Production examples motivate the proposed architecture; they do not imply that every company implements the exact protocol described here.
 
 ## Collaboration and storage
 
@@ -61,6 +61,8 @@ Official engineering blog posts and papers from companies that run these systems
 | WhatsApp | [How WhatsApp Enables Multi-Device Capability](https://engineering.fb.com/2021/07/14/security/whatsapp-multi-device/) | Device identity keys, client fan-out encryption, encrypted history transfer, and secure app-state sync. |
 | LinkedIn | [Designing Our New Messaging System](https://www.linkedin.com/blog/engineering/messaging-notifications/designing-our-new-messaging-system) | Centralized message copies, service ownership boundaries, and correctness-first migration principles. |
 | LinkedIn | [Unifying Messaging Experiences Across LinkedIn](https://www.linkedin.com/blog/engineering/messaging-notifications/unifying-messaging-experiences-across-linkedin) | Reactive client data layer combining local store, realtime stream, and query APIs across platforms. |
+| Apache Cassandra | [CQL data manipulation: BATCH](https://cassandra.apache.org/doc/latest/cassandra/developing/cql/dml.html#batch) | Documents batch atomicity and the single-partition isolation boundary; not a general cross-store transaction. |
+| IETF | [RFC 9110: 201 Created and 202 Accepted](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.3.2) | Separates resource creation and asynchronous processing semantics from application-level delivery receipts. |
 
 ## Commerce and transactions
 
@@ -78,6 +80,7 @@ Official engineering blog posts and papers from companies that run these systems
 | Cloudflare | [Building Waiting Room on Workers and Durable Objects](https://blog.cloudflare.com/building-waiting-room-on-workers-and-durable-objects/) | Details global slot allocation, encrypted queue cookies, bucketed users, and bounded edge coordination for waiting rooms. |
 | Cloudflare | [Waiting Room: Random Queueing and Custom Web/Mobile Apps](https://blog.cloudflare.com/waiting-room-random-queueing-and-custom-web-mobile-apps/) | Compares FIFO and random queueing and explains when hype launches need randomized fairness instead of arrival-order dominance. |
 | AWS | [Introducing AWS Virtual Waiting Room](https://aws.amazon.com/blogs/compute/introducing-aws-virtual-waiting-room/) | Reference implementation for signed time-limited admission tokens, authorizers, burst buffering, and protected API integration. |
+| Stripe | [Place a hold on a payment method](https://docs.stripe.com/payments/place-a-hold-on-a-payment-method) | Defines authorization expiry and capture semantics for the checkout saga. |
 
 ### [Local Delivery (Gopuff)](./local-delivery-system-design.md)
 
@@ -93,6 +96,7 @@ Official engineering blog posts and papers from companies that run these systems
 | Zepto | [Building Search for a 10-Minute World](https://blog.zepto.com/building-search-for-a-10-minute-world-43b1992f5dca) | Explains hyperlocal quick-commerce search where query intent, fulfillment zone, inventory, price, and ranking are resolved live. |
 | Zepto / AWS | [How Zepto powers sub-second search using OpenSearch Service OR2 instances](https://aws.amazon.com/blogs/big-data/how-zepto-powers-sub-second-search-using-opensearch-service-or2-instances/) | Shows event-driven hub-level indexing, P0/P1 freshness pipelines, and the trade-off between search refresh latency and real-time inventory validation. |
 | Swiggy | [Building Rock-Solid ML Systems](https://medium.com/swiggy-bytes/building-rock-solid-ml-systems-d1d5ab544f0e) | Covers ML operational excellence for ETA and quick-delivery systems, including clipping, shadow mode, error codes, and fallbacks. |
+| PostgreSQL | [Transaction Isolation](https://www.postgresql.org/docs/current/transaction-iso.html) | Explains concurrent conditional updates and predicate rechecks; multi-row reservation and confirmation still require one transaction. |
 
 ### [Online Auction](./online-auction-system-design.md)
 
@@ -106,12 +110,15 @@ Official engineering blog posts and papers from companies that run these systems
 | Whatnot | [Taking On Shill Bidding](https://blog.teamwhatnot.com/unitedstates/taking-on-shill-bidding) | Trust-and-safety signals for detecting seller-related bids, collusion, and manipulation. |
 | AWS | [Building resilient real-time streaming workers with Amazon DynamoDB leases](https://aws.amazon.com/blogs/architecture/building-resilient-real-time-streaming-workers-with-amazon-dynamodb-leases/) | Lease, heartbeat, and reconciliation pattern for exactly-one ownership of stateful WebSocket work. |
 | AWS | [AWS AppSync real-time reference architecture](https://aws.amazon.com/blogs/mobile/aws-appsync-real-time-reference-architecture/) | Managed WebSocket subscription fan-out pattern for delivering realtime auction read-model updates. |
+| PostgreSQL | [Date/time functions](https://www.postgresql.org/docs/17/functions-datetime.html) | Distinguishes transaction-start time from an actual clock sample when defining deadline checks. |
 
 ### [Payment System](./payment-system-design.md)
 
 | Source | Article | Why it matters |
 |---|---|---|
 | Stripe | [Designing robust and predictable APIs with idempotency](https://stripe.com/blog/idempotency) | Explains ambiguous network failures, idempotency keys, replayed results, and backoff for safe payment retries. |
+| Stripe | [Idempotent requests](https://docs.stripe.com/api/idempotent_requests) | Specifies parameter matching, API-version differences, and the retention boundary for safe retries. |
+| Stripe | [Place a hold on a payment method](https://docs.stripe.com/payments/place-a-hold-on-a-payment-method) | Distinguishes authorization from capture and documents expiry and partial-capture limits. |
 | Airbnb | [Avoiding double payments in a distributed payments system](https://medium.com/airbnb-engineering/avoiding-double-payments-in-a-distributed-payments-system-2981f6b070bb) | Shows a recovery-point idempotency framework for exactly-once effects across payment microservices. |
 | Stripe | [Ledger: Stripe's system for tracking and validating money movement](https://stripe.com/blog/ledger-stripe-system-for-tracking-and-validating-money-movement) | Describes immutable fund-flow modeling, clearing/timeliness/completeness checks, and data-quality tooling at payment scale. |
 | Square | [Books, an immutable double-entry accounting database service](https://developer.squareup.com/blog/books-an-immutable-double-entry-accounting-database-service/) | Details why Square built a shared double-entry ledger database for settlements, payouts, consistency, and auditability. |
@@ -137,6 +144,9 @@ Official engineering blog posts and papers from companies that run these systems
 | Discord | [How Discord Indexes Trillions of Messages](https://discord.com/blog/how-discord-indexes-trillions-of-messages) | Explains Elasticsearch cells, destination-aware Pub/Sub bulk indexing, Kubernetes operations, and special handling for huge guilds. |
 | Slack | [Search at Slack](https://slack.engineering/search-at-slack/) | Demonstrates two-stage Solr retrieval plus personalized re-ranking with work-graph features and click-bias-aware training. |
 | Slack | [How we built enterprise search to be secure and private](https://slack.engineering/how-we-built-enterprise-search-to-be-secure-and-private/) | Shows when to use federated, permission-aware real-time retrieval instead of indexing stale external data. |
+| Elastic | [Paginate search results](https://www.elastic.co/docs/reference/elasticsearch/rest-apis/paginate-search-results) | Defines PIT, unchanged query/sort, tie-breakers, and retrieval `search_after` values. |
+| Elastic | [Delete a document](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-delete) | Documents finite deleted-version retention and `index.gc_deletes`; durable replay fences require more than a bare delete. |
+| PostgreSQL | [Logical decoding: exported snapshots](https://www.postgresql.org/docs/current/logicaldecoding-explanation.html#LOGICALDECODING-EXPORTED-SNAPSHOTS) | Provides a primary-source example of a snapshot tied to a change-stream boundary without a scan/replay gap. |
 
 ### [News Aggregator](./news-aggregator-system-design.md)
 
@@ -181,6 +191,9 @@ Official engineering blog posts and papers from companies that run these systems
 | Meta Engineering | [How Instagram suggests new content](https://engineering.fb.com/2020/12/10/web/how-instagram-suggests-new-content/) | Covers suggested-post seed selection, cold start, value models, and “Feels Like Home” constraints. |
 | Meta Engineering | [Journey to 1000 models: Scaling Instagram’s recommendation system](https://engineering.fb.com/2025/05/21/production-engineering/journey-to-1000-models-scaling-instagrams-recommendation-system/) | Shows model registry, launch automation, criticality, and stability SLOs for large ML fleets. |
 | Meta Engineering | [Introducing Immortal Objects for Python](https://engineering.fb.com/2023/08/15/developer-tools/immortal-objects-for-python-instagram-meta/) | Explains Instagram's Python/Django serving model and memory-efficiency work at scale. |
+| AWS | [CloudFront signed URLs](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-signed-urls.html) | Defines signature validity and request-time expiry; does not provide application relationship revocation. |
+| AWS | [Restrict access to an S3 origin](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html) | Prevents direct origin requests from bypassing the CDN access path. |
+| AWS | [Uploading objects with presigned URLs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/PresignedUrlUploadObject.html) | Warns that a PUT can replace an existing key, motivating immutable source versions and write-once published outputs. |
 
 ### [YouTube](./youtube-system-design.md)
 
@@ -195,6 +208,9 @@ Official engineering blog posts and papers from companies that run these systems
 | Meta | [How Facebook encodes your videos](https://engineering.fb.com/2021/04/05/video-engineering/how-facebook-encodes-your-videos/) | Uses benefit-cost and ML prioritization so expensive codecs are applied where they improve QoE most. |
 | Meta | [Reducing Instagram's basic video compute by 94 percent](https://engineering.fb.com/2022/11/04/video-engineering/instagram-video-processing-encoding-reduction/) | Demonstrates DAG/intermediate reuse to remove redundant encoding work at massive upload scale. |
 | Meta | [Bringing AV1 to Facebook and Instagram Reels](https://engineering.fb.com/2023/02/21/video-engineering/av1-codec-facebook-instagram-reels/) | Covers AV1's compression benefits and the compute/device trade-offs of production codec rollout. |
+| AWS | [CloudFront signed URLs](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-signed-urls.html) | Documents request-time signature expiry and its limits for ongoing downloads and revocation. |
+| AWS | [Restrict access to an S3 origin](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html) | Explains preventing origin access from bypassing protected CDN requests. |
+| Apple | [HLS authoring specification](https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices) | Defines segment decoding, common time ranges, and switching-boundary requirements for compatible renditions. |
 
 ## Data and infrastructure
 
@@ -210,6 +226,7 @@ Official engineering blog posts and papers from companies that run these systems
 | Datadog | [Evolving our real-time timeseries storage again: Built in Rust for performance at scale](https://www.datadoghq.com/blog/engineering/rust-timeseries-engine/) | Describes separating real-time point storage from tag indexing and redesigning the hot engine for high-cardinality, bursty workloads. |
 | Pinterest | [Improving Efficiency Of Goku Time Series Database at Pinterest (Part — 1)](https://medium.com/pinterest-engineering/improving-efficiency-of-goku-time-series-database-at-pinterest-part-1-7659b94796f4) | Highlights short-term/long-term storage separation, compaction, smart routing, and recovery-time bottlenecks. |
 | Cloudflare | [How Cloudflare runs Prometheus at scale](https://blog.cloudflare.com/how-cloudflare-runs-prometheus-at-scale/) | Gives operational lessons from hundreds of Prometheus instances, billions of series, and practical cardinality governance. |
+| Prometheus | [Query functions](https://prometheus.io/docs/prometheus/latest/querying/functions/) | Defines counter reset handling, rate extrapolation, histogram behavior, and rate-before-aggregation semantics. |
 
 ### [Distributed Job Scheduler](./distributed-job-scheduler-system-design.md)
 
@@ -240,6 +257,8 @@ Official engineering blog posts and papers from companies that run these systems
 | Slack | [Scaling Slack’s Job Queue](https://slack.engineering/scaling-slacks-job-queue/) | Connects Kafka-style logs to practical job-queue retry, dedupe, and migration concerns. |
 | Google Cloud | [Architectural overview of Pub/Sub](https://docs.cloud.google.com/pubsub/architecture) | Describes forwarders, routers, quorum persistence, and horizontal sharding in a managed pub/sub service. |
 | Google Cloud | [Exactly-once delivery](https://docs.cloud.google.com/pubsub/docs/exactly-once-delivery) | Clarifies ack IDs, lease deadlines, regional scope, and duplicate versus redelivery semantics. |
+| Apache Kafka | [Topic configuration](https://kafka.apache.org/41/configuration/topic-configs/) | Specifies ISR acknowledgement requirements and the minimum-replica durability threshold. |
+| Apache Kafka | [Design](https://kafka.apache.org/41/design/design/) | Explains replication, filesystem caching, transactions, and the limits of delivery guarantees. |
 
 ### [Distributed Cache](./distributed-cache-system-design.md)
 
@@ -269,6 +288,10 @@ Official engineering blog posts and papers from companies that run these systems
 | LinkedIn | [Open Sourcing Venice: LinkedIn’s Derived Data Platform](https://www.linkedin.com/blog/engineering/open-source/open-sourcing-venice-linkedin-s-derived-data-platform) | Provides production numbers and patterns for read-heavy derived KV data, BatchGet fanout, multi-tenancy, quotas, and multi-region operation. |
 | Apple / FoundationDB | [Technical Overview](https://apple.github.io/foundationdb/technical-overview.html) | Shows why a minimal ordered transactional KV core, layers, optimistic concurrency, and simulation-driven testing matter. |
 | Netflix | [Introducing Netflix’s Key-Value Data Abstraction Layer](https://netflixtechblog.com/introducing-netflixs-key-value-data-abstraction-layer-1ea8a0a11b30) | Explains how a KV DAL standardizes consistency, idempotency, pagination, and data modeling across multiple backing stores. |
+| IETF | [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html#name-if-match) | Defines If-Match and If-None-Match preconditions without overloading wildcard semantics. |
+| Raft authors | [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf) | Explains state-machine deduplication, safe reads, and membership changes. |
+| Cockroach Labs | [An epic read on follower reads](https://www.cockroachlabs.com/blog/follower-reads-stale-data/) | Explains closed and resolved timestamps needed for safe historical follower reads. |
+| Apache Cassandra | [Tombstones](https://cassandra.apache.org/doc/latest/cassandra/managing/operating/compaction/tombstones.html) | Explains why replica repair and delete-marker retention must prevent resurrection. |
 
 ## Location and large-scale ingestion
 
@@ -313,6 +336,7 @@ Official engineering blog posts and papers from companies that run these systems
 | Microsoft Bing Webmaster | [Bingbot Series: Maximizing Crawl Efficiency](https://blogs.bing.com/webmaster/2018/10/bingbot-Series-Maximizing-Crawl-Efficiency/) | Frames crawl quality as fresh/new content discovered per fetch, not merely pages crawled per second. |
 | Microsoft Bing Webmaster | [IndexNow: Announcing Sharing of Submitted URLs](https://blogs.bing.com/webmaster/2022/1/IndexNow-Announcing-Sharing-of-Submitted-URLs/) | Shows how push URL-change notifications can improve freshness and reduce waste while still needing validation. |
 | Cloudflare | [From 0 to 20 billion - How We Built Crawler Hints](https://blog.cloudflare.com/from-0-to-20-billion-how-we-built-crawler-hints/) | Details a production freshness-hint pipeline with Kafka, Redis dedupe generations, batching, retries, and observability. |
+| IETF | [RFC 9309: Robots Exclusion Protocol](https://www.rfc-editor.org/rfc/rfc9309.html) | Normative matching, redirect, status, caching, and minimum parsing-limit rules; distinguishes the standard from crawler-specific policy. |
 
 ### [Ad Click Aggregator](./ad-click-aggregator-system-design.md)
 
@@ -325,3 +349,4 @@ Official engineering blog posts and papers from companies that run these systems
 | Pinterest | [Ensuring High Availability of Ads Realtime Streaming Services](https://medium.com/pinterest-engineering/ensuring-high-availability-of-ads-realtime-streaming-services-ea3889420490) | Shows hot-hot budget/pacing/bidding streams, health metrics, and automatic switchover for ads spend control. |
 | X/Twitter | [Processing billions of events in real time at Twitter](https://blog.x.com/engineering/en_us/topics/infrastructure/2021/processing-billions-of-events-in-real-time-at-twitter-) | Demonstrates UUID dedupe, late-event handling, Bigtable serving, and validation against batch counts at massive scale. |
 | LinkedIn | [Real-time Analytics at Massive Scale with Pinot](https://engineering.linkedin.com/analytics/real-time-analytics-massive-scale-pinot) | Explains why ads reporting needs a dedicated real-time columnar OLAP system with specialized indexes. |
+| Apache Pinot | [Stream Ingestion with Upsert](https://docs.pinot.apache.org/build-with-pinot/ingestion/upsert-dedup/upsert) | Specifies primary-key partitioning, comparison-value ordering, and equal-version conflict limitations. |

@@ -139,7 +139,7 @@ RankingFeature
 - entity_key, feature_name, value, computed_at, expires_at, definition_version
 ```
 
-Canonical `Post`, `FollowEdge`, and destructive state changes live in strongly consistent transactional or quorum-backed stores appropriate to their access pattern. Author timelines and feed inboxes live in wide-column or log-structured key-value storage partitioned by source/user and time bucket. Counters and ranking features live in stores optimized for high-write aggregation and low-latency batch reads. Media is stored separately in immutable object storage and served through a CDN. Final ranked feed pages are not stored as canonical truth because model versions, request context, and privacy state change too often.
+Canonical `Post`, `FollowEdge`, and destructive state changes use stores with conditional writes and authoritative current reads; an arbitrary read/write quorum is not by itself a linearizability guarantee. Author timelines and feed inboxes are asynchronously materialized in wide-column or log-structured storage partitioned by source/user and time bucket. Counters and features use high-write aggregation and low-latency batch reads. Media is separate. Final ranked pages are not canonical truth because context and privacy change too often.
 
 > **Key idea.** The model separates truth from accelerators. Posts and graph edges decide what may exist and who may see it; inboxes, timelines, counters, sessions, and features make reads fast but are always disposable or repairable.
 
@@ -172,7 +172,7 @@ Meta describes News Feed as collecting eligible inventory, predicting multiple o
 
 ### Fix 3: Final authorization and invalidation path
 
-Fan-out and candidate indexes are not proof of eligibility. A post may have been deleted, an author may have blocked the viewer, a group membership may have changed, or moderation may have removed the content. The feed service performs a cheap early filter to reduce wasted ranking work, then an authoritative final filter immediately before response. Safety-critical state such as blocks, deletion tombstones, account disablement, and moderation decisions is cached aggressively but treated as fail-closed when unavailable.
+Fan-out and candidate indexes are not proof of eligibility. The feed service performs a cheap early filter, then an authoritative final filter immediately before response. That gate uses current post/graph versions or revocation-fenced authorization leases, not a still-reachable but stale allow cache. If leases are used, a revoke is acknowledged only after holders are fenced or their leases expire; an uncertain holder fails closed. For reshares, the viewer must be authorized for both the wrapper and the original post before any original text, thumbnail, or media descriptor is hydrated.
 
 Deletes and privacy changes write canonical state and emit high-priority invalidation events. Those events remove or mark derived entries where practical, but correctness comes from the final check. Meta TAO's graph lesson applies: social reads need cache-aware, single-hop object and association lookups. Deep graph traversals do not belong in the feed hot path.
 
@@ -199,7 +199,7 @@ flowchart LR
     Outbox --> Stream["Event stream"]
     Stream --> Fanout["Fan-out workers"]
     Fanout --> Inbox[("Feed inbox store")]
-    PostSvc --> AuthorTL[("Author timelines")]
+    Stream --> AuthorTL[("Author timeline projection")]
     FeedSvc --> Cand["Candidate assembler"]
     Cand --> Inbox
     Cand --> AuthorTL
@@ -216,7 +216,7 @@ flowchart LR
     FeedSvc --> Session[("Feed session store")]
 ```
 
-A post write commits the canonical post, author timeline entry, and outbox event. Fan-out workers materialize inbox references only where the source is eligible for write fan-out. A feed read decodes the cursor, loads materialized candidates, pulls celebrity timelines, asks recommendation and ad systems for bounded candidates, hydrates features in batches, ranks the reduced set, applies diversity and policy constraints, performs final authorization, updates session seen-state, returns items, and logs impressions asynchronously. Each store maps to a data-model role: canonical truth in post/graph stores, accelerators in inbox/timeline/feature stores, and user-session stability in the feed session store.
+A post write commits the canonical post, idempotency record, and outbox event in one transaction. The separate author-timeline store and follower inboxes consume that event idempotently; they are not part of a fictitious transaction across SQL and wide-column storage. The author's immediate read-your-writes view can inject the committed post while projections catch up. A feed read merges bounded candidates, hydrates features, ranks, applies final policy, commits page/session state, returns items, and logs serving context asynchronously. Client visibility events, not delivery of the response alone, establish impressions.
 
 > **Key idea.** Each component traces back to a specific failure of the naive design.
 
@@ -227,7 +227,7 @@ A post write commits the canonical post, author timeline entry, and outbox event
 **Question.** A user with 80 million followers publishes a post during a traffic spike. Do we write 80 million inbox rows, pull the post on every follower read, or something else?
 <details><summary>Answer</summary>
 
-Use hybrid fan-out. Ordinary authors are fanned out on write into follower inbox references. Celebrity sources are stored once in author timelines and pulled during candidate generation. Thresholds are dynamic, overlap is allowed during transitions, and deduplication by `post_id` makes mode changes safe.
+Use hybrid fan-out with a versioned transition boundary. Ordinary authors use inbox references; celebrities use author-timeline pulls. Maintain at least one complete candidate path across the boundary, permit overlap, and deduplicate by `post_id`. Deduplication removes overlap but cannot repair a gap where neither path supplied a post.
 
 </details>
 
@@ -247,8 +247,9 @@ sequenceDiagram
     participant Timeline as Author timeline
     participant Feed as Feed read
     Author->>Post: Create post with idempotency key
-    Post->>Timeline: Append author timeline entry
-    Post->>Stream: Commit outbox event
+    Post->>Post: Commit canonical post and outbox atomically
+    Post->>Stream: Relay committed outbox event
+    Stream->>Timeline: Idempotent timeline projection
     Stream->>Router: Deliver post-created event
     alt Ordinary author
         Router->>Inbox: Append follower inbox references
@@ -262,7 +263,7 @@ sequenceDiagram
 
 Mode selection should use more than raw follower count. A dormant account with many followers but few active readers may still be cheap to fan out. A medium-sized account posting hundreds of times per day can be expensive even below a celebrity threshold. Useful inputs are follower count, active follower count, post rate, engagement rate, fan-out queue age, inbox write cost, and read-time pull cost. The decision can be hysteretic: move to celebrity mode above a high threshold and back to write fan-out below a lower threshold, avoiding flapping.
 
-Mode transitions create edge cases. If an author switches from write fan-out to read pull while events are in flight, some followers may already have inbox entries for recent posts while the read path also pulls them from the author timeline. The safe answer is not to coordinate a perfect cutover; it is to allow overlap and deduplicate by `post_id`. If switching the other way, the system can fan out only future posts or run a bounded backfill for recent posts. Backfills must be lower priority than fresh fan-out so an old transition does not delay current posts.
+Mode transitions need coverage as well as deduplication. Record a durable source mode epoch and cutover watermark. For push-to-pull, enable read-time inclusion and verify timeline catch-up before stopping push; readers with older mode metadata must refresh or retain a covered push path. For pull-to-push, keep pulling the retained recent window until backfill and live fan-out cover it, or until that window ages out of eligibility. Switching only future posts to push and immediately disabling pull would lose the old celebrity inventory. Posts carry the routing epoch so delayed jobs follow a stable decision; overlap is deduplicated by `post_id`. Backfills remain lower priority than fresh work.
 
 LinkedIn FollowFeed illustrates the trade-off. LinkedIn reported that full fan-out-on-write would inflate data size by 62 times and make ranking experiments expensive, so it used timeline indexes and computed relevance online. Twitter timelines show the complementary lesson: relevance can sit on top of chronological followed inventory, preserving a simple fallback. A production feed should not argue fan-out-on-write versus fan-out-on-read as ideology. It should measure the graph distribution and choose per source.
 
@@ -334,7 +335,7 @@ Use a short-lived feed session with source watermarks, served-item state, deferr
 
 Offset pagination fails immediately for ranked feeds. If page one returns items 1-20 and a new high-scoring post appears at position 3, offset 20 for page two now starts after a different set of items. The user may see duplicates or miss items. Reranking every page independently is fresh but chaotic. Freezing the entire feed at page one is stable but stale, expensive, and hostile to deletes and privacy changes.
 
-The practical design is a feed session. On the first page, the feed service records a candidate snapshot watermark for each source, the model version, returned post IDs, and a deferred pool of candidates that scored below the first page but may be useful later. The cursor returned to the client is signed and references this state. For page two, the service reloads the session, excludes served IDs, considers deferred candidates, optionally admits a small number of fresh candidates above the old watermark, reranks within constraints, and updates the served set.
+The practical design is a feed session. On the first page, the service records source watermarks, model version, returned IDs, and deferred candidates. Each cursor identifies a specific page transition. A conditional session update commits that page's candidate IDs, next cursor, and served-set change together; concurrent requests for the same cursor reuse the committed page rather than advancing twice. A lost response can thus be retried without silently skipping a page. Retries revalidate authorization and can suppress newly forbidden items. Subsequent pages exclude served IDs, use deferred candidates, and admit limited fresh inventory.
 
 Seen-state can be exact or approximate. A server-side exact set avoids false positives but costs memory proportional to active feed sessions. If 50 million users have an active session and each session stores 200 served or deferred IDs at 16 bytes per ID, raw ID storage is `50M × 200 × 16 B = 160 GB` before overhead. That is feasible only with short TTLs, compression, and sharding. A Bloom filter is smaller but can falsely suppress unseen posts. Most feeds can tolerate a tiny false-suppression rate better than visible duplicates, especially for lower-ranked items. For high-value surfaces such as notifications, exact state may be required; for home feed scrolling, bounded approximate state is acceptable.
 

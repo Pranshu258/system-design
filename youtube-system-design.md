@@ -32,7 +32,7 @@ This constraint forces three mechanisms. First, transcoding becomes a durable ch
 
 Assume, illustratively, `500M` daily active viewers and `1B` hours watched per day. That is `1B × 3,600 = 3.6T` playback seconds per day. At an average delivered bitrate of `3 Mb/s`, average viewer egress is `3.6T × 3 Mb / 86,400 ≈ 125,000,000 Mb/s`, or about `125 Tb/s`. Peak can be several times average by region and time of day; designing for `2.5×` gives about `312 Tb/s`. This number is the reason the origin cannot be in the normal serving path. A `98%` byte hit ratio still leaves `125 Tb/s × 2% = 2.5 Tb/s` average origin or shield egress, which is large but tractable compared with serving everything from object storage.
 
-Segments turn viewer concurrency into request load. If the average segment duration is `4 s`, then average segment request rate is `3.6T / 4 / 86,400 ≈ 10.4M` segment requests per second, before manifests, thumbnails, comments, and API calls. Shorter `2 s` segments double that request rate while improving adaptation and live latency. The CDN and clients must therefore tolerate very high small-object request rates, and the metadata API must not be consulted per segment.
+Segments turn viewer concurrency into request load. If the average segment duration is `4 s`, the video-track request rate is `3.6T / 4 / 86,400 ≈ 10.4M` requests per second. Separately fetched audio adds requests; equal-duration audio segments would roughly double this, before manifests, thumbnails, comments, and API calls. Shorter `2 s` segments double the per-track request rate while improving adaptation and live latency. The CDN and clients must therefore tolerate very high small-object request rates, without calling the central metadata API per segment.
 
 Uploads are smaller in QPS but heavy in bytes and compute. Suppose `5M` uploads per day with an average source size of `1 GB`. That is `5 PB/day` of source ingest and `5M / 86,400 ≈ 58` uploads per second on average; a busy-hour multiplier of `8×` yields roughly `460` completed uploads per second. If the platform creates a baseline H.264 ladder, audio, thumbnails, captions, and selected VP9 or AV1 renditions, stored outputs may be `2×` to `5×` the source size. The implication is not that upload coordinators need exotic QPS handling; it is that storage lifecycle, codec selection, and transcode scheduling determine cost.
 
@@ -74,7 +74,7 @@ POST   /v1/videos/{video_id}/publish
        body: {target_state: "PUBLIC"}
 
 GET    /v1/videos/{video_id}/playback?capabilities=av1,vp9,h264&max_height=2160
-       response: {playback_session_id, manifest_url, heartbeat_interval_seconds, expires_at}
+       response: {playback_session_id, manifest_url, segment_grant, heartbeat_interval_seconds, expires_at}
 
 POST   /v1/playback/{playback_session_id}/events
        body: {events: [{event_id, type, position_ms, watch_ms, event_time}]}
@@ -84,7 +84,7 @@ The upload API sends bytes to object storage or upload servers using resumable p
 
 The processing endpoint exists because transcoding can take seconds to hours. A synchronous `POST /upload-and-transcode` would fail through normal load balancer timeouts and would encourage clients to retry work that may still be running. Publication is deliberately separate from processing. A creator can schedule publication before full 4K finishes, but the state transition to public checks that a minimum viable manifest exists and policy permits playback.
 
-Playback returns a short-lived manifest URL rather than raw object keys. The manifest token encodes the video, active manifest version, viewer authorization class, expiry, and sometimes territory or device constraints. Segment URLs are immutable and cacheable, so authorization should be validated at the manifest or edge-token layer without adding viewer identity to every segment cache key. Event submission is best-effort and batched; dropping analytics must not stall playback.
+Playback returns a short-lived manifest URL and a scoped segment grant. The token binds video, active manifest version, viewer/entitlement, policy version, expiry, and applicable territory/device constraints. The CDN checks the grant on every manifest and segment request, including cache hits, before looking up the shared immutable-object cache key. Signing only the manifest leaves copied segment URLs unprotected. Origins are not publicly reachable. Event submission is best-effort and batched; dropping analytics must not stall playback.
 
 ## 4. Data model
 
@@ -167,7 +167,7 @@ The workflow orchestrator probes the source, builds a DAG, and dispatches idempo
 
 ### Fix 3: Immutable segments, manifests, and CDN hierarchy
 
-The packager writes HLS or DASH segments and manifests. Segments are immutable and content-versioned, so browser caches, edge caches, regional shields, and origin storage can keep them for long periods. The playback service authorizes a viewer and returns a signed manifest URL; the client then downloads segment bytes from the nearest cache without consulting the metadata service per segment. Netflix Open Connect demonstrates the same principle at appliance level: a video edge cache is a high-throughput storage and networking system, not a generic reverse proxy.
+The packager writes HLS or DASH segments and manifests. Segments are immutable and content-versioned, so edge caches, shields, and origins can retain them for long periods. The playback service authorizes a viewer and returns a signed manifest URL plus segment access; the nearest edge validates each request using revocation-fenced policy state without consulting the central metadata service per segment. Netflix Open Connect illustrates byte-serving throughput, not this proposal's authorization protocol.
 
 ### Fix 4: Strong metadata boundaries and log-derived counters
 
@@ -228,15 +228,20 @@ flowchart TD
     CHUNK --> AV1["AV1 premium ladder"]
     DEMUX --> AUD["Audio encodes"]
     H264 --> PKG["Segment packaging"]
-    VP9 --> PKG
-    AV1 --> PKG
+    VP9 --> EXTRA["Optional premium packaging and validation"]
+    AV1 --> EXTRA
     AUD --> PKG
+    AUD --> EXTRA
     PKG --> VAL["Quality and duration validation"]
     VAL --> MAN["Manifest assembly"]
     MAN --> SWITCH["Atomic active manifest switch"]
+    EXTRA --> UPGRADE["Later validated manifest upgrade"]
+    UPGRADE --> SWITCH
 ```
 
 Idempotency is the difference between a workflow and an expensive guessing game. Every job writes to a deterministic key containing `video_id`, `workflow_id`, profile, chunk number, and attempt or content hash. The worker may crash after writing bytes but before acknowledging; on retry, the scheduler checks the checksum and either reuses the output or overwrites a new attempt key and updates metadata conditionally. A worker lease includes a fencing token so a slow old worker cannot report success after a newer attempt already finished. The orchestrator stores DAG state durably, and retry policies distinguish transient infrastructure failures from poison inputs such as corrupt containers.
+
+Baseline packaging depends only on required audio/video outputs and policy checks, not on every optional codec branch. Manifest activation checks the workflow generation, expected active pointer, and current video/policy version in one metadata transaction; a late baseline retry cannot replace a newer premium manifest or undo a takedown. Published output keys are write-once. Validation includes common presentation boundaries and independently decodable switching points across ABR renditions, not merely source keyframe alignment and matching total duration.
 
 The ladder should not be fixed for every video. Netflix's per-title and shot-based encoding work shows that content complexity changes the useful bitrate-resolution points: a talking-head lecture and a fast sports clip should not consume the same bits for the same perceived quality. A practical platform can produce a quick compatibility ladder first, then run content-aware refinement for videos whose predicted watch time justifies the compute. Meta describes benefit-cost models for advanced codecs, and that maps directly here: AV1 may save substantial egress, but only if enough target devices can decode it and enough views will amortize encoder cost. YouTube's VCU story pushes the same lesson further. At this scale, the scheduler should know which workers have video accelerators and reserve scarce slots for profiles with material delivery savings.
 
@@ -278,8 +283,9 @@ sequenceDiagram
     Client->>Playback: Request playback with capabilities
     Playback->>Meta: Read visibility policy and active manifest
     Meta-->>Playback: Authorized manifest version
-    Playback-->>Client: Signed manifest URL
+    Playback-->>Client: Signed manifest URL and segment grant
     Client->>Edge: GET manifest and segment 0
+    Edge->>Edge: Validate grant and current fenced policy before cache lookup
     alt Edge hit
         Edge-->>Client: Segment bytes
     else Edge miss
@@ -293,17 +299,17 @@ sequenceDiagram
     Client->>Edge: GET next segment at selected bitrate
 ```
 
-The CDN hierarchy is the real serving system: device cache, edge point of presence, regional shield, and origin. Immutable segment keys allow long TTLs and simple validation. Manifests can be shorter lived because they encode the active version and policy-sensitive choices. Authorization must not destroy cacheability. If every segment URL contains a unique viewer token in the cache key, the hit ratio collapses. Instead, use signed cookies, edge token validation that ignores the token for object lookup, or tokenized manifests whose segment paths remain shared within an authorization class.
+The CDN hierarchy is the real serving system: device cache, edge point of presence, regional shield, and origin. Immutable segment keys allow long object TTLs, independently of authorization lifetime. Viewer tokens must not fragment the object cache, but must still be verified on each request: use a signed cookie or segment grant before looking up the shared path. A tokenized manifest alone is insufficient. Direct origin access must be restricted to the protected delivery path.
 
 Popularity-tiered placement follows from the egress math. Hot videos should be pushed or prewarmed to regions where demand is likely: subscriptions, scheduled premieres, home-page promotion, and early velocity are useful signals. Warm content lives at regional shields and fills edges on demand. Cold long-tail content may remain in origin storage with only opportunistic caching. Netflix Open Connect is useful evidence because it shows that the last mile is not just HTTP semantics; cache appliances need NVMe, NIC, kernel, and sendfile tuning to sustain media throughput. A platform at YouTube scale would also embed caches in ISP networks or peer deeply with them because reducing backbone and transit traffic is the main cost win.
 
 Request coalescing protects origin during synchronized misses. If `10,000` viewers at one edge ask for segment `S` and it is absent, the edge should issue one fill to the shield and attach the other requests to that promise. The shield applies the same rule toward origin. Negative caching matters too: if a manifest accidentally references a missing segment, blindly retrying from every edge creates a failure amplifier. The edge should cache a short negative result, while the playback service stops handing out that manifest version once validation detects the issue.
 
-Multi-CDN can improve reach and resilience but complicates logs, token validation, cache warming, and debugging. The traffic manager should route by viewer ISP, region, device, real-time CDN health, and content placement. Failover must be careful: shifting a viral video to an unprepared CDN can create a second cold-cache storm. For sensitive takedowns, the system needs both metadata denial and purge or token invalidation paths, because cached immutable bytes may otherwise remain accessible through old URLs until expiry.
+Multi-CDN can improve reach and resilience but complicates token validation, warming, and debugging. Routing uses ISP, region, device, health, and placement; moving a viral video to a cold CDN can create another miss storm. Policy revocation stops grant renewal immediately and fences the affected policy version at every serving CDN. Edges may use registered, bounded policy leases: revocation is reported enforced only after holders acknowledge the new fence or old leases expire; disconnected holders fail closed thereafter. A newly routed CDN must acquire current policy before serving. Ordinary signed-URL expiry does not provide this protocol. Purging bytes is supplementary, because a copied URL could otherwise refill them. Already downloaded buffers and requests authorized before the fence cannot be recalled.
 
 Signals worth watching: startup time, first-segment cache hit rate, rebuffer ratio, average bitrate, edge-to-shield fill rate, origin egress, coalescing fan-in, and CDN errors by ISP and device.
 
-> **Strong-answer criteria.** A strong design makes manifests the authorization boundary, segments the cacheable byte boundary, and CDN placement the main capacity control.
+> **Strong-answer criteria.** A strong design issues authorization at playback bootstrap, enforces it on both manifests and segments at the edge, and keeps byte caching independent of viewer identity.
 
 | Level | Approach | Why |
 |---|---|---|
@@ -338,7 +344,9 @@ flowchart TD
 
 Partitioning is subtle. Partitioning strictly by `video_id` makes per-video aggregation simple but creates hot partitions for viral content. Random partitioning spreads load but makes exactly-once-ish per-video windows harder. A practical design uses a composite strategy: normal videos partition by `video_id`, while hot videos are salted across buckets and later merged by window. The snapshot includes a watermark so readers know how far the aggregation has progressed. The public API can display `1.2M views` from the latest snapshot rather than pretending every heartbeat is included.
 
-Metadata has the opposite character. A creator changing a video to private, a policy system issuing a takedown, or a workflow switching active manifests should be guarded by conditional updates. `PATCH /videos/{id}` uses `If-Match` on `Video.version`; a stale edit returns conflict rather than overwriting a newer policy state. `publish` checks `processing_state = READY`, `policy_state = ALLOWED`, and expected version in one transaction. `active_manifest_version` changes only after the manifest validation state is complete. The playback service reads this authoritative state before issuing a manifest, and tokens expire quickly enough that old authorizations drain.
+Metadata has the opposite character. A creator changing visibility, a policy takedown, or a manifest switch uses conditional updates. `PATCH /videos/{id}` checks `Video.version`; a stale edit cannot overwrite newer policy state. `publish` atomically checks the validated minimum playable manifest, `policy_state = ALLOWED`, and expected version; `READY` means this minimum is ready, not that all premium jobs finished. The playback service checks authoritative state before issuing access, and the edge revocation barrier prevents old grants from authorizing new requests after enforcement completes.
+
+Every route into public visibility uses that same guard, including `PATCH` and scheduled publication at execution time. Otherwise a creator could bypass the dedicated publish endpoint's readiness and policy checks by patching `visibility` directly.
 
 Vitess is relevant because relational metadata does not disappear just because the platform is huge. You still want transactions for a video row, unique constraints for likes or subscriptions, and secondary indexes for channel listings. What changes is the operational layer: route queries by shard key, prevent cross-shard fan-out in hot APIs, support online resharding, and isolate analytical scans from serving databases. A video page can combine strongly read metadata with eventually consistent projections: title and visibility from the metadata store, public count from the latest snapshot, comments from their own partitioned store, and recommendations from a separate service.
 
@@ -393,7 +401,7 @@ The design follows the egress constraint. Upload QPS is manageable, but source b
 3. How can playback be authorized without ruining CDN cache sharing?
    <details><summary>Answer</summary>
 
-   Authorize at manifest request time and use short-lived signed manifests, signed cookies, or edge token validation that does not make viewer identity part of the segment object cache key. Segments remain immutable and shared by authorized classes.
+   Issue access at playback bootstrap, then validate the scoped grant and revocation-fenced policy on every manifest and segment request, including cache hits. Only the object lookup ignores viewer identity. Keep origins private; signing a manifest alone does not protect segment URLs.
 
    </details>
 
@@ -424,3 +432,6 @@ The design follows the egress constraint. Upload QPS is manageable, but source b
 | Meta | [How Facebook encodes your videos](https://engineering.fb.com/2021/04/05/video-engineering/how-facebook-encodes-your-videos/) | Uses benefit-cost and ML prioritization so expensive codecs are applied where they improve QoE most. |
 | Meta | [Reducing Instagram's basic video compute by 94 percent](https://engineering.fb.com/2022/11/04/video-engineering/instagram-video-processing-encoding-reduction/) | Demonstrates DAG/intermediate reuse to remove redundant encoding work at massive upload scale. |
 | Meta | [Bringing AV1 to Facebook and Instagram Reels](https://engineering.fb.com/2023/02/21/video-engineering/av1-codec-facebook-instagram-reels/) | Covers AV1's compression benefits and the compute/device trade-offs of production codec rollout. |
+| AWS | [CloudFront signed URLs](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-signed-urls.html) | Documents request-time signature expiry and its limits for ongoing downloads and revocation. |
+| AWS | [Restrict access to an S3 origin](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html) | Explains preventing origin access from bypassing protected CDN requests. |
+| Apple | [HLS authoring specification](https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices) | Defines segment decoding, common time ranges, and switching-boundary requirements for compatible renditions. |
