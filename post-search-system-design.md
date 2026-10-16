@@ -361,6 +361,55 @@ Cursor stability requires separating retrieval from reranking. This proposal mat
 
 Signals worth watching: candidates per stage, drops by denylist and hydration, backfill depth, reranker latency, feature-store timeout rate, model fallback rate, zero-result after filtering, click metrics by query class, and stale-permission incidents.
 
+#### Pagination mechanics and costs
+
+**Use `search_after`, not deep `OFFSET`.** With an offset, each shard must collect enough hits for all preceding pages plus the requested page. A signed cursor carries the retrieval sort tuple and binds the query, filters, sort mode, and expiry.
+
+**It is a sort boundary, not a saved result list.** For a retrieval batch of 20, each shard collects its best 20 hits after the cursor instead of collecting `offset + 20` hits. Each retrieval request still performs matching and scoring; the main savings are in result collection, shard transfer, and coordinator merging. In this design, later user pages consume the cached session pool rather than rerunning retrieval.
+
+**Choose the guarantee explicitly:**
+
+| Mode | Index view | Tradeoff |
+|---|---|---|
+| **This proposal: stable session** | PIT while building a bounded pool; cached ranked order for later pages | Stable page boundaries, but retained segments and session state consume resources |
+| **Cheaper alternative: best-effort browsing** | Current index on each page; no PIT or cached ranked pool | Less server-side state, but duplicates and skipped results are possible |
+
+For best-effort browsing:
+
+- **Relevance sort:** use `(retrieval_score, created_at, post_id)` with fixed sort directions and a unique tie-breaker.
+- **Newest-first sort:** use `(created_at, post_id)` with a fixed initial upper time bound. Newer posts stay out; delayed indexing, edits, and deletions can still change membership.
+- **UX:** cap pagination depth and offer refresh/restart. Client deduplication cannot recover skipped results; reranking within each retrieval window is not globally sorted final relevance.
+
+**What does a PIT retain?**
+
+**It does not copy the entire index per query.** Each shard consists of immutable segments, each containing an inverted index (`term -> matching document IDs`) and supporting fields. A PIT retains references to those segments and their document-visibility state, not ranked query results.
+
+```text
+At PIT creation:  PIT X -> segments A, B
+After refresh:   latest -> A, B, C       PIT X -> A, B
+After merge:     latest -> merged M      PIT X -> A, B (retained)
+```
+
+**PIT chooses the index view; `search_after` chooses the retrieval boundary.** Neither caches scores. The separate session pool is what avoids repeated retrieval for later user pages.
+
+| Resource | Why usage increases |
+|---|---|
+| Disk | Old segments cannot be deleted after merges while a PIT still needs them |
+| Search contexts and file handles | Views retain resources across participating shards |
+| Heap | Updates/deletes require document-liveness bookkeeping |
+
+For scale: **10,000 new sessions/second x 60-second PIT lifetime = roughly 600,000 active PITs**, even if nobody requests page two. Close PITs as soon as the bounded pool is complete; do not retain them just to serve cached pages.
+
+**Stable-session guardrails:**
+
+- **Start before retrieval:** open the PIT before building the pool; retain its handle and retrieval boundaries internally.
+- **Bound resources:** enforce idle expiry, maximum lifetime, and per-user/global limits on PITs and cached pools. Reject new sessions explicitly at capacity.
+- **Monitor:** retained segment bytes, open contexts, file handles, heap, and session-cache bytes.
+- **Fail explicitly:** return `CURSOR_EXPIRED` if session state expires or a PIT needed for unfinished retrieval is lost. A completed pool does not require a live PIT.
+- **Preserve ranking and privacy:** a PIT alone does not freeze external features or authorization. Freeze the pool's ranking inputs and recheck current visibility on every page.
+
+See [Elasticsearch's PIT documentation](https://www.elastic.co/guide/en/elasticsearch/reference/8.19/point-in-time-api.html#keeping-point-in-time-alive) for segment-retention and resource costs.
+
 > **Strong-answer criteria.** A senior answer must keep retrieval cheap, make reranking bounded, and treat authorization as a final correctness gate rather than a relevance feature. It should also explain how deletes and cursor stability interact with ranking.
 
 | Level | Approach | Why |
