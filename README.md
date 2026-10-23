@@ -46,6 +46,7 @@ Detailed, production-scale system design walkthroughs. Each design is built up a
 
 - [Uber / Nearby Drivers](./nearby-drivers-system-design.md)
 - [Google Maps](./google-maps-system-design.md)
+- [Google Street View](./google-street-view-system-design.md)
 - [Web Crawler](./web-crawler-system-design.md)
 - [Ad Click Aggregator](./ad-click-aggregator-system-design.md)
 
